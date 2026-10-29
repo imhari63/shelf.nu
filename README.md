@@ -1,161 +1,195 @@
-<a href="https://www.shelf.nu/" target="_blank">
-<img width="100%" src="./apps/webapp/public/static/images/readme-cover.jpg" alt="Shelf.nu" />
-</a>
+# Shelf.nu — MAD BIRD STUDIOS
+
+<p align="center">
+  <img width="100%" src="./apps/webapp/public/static/images/readme-cover.jpg" alt="Shelf.nu Asset Management Platform" />
+</p>
 
 <h3 align="center">Open-source asset management infrastructure for everyone.</h3>
 
-Shelf is a platform for tracking physical assets — equipment, devices, tools, vehicles, props, inventory. It's built for teams that need to know what they have, where it is, and who's using it. Organizations use Shelf to manage thousands of assets across locations with role-based access for their teams.
+<p align="center">
+  Developed by <strong>MAD BIRD STUDIOS</strong>
+</p>
+
+Shelf.nu is an asset management platform for tracking physical assets, including equipment, devices, tools, vehicles, props, and inventory. It helps teams manage assets across locations, track bookings, assign custody, and organize inventory with role-based access controls.
 
 ## Features
 
-- **QR asset tags** — Generate and print QR codes. Scan with any phone to view, check out, or report an asset.
-- **Bookings and reservations** — Schedule equipment, prevent double-bookings, set checkout/return dates with calendar integration.
-- **Custody tracking** — Assign assets to team members. Know who has what at all times.
-- **Location management** — Hierarchical locations (buildings, floors, rooms, shelves). GPS tagging support.
-- **Team roles** — Owner, Admin, Base, and Self Service roles with granular permissions.
-- **Custom fields** — Add any metadata to assets: purchase date, warranty info, serial numbers, condition.
-- **Categories and tags** — Organize assets into categories. Tag for flexible cross-cutting grouping.
-- **Kits** — Bundle assets into kits (e.g., laptop + charger + dock) and manage them as a unit.
-- **Search and filtering** — Full-text search with advanced filters. Saved filter presets.
-- **CSV import/export** — Bulk import assets from spreadsheets. Export for reporting.
-- **Asset reminders** — Schedule alerts for maintenance, calibration, warranty expiry.
-- **Audit trail** — Notes and activity logs on every asset.
-- **Multi-workspace** — Manage separate inventories for different organizations or departments.
-- **Scanner** — Built-in QR/barcode scanner with bulk actions: assign custody, update location, add to bookings.
+- **QR Asset Tags** — Generate and print QR codes to identify and access asset information.
+- **Bookings and Reservations** — Schedule equipment usage and manage checkout and return dates.
+- **Custody Tracking** — Assign assets to team members and track responsibility.
+- **Location Management** — Organize assets by buildings, floors, rooms, and storage locations.
+- **Team Roles** — Manage organization access using role-based permissions.
+- **Custom Fields** — Store metadata such as serial numbers, purchase dates, and warranty information.
+- **Categories and Tags** — Organize and classify assets.
+- **Kits** — Group related assets and manage them together.
+- **Search and Filtering** — Find assets using search and advanced filters.
+- **CSV Import and Export** — Import asset data in bulk and export reports.
+- **Asset Reminders** — Schedule reminders for maintenance and warranty dates.
+- **Audit Trail** — Track asset activities, notes, and changes.
+- **Multi-workspace Support** — Manage inventory across organizations and departments.
+- **QR and Barcode Scanner** — Scan assets and perform supported inventory actions.
 
 ## Tech Stack
 
-| Layer      | Technology                                                                      |
-| ---------- | ------------------------------------------------------------------------------- |
-| Framework  | [React Router](https://reactrouter.com/) 7 (React 19)                           |
-| Language   | [TypeScript](https://www.typescriptlang.org/) 5                                 |
-| Database   | [PostgreSQL](https://www.postgresql.org/) via [Supabase](https://supabase.com/) |
-| ORM        | [Prisma](https://www.prisma.io/) 6                                              |
-| Styling    | [Tailwind CSS](https://tailwindcss.com/) 3                                      |
-| Components | [Radix UI](https://www.radix-ui.com/) primitives                                |
-| Auth       | [Supabase Auth](https://supabase.com/docs/guides/auth) (email, SSO)             |
-| Job queue  | [pg-boss](https://github.com/timgit/pg-boss)                                    |
-| Payments   | [Stripe](https://stripe.com/)                                                   |
-| Email      | [Nodemailer](https://nodemailer.com/) (SMTP)                                    |
-| Build      | [Vite](https://vite.dev/) 7, [Turborepo](https://turbo.build/)                  |
-| Testing    | [Vitest](https://vitest.dev/), [Playwright](https://playwright.dev/)            |
+| Layer | Technology |
+|---|---|
+| Framework | React Router 7, React 19 |
+| Language | TypeScript |
+| Database | PostgreSQL via Supabase |
+| ORM | Prisma |
+| Styling | Tailwind CSS |
+| Components | Radix UI |
+| Authentication | Supabase Auth |
+| Job Queue | pg-boss |
+| Payments | Stripe |
+| Email | Nodemailer |
+| Build Tools | Vite, Turborepo |
+| Testing | Vitest, Playwright |
+
+Refer to the relevant configuration files in this repository to confirm the exact installed versions.
 
 ## Getting Started
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) >= 24.22.1
-- [pnpm](https://pnpm.io/) >= 9.15.4
-- A [Supabase](https://supabase.com/) project (free tier works)
+- Node.js version required by the repository
+- pnpm version required by the repository
+- A configured Supabase project
+- Git
 
-### Setup
+Check the project's `package.json`, `packageManager` field, and documentation for the required tool versions.
+
+### Installation
+
+Clone this repository:
 
 ```bash
-# Clone the repository
-git clone https://github.com/imhari63/shelf.git
+git clone https://github.com/imhari63/shelf.nu.git
 cd shelf.nu
+```
 
-# Install dependencies
+Install dependencies:
+
+```bash
 pnpm install
+```
 
-# Copy environment template
+Create your local environment file using the provided template, if available:
+
+```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your Supabase credentials and other configuration. See the [Supabase setup guide](https://docs.shelf.nu/supabase-setup) for step-by-step instructions.
+On Windows PowerShell, you can use:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Configure the required environment variables using the project's documentation. Never commit real API keys, database passwords, or other secrets.
+
+### Database Setup
+
+After configuring Supabase and the required environment variables, run the repository's setup command:
 
 ```bash
-# Generate Prisma client and run migrations
 pnpm webapp:setup
+```
 
-# Start development server
+### Start Development
+
+```bash
 pnpm webapp:dev
 ```
 
-The app runs at `https://localhost:3000` (the dev server uses HTTPS with local certificates by default).
+Check the terminal output for the local application URL and any required HTTPS certificate setup.
 
-For detailed setup instructions including SSL certificates and troubleshooting, see the [local development guide](https://docs.shelf.nu/local-development).
+**Note:** These commands are based on the existing project documentation. Successful startup depends on your environment configuration and the current repository state.
 
 ## Project Structure
 
-```
+```text
 shelf.nu/
 ├── apps/
-│   ├── webapp/          # Main application (React Router + Hono)
-│   │   ├── app/
-│   │   │   ├── routes/      # File-based routing
-│   │   │   ├── modules/     # Business logic (booking, asset, kit, etc.)
-│   │   │   ├── components/  # React components
-│   │   │   └── utils/       # Shared utilities
-│   │   └── public/          # Static assets
-│   └── docs/            # Documentation site (VitePress)
+│   ├── webapp/       # Main web application
+│   ├── companion/    # Companion mobile application
+│   └── docs/         # Documentation site
 ├── packages/
-│   └── database/        # Prisma schema, migrations, client
-└── tooling/
-    └── typescript/      # Shared TypeScript config
+│   └── database/     # Database schema and migrations
+├── tooling/          # Shared development configuration
+├── package.json
+├── pnpm-workspace.yaml
+└── turbo.json
 ```
 
-The monorepo is managed with pnpm workspaces and Turborepo. The `@shelf/database` package owns all database concerns — schema, migrations, and Prisma client generation.
+The project uses pnpm workspaces and Turborepo to manage its monorepo structure.
 
-## Commands
+## Development Commands
 
-| Command                     | Description                             |
-| --------------------------- | --------------------------------------- |
-| `pnpm webapp:dev`           | Start development server                |
-| `pnpm webapp:build`         | Production build                        |
-| `pnpm webapp:test`          | Run tests (Vitest)                      |
-| `pnpm webapp:validate`      | Lint + typecheck + test                 |
-| `pnpm webapp:doctor`        | React health scan (react-doctor)        |
-| `pnpm companion:doctor`     | React Native health scan (react-doctor) |
-| `pnpm webapp:setup`         | Generate Prisma client + run migrations |
-| `pnpm db:prepare-migration` | Create a new database migration         |
-| `pnpm db:deploy-migration`  | Apply pending migrations                |
-| `pnpm db:reset`             | Reset database (destructive)            |
-| `pnpm docs:dev`             | Start documentation site                |
-| `pnpm typecheck`            | TypeScript type checking                |
-| `pnpm lint`                 | ESLint                                  |
+| Command | Description |
+|---|---|
+| `pnpm webapp:dev` | Start the web application |
+| `pnpm webapp:build` | Build the web application |
+| `pnpm webapp:test` | Run web application tests |
+| `pnpm webapp:validate` | Run project validation |
+| `pnpm webapp:setup` | Set up the database client and migrations |
+| `pnpm typecheck` | Run TypeScript checks |
+| `pnpm lint` | Run ESLint |
+| `pnpm docs:dev` | Start the documentation site |
+
+Run commands from the repository root. Verify available scripts in `package.json` before relying on them.
 
 ## Deployment
 
-### Fly.io
+Deployment depends on the required database, authentication, environment variables, and hosting configuration.
 
-Shelf deploys to [Fly.io](https://fly.io/) with GitHub Actions for CI/CD. Pushes to `dev` trigger staging deploys and pushes to `main` trigger production deploys; in both cases we run lint, typecheck, test, Docker build, and deploy.
+Before deploying:
 
-See the [deployment guide](https://docs.shelf.nu/deployment) for full setup instructions.
+1. Configure production environment variables.
+2. Set up the database and apply the required migrations.
+3. Run the available validation and build scripts.
+4. Configure your hosting platform.
+5. Verify authentication, storage, and application functionality.
 
-### Docker
-
-Community-maintained Docker support is available for self-hosting. Requires an external Supabase instance.
-
-See the [Docker guide](https://docs.shelf.nu/docker).
+Do not assume the original project's deployment pipeline is configured for this repository.
 
 ## Documentation
 
-| Guide                                                        | Description                                  |
-| ------------------------------------------------------------ | -------------------------------------------- |
-| [Local Development](https://docs.shelf.nu/local-development) | Full local setup with SSL, monorepo overview |
-| [Supabase Setup](https://docs.shelf.nu/supabase-setup)       | Database, auth, storage configuration        |
-| [Deployment](https://docs.shelf.nu/deployment)               | Fly.io + GitHub Actions CI/CD                |
-| [Docker](https://docs.shelf.nu/docker)                       | Self-hosted Docker setup                     |
-| [App Configuration](https://docs.shelf.nu/app-configuration) | `shelf.config.ts` options                    |
-| [Error Handling](https://docs.shelf.nu/handling-errors)      | Error patterns and conventions               |
-| [Accessibility](https://docs.shelf.nu/accessibility)         | WCAG 2.1 AA compliance                       |
-| [Contributing](./CONTRIBUTING.md)                            | How to contribute                            |
+- [Shelf.nu Documentation](https://docs.shelf.nu/)
+- [Local Development Guide](https://docs.shelf.nu/local-development)
+- [Supabase Setup](https://docs.shelf.nu/supabase-setup)
+- [Deployment Guide](https://docs.shelf.nu/deployment)
+- [Docker Guide](https://docs.shelf.nu/docker)
+- [Contributing Guide](./CONTRIBUTING.md)
 
-For developer onboarding and codebase conventions, see [`CLAUDE.md`](./CLAUDE.md).
+Some documentation links describe the upstream project and may need to be adapted to this customized repository.
 
-## Contributing
+## License and Attribution
 
-We welcome contributions. Check the [contribution guidelines](./CONTRIBUTING.md) and look for issues labeled [**"Open for contributions"**](https://github.com/imhari63/shelf/issues?q=is%3Aissue+is%3Aopen+label%3A%22Open+for+contributions%22).
+This repository is based on the Shelf.nu project.
 
-The project uses [conventional commits](https://www.conventionalcommits.org/), enforced by commitlint. Pre-commit hooks run ESLint, Prettier, and TypeScript checking via Lefthook.
+The upstream project identifies its main application as licensed under **GNU Affero General Public License v3.0 (AGPL-3.0)**, with a separate license for the companion mobile application in `apps/companion/`.
 
-Join the [Discord](https://discord.gg/8he9W7aTJu) if you have questions or want to discuss your contribution.
+- Preserve the original copyright notices and required license files.
+- Review the root `LICENSE` and `apps/companion/LICENSE` before modifying or redistributing the project.
+- Follow all applicable license conditions when publishing modified source code or offering the application as a network service.
+- Do not replace the original copyright ownership with MAD BIRD STUDIOS or imply that MAD BIRD STUDIOS created the original upstream software.
 
-## License
+MAD BIRD STUDIOS branding and modifications do not change the upstream license obligations.
 
-Shelf.nu is licensed under [AGPL-3.0](./LICENSE), with one exception.
+For the binding terms, refer to the license files included in this repository.
 
-The companion mobile app in [`apps/companion/`](./apps/companion) is **not open source**. Its source is available under the [PolyForm Internal Use License 1.0.0](./apps/companion/LICENSE). You may read it, build it and change it for the internal business operations of your own company. You may not distribute it. Publishing the app, or an app based on it, on the Apple App Store, Google Play or any other store is distribution.
+## Maintained By
 
-This section is a summary. The license files are the binding terms.
+**MAD BIRD STUDIOS**
+
+A digital creative studio working across design, web development, branding, video editing, and SEO.
+
+- GitHub: [@imhari63](https://github.com/imhari63)
+- Repository: [shelf.nu](https://github.com/imhari63/shelf.nu)
+
+---
+
+<p align="center">
+  Customized and maintained by MAD BIRD STUDIOS.
+</p>
