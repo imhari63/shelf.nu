@@ -1,4 +1,4 @@
-# Shelf.nu — MAD BIRD STUDIOS
+# Shelf.nu
 
 <p align="center">
   <img width="100%" src="./apps/webapp/public/static/images/readme-cover.jpg" alt="Shelf.nu Asset Management Platform" />
@@ -7,12 +7,12 @@
 <h3 align="center">Open-source asset management infrastructure for everyone.</h3>
 
 <p align="center">
-  Customized fork of the original Shelf.nu project
+  Custom fork of the original Shelf.nu project
 </p>
 
 Shelf.nu is an asset management platform for tracking physical assets, including equipment, devices, tools, vehicles, props, and inventory. It helps teams manage assets across locations, track bookings, assign custody, and organize inventory with role-based access controls.
 
-This repository is a customized fork of the upstream Shelf.nu project. The original project remains the source of the main application, and the custom branding and modifications here do not change the upstream copyright or license obligations.
+This repository is a customized fork of the upstream Shelf.nu project. The original project remains the source of the main application, and this fork preserves the upstream authorship, copyright notices, and license obligations. MAD BIRD STUDIOS branding and customizations do not replace or supersede the original upstream copyright or authorship.
 
 ## Features
 
@@ -181,7 +181,7 @@ MAD BIRD STUDIOS branding and modifications do not change the upstream license o
 
 For the binding terms, refer to the license files included in this repository.
 
-## Maintained By
+## Fork Maintained By
 
 **MAD BIRD STUDIOS**
 
@@ -193,5 +193,5 @@ A digital creative studio working across design, web development, branding, vide
 ---
 
 <p align="center">
-  Customized for MAD BIRD STUDIOS.
+  Custom fork maintained for MAD BIRD STUDIOS.
 </p>
