@@ -1,5 +1,5 @@
 <a href="https://www.shelf.nu/" target="_blank">
-<img width="100%" src="apps/webapp/public/static/images/readme-cover.jpg" alt="Shelf.nu" />
+<img width="100%" src="./apps/webapp/public/static/images/readme-cover.jpg" alt="Shelf.nu" />
 </a>
 
 <h3 align="center">Open-source asset management infrastructure for everyone.</h3>
