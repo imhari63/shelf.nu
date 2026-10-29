@@ -7,10 +7,12 @@
 <h3 align="center">Open-source asset management infrastructure for everyone.</h3>
 
 <p align="center">
-  Developed by <strong>MAD BIRD STUDIOS</strong>
+  Customized fork of the original Shelf.nu project
 </p>
 
 Shelf.nu is an asset management platform for tracking physical assets, including equipment, devices, tools, vehicles, props, and inventory. It helps teams manage assets across locations, track bookings, assign custody, and organize inventory with role-based access controls.
+
+This repository is a customized fork of the upstream Shelf.nu project. The original project remains the source of the main application, and the custom branding and modifications here do not change the upstream copyright or license obligations.
 
 ## Features
 
@@ -166,16 +168,16 @@ Some documentation links describe the upstream project and may need to be adapte
 
 ## License and Attribution
 
-This repository is based on the Shelf.nu project.
+This repository contains a customized fork of the Shelf.nu project and preserves the original upstream licensing and notices.
 
-The upstream project identifies its main application as licensed under **GNU Affero General Public License v3.0 (AGPL-3.0)**, with a separate license for the companion mobile application in `apps/companion/`.
+The main application is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0), as defined in the root `LICENSE` file. The companion mobile application in `apps/companion/` is separately licensed under the PolyForm Internal Use License 1.0.0, as defined in `apps/companion/LICENSE`.
 
 - Preserve the original copyright notices and required license files.
 - Review the root `LICENSE` and `apps/companion/LICENSE` before modifying or redistributing the project.
 - Follow all applicable license conditions when publishing modified source code or offering the application as a network service.
-- Do not replace the original copyright ownership with MAD BIRD STUDIOS or imply that MAD BIRD STUDIOS created the original upstream software.
+- Do not replace the original upstream copyright or imply that MAD BIRD STUDIOS created the original Shelf.nu software.
 
-MAD BIRD STUDIOS branding and modifications do not change the upstream license obligations.
+MAD BIRD STUDIOS branding and modifications do not change the upstream license obligations for the main application.
 
 For the binding terms, refer to the license files included in this repository.
 
@@ -191,5 +193,5 @@ A digital creative studio working across design, web development, branding, vide
 ---
 
 <p align="center">
-  Customized and maintained by MAD BIRD STUDIOS.
+  Customized for MAD BIRD STUDIOS.
 </p>
