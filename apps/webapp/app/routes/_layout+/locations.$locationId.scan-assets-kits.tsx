@@ -1,0 +1,360 @@
+import {
+  data,
+  redirect,
+  Outlet,
+  useLoaderData,
+  useMatches,
+} from "react-router";
+import type {
+  ActionFunctionArgs,
+  LinksFunction,
+  MetaFunction,
+  LoaderFunctionArgs,
+} from "react-router";
+
+import { z } from "zod";
+import ImageWithPreview from "~/components/image-with-preview/image-with-preview";
+import Header from "~/components/layout/header";
+import { RecordNavigation } from "~/components/layout/header/record-navigation";
+import type { HeaderData } from "~/components/layout/header/types";
+import HorizontalTabs from "~/components/layout/horizontal-tabs";
+import { ActionsDropdown } from "~/components/location/actions-dropdown";
+import { LocationTree } from "~/components/location/location-tree";
+import { ShelfMap } from "~/components/location/map";
+import { MapPlaceholder } from "~/components/location/map-placeholder";
+import { Button } from "~/components/shared/button";
+import { Card } from "~/components/shared/card";
+import TextualDivider from "~/components/shared/textual-divider";
+import { db } from "~/database/db.server";
+import { useRecordNavigation } from "~/hooks/use-list-context";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import {
+  assertLocationDeleteConfirmed,
+  deleteLocation,
+  getLocation,
+  getLocationDescendantsTree,
+  getLocationHierarchy,
+} from "~/modules/location/service.server";
+import type { RouteHandleWithName } from "~/modules/types";
+import assetCss from "~/styles/asset.css?url";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { DeleteConfirmationSchema } from "~/utils/delete-confirmation";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError } from "~/utils/error";
+import { geolocate } from "~/utils/geolocate.server";
+import { payload, error, getParams, parseData } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { userHasPermission } from "~/utils/permissions/permission.validator.client";
+import { requirePermission } from "~/utils/roles.server";
+
+const paramsSchema = z.object({ locationId: z.string() });
+
+export async function loader({ request, context, params }: LoaderFunctionArgs) {
+  const { userId } = context.getSession();
+  const { locationId } = getParams(params, paramsSchema);
+
+  try {
+    const { organizationId, userOrganizations } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.location,
+      action: PermissionAction.read,
+    });
+
+    const [{ location, totalAssetsWithinLocation }, hierarchy, childLocations] =
+      await Promise.all([
+        getLocation({
+          organizationId,
+          id: locationId,
+          // The header's asset count (the start-audit dialog reads it) is the
+          // location's total, so no search, custodian filter or archived view
+          // is passed, whatever the Assets tab is showing. The Assets tab
+          // loads its own page of rows.
+          withAssetsPage: false,
+          userOrganizations,
+          request,
+        }),
+        getLocationHierarchy({ organizationId, locationId }),
+        getLocationDescendantsTree({ organizationId, locationId }),
+      ]);
+
+    const allBreadcrumbs = hierarchy.map(({ id, name }) => ({ id, name }));
+    const parentBreadcrumbs =
+      allBreadcrumbs.length > 1 ? allBreadcrumbs.slice(0, -1) : [];
+
+    const header: HeaderData = {
+      title: location.name,
+    };
+
+    // Use cached coordinates from database, or geocode and cache if not available
+    let mapData: { lat: number; lon: number } | null = null;
+    if (location.latitude !== null && location.longitude !== null) {
+      mapData = { lat: location.latitude, lon: location.longitude };
+    } else if (location.address) {
+      // Fallback: geocode and cache coordinates for existing locations
+      mapData = await geolocate(location.address);
+      if (mapData) {
+        // Update the database with the geocoded coordinates
+        await db.location.update({
+          where: { id: location.id, organizationId },
+          data: {
+            latitude: mapData.lat,
+            longitude: mapData.lon,
+          },
+        });
+      }
+    }
+
+    return payload({
+      location,
+      header,
+      mapData,
+      breadcrumbs: parentBreadcrumbs,
+      childLocations,
+      totalAssetsWithinLocation,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, locationId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: appendToMetaTitle(data?.header?.title) },
+];
+
+export const handle = {
+  breadcrumb: () => "single",
+};
+
+export const links: LinksFunction = () => [
+  { rel: "stylesheet", href: assetCss },
+];
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { locationId: id } = getParams(
+    params,
+    z.object({ locationId: z.string() }),
+    {
+      additionalData: { userId },
+    }
+  );
+
+  try {
+    const { organizationId } = await requirePermission({
+      userId: authSession.userId,
+      request,
+      entity: PermissionEntity.location,
+      action: PermissionAction.delete,
+    });
+
+    // The dialog asks for the location's name; refuse a request that skipped it.
+    const { confirmation } = parseData(
+      await request.formData(),
+      DeleteConfirmationSchema
+    );
+    await assertLocationDeleteConfirmed({ id, organizationId, confirmation });
+
+    await deleteLocation({ id, organizationId });
+
+    sendNotification({
+      title: "Location deleted",
+      message: "Your location has been deleted successfully",
+      icon: { name: "trash", variant: "error" },
+      senderId: authSession.userId,
+    });
+
+    return redirect(`/locations`);
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, id });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+type LocationBreadcrumb = {
+  id: string;
+  name: string;
+};
+
+export default function LocationPage() {
+  const {
+    location,
+    mapData,
+    breadcrumbs,
+    childLocations,
+    totalAssetsWithinLocation,
+  } = useLoaderData<typeof loader>();
+
+  const matches = useMatches();
+  const currentRoute: RouteHandleWithName = matches[matches.length - 1];
+
+  const roles = useOrganizationRoles();
+  // The Activity tab is the location's notes, a separate grant from reading it.
+  const canReadActivity = userHasPermission({
+    roles,
+    entity: PermissionEntity.locationNote,
+    action: PermissionAction.read,
+  });
+
+  const items = [
+    { to: "overview", content: "Overview" },
+    { to: "assets", content: "Assets" },
+    { to: "kits", content: "Kits" },
+    ...(canReadActivity ? [{ to: "activity", content: "Activity" }] : []),
+  ];
+
+  /**
+   * When we are on the location.scan-assets route, we render an outlet on the whole layout.
+   */
+  const isScanRoute =
+    currentRoute?.handle?.name === "location.scan-assets-kits";
+  const recordNavigation = useRecordNavigation({
+    entity: "location",
+    id: location.id,
+    enabled: !isScanRoute,
+  });
+
+  if (isScanRoute) {
+    return <Outlet />;
+  }
+
+  return (
+    <div>
+      <Header
+        preHeading={
+          breadcrumbs?.length ? (
+            <LocationBreadcrumbs breadcrumbs={breadcrumbs} />
+          ) : undefined
+        }
+        slots={{
+          "left-of-title": (
+            <ImageWithPreview
+              className="mr-2"
+              imageUrl={location.imageUrl ?? undefined}
+              thumbnailUrl={location.thumbnailUrl ?? undefined}
+              alt={location.name}
+              withPreview
+            />
+          ),
+        }}
+      >
+        <ActionsDropdown
+          location={{ ...location, childCount: childLocations?.length }}
+          assetCount={totalAssetsWithinLocation}
+        />
+        <RecordNavigation navigation={recordNavigation} />
+      </Header>
+
+      <HorizontalTabs items={items} />
+
+      <div className="mt-4 block md:mx-0 lg:flex">
+        {/* Left column */}
+        <div className="flex-1">
+          <Outlet />
+        </div>
+
+        {/* Right Column - Location info */}
+        <div className="w-full space-y-4 md:w-[360px] lg:ml-4">
+          {childLocations?.length ? (
+            <Card>
+              <div className="text-sm font-semibold text-gray-900">
+                Child locations
+              </div>
+              <div className="mt-3 text-sm text-gray-700">
+                <LocationTree nodes={childLocations} />
+              </div>
+            </Card>
+          ) : null}
+
+          {location.description ? (
+            <Card className="md:rounded-t-none">
+              <p className=" text-gray-600">{location.description}</p>
+            </Card>
+          ) : null}
+
+          <TextualDivider text="Details" className="my-8 lg:hidden" />
+
+          <div className="flex items-start justify-between gap-10 rounded border border-gray-200 bg-white px-4 py-5">
+            <span className=" text-xs font-medium text-gray-600">Address</span>
+            <span className="font-medium">{location.address ?? "-"}</span>
+          </div>
+
+          {mapData ? (
+            <div className="mb-10 mt-4 border">
+              <ShelfMap latitude={mapData.lat} longitude={mapData.lon} />
+              <div className="border border-gray-200 p-4 text-center text-text-xs text-gray-600">
+                <p>
+                  <Button
+                    to={`https://www.google.com/maps/search/?api=1&query=${mapData.lat},${mapData.lon}&zoom=15&markers=${mapData.lat},${mapData.lon}`}
+                    variant="link"
+                    target="_blank"
+                    rel="nofollow noopener noreferrer"
+                  >
+                    See in Google Maps
+                  </Button>
+                </p>
+                <p className="mt-2 text-xs">
+                  Geocoding by{" "}
+                  <a
+                    href="https://nominatim.openstreetmap.org/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-primary-600 underline"
+                  >
+                    OpenStreetMap Nominatim
+                  </a>
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="mb-10 mt-4 border">
+              <MapPlaceholder
+                description={
+                  location.address
+                    ? "We couldn't geolocate your address. Please try formatting it differently."
+                    : "Add an address to see it on the map."
+                }
+              />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LocationBreadcrumbs({
+  breadcrumbs,
+}: {
+  breadcrumbs: LocationBreadcrumb[];
+}) {
+  if (!breadcrumbs.length) {
+    return null;
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+      {breadcrumbs.map((crumb, index) => (
+        <span key={crumb.id} className="flex items-center gap-1">
+          <Button
+            to={`/locations/${crumb.id}`}
+            variant="link"
+            className="h-auto p-0 text-[11px] text-gray-600 hover:text-primary-600"
+          >
+            {crumb.name}
+          </Button>
+          {index < breadcrumbs.length - 1 && (
+            <span className="text-gray-400" aria-hidden="true">
+              ›
+            </span>
+          )}
+        </span>
+      ))}
+    </div>
+  );
+}

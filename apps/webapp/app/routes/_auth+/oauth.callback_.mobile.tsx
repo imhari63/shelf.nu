@@ -1,0 +1,321 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  ActionFunctionArgs,
+  LoaderFunctionArgs,
+  MetaFunction,
+} from "react-router";
+import {
+  data,
+  redirect,
+  useActionData,
+  useFetcher,
+  useLoaderData,
+} from "react-router";
+import { useZorm } from "react-zorm";
+import { z } from "zod";
+import { Form } from "~/components/custom-form";
+import { ShelfOTP } from "~/components/forms/otp-input";
+import { Button } from "~/components/shared/button";
+import { useSearchParams } from "~/hooks/search-params";
+import { useDisabled } from "~/hooks/use-disabled";
+import { verifyOtpAndSignin } from "~/modules/auth/service.server";
+import { isSsoDomainEmail } from "~/modules/auth/sso-enforcement.server";
+import {
+  getSelectedOrganization,
+  setSelectedOrganizationIdCookie,
+} from "~/modules/organization/context.server";
+import {
+  readSignupIntent,
+  signupIntentHeaders,
+} from "~/modules/signup-intent/cookie.server";
+import { createUser, findUserById } from "~/modules/user/service.server";
+import { generateUniqueUsername } from "~/modules/user/utils.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { detectFormatPrefsForPersistence } from "~/utils/client-hints";
+import { expireListPreferenceCookies, setCookie } from "~/utils/cookies.server";
+import { ShelfError, makeShelfError, notAllowedMethod } from "~/utils/error";
+import { isFormProcessing } from "~/utils/form";
+import {
+  payload,
+  error,
+  getActionMethod,
+  parseData,
+  safeRedirect,
+} from "~/utils/http.server";
+import { validEmail } from "~/utils/misc";
+import { getOtpPageData, type OtpVerifyMode } from "~/utils/otp";
+import { tw } from "~/utils/tw";
+import type { action as resendOtpAction } from "./resend-otp";
+
+export async function loader({ context, request }: LoaderFunctionArgs) {
+  const { searchParams } = new URL(request.url);
+  const mode = searchParams.get("mode") as OtpVerifyMode;
+  const title = getOtpPageData(mode).title;
+
+  if (context.isAuthenticated) {
+    return redirect("/");
+  }
+
+  /**
+   * An address that must use SSO is sent no code, and the send answers as if
+   * it were. This page tells everyone on an SSO domain where to go instead. It
+   * depends only on the domain, so it says nothing about any one account.
+   */
+  const email = searchParams.get("email") ?? "";
+  const ssoDomainHint = validEmail(email)
+    ? await isSsoDomainEmail(email).catch(() => false)
+    : false;
+
+  return payload({ title, ssoDomainHint });
+}
+
+const OtpSchema = z.object({
+  otp: z.string().min(2, "Please enter the code sent to your email"),
+  email: z
+    .string()
+    .transform((email) => email.toLowerCase())
+    .refine(validEmail, () => ({
+      message: "Please enter a valid email",
+    })),
+});
+
+export async function action({ context, request }: ActionFunctionArgs) {
+  try {
+    const method = getActionMethod(request);
+
+    switch (method) {
+      case "POST": {
+        let formData: FormData;
+        try {
+          formData = await request.formData();
+        } catch (cause) {
+          return data(
+            error(
+              new ShelfError({
+                cause,
+                message: "Invalid request body",
+                label: "Request validation",
+                shouldBeCaptured: false,
+                status: 400,
+              }),
+              false
+            ),
+            { status: 400 }
+          );
+        }
+
+        const { email, otp } = parseData(formData, OtpSchema, {
+          shouldBeCaptured: false,
+        });
+
+        const authSession = await verifyOtpAndSignin(email, otp);
+        // Whether this person already has an account is decided by the
+        // authenticated id, never by the address typed: the same person can
+        // type it with different capitals, and each spelling must reach the
+        // same account instead of creating another.
+        const existingUser = await findUserById(authSession.userId);
+        const userExists = Boolean(existingUser);
+
+        // What the signup link asked for, carried by cookie. A new account
+        // records it on its signup event; the cookie then travels on for
+        // onboarding to store and act on. A login is not a signup: the form
+        // posts back to this page's URL, so `mode` is on the request, and a
+        // login ignores whatever intent an earlier `/join` visit left behind.
+        const isLogin =
+          new URL(request.url).searchParams.get("mode") === "login";
+        const signupIntent = isLogin ? null : await readSignupIntent(request);
+
+        if (!userExists) {
+          try {
+            const username = await generateUniqueUsername(authSession.email);
+            // Detect the caller's date/time/week/timezone prefs from browser
+            // hints (accept-language + CH-time-zone cookie) and stamp them on
+            // the new row. timeZone is left null when the cookie hasn't
+            // round-tripped yet (see detectFormatPrefsForPersistence), so the
+            // lazy backfill fills the real zone on a later load — never the
+            // "UTC" fallback, which would stick forever.
+            const formatPrefs = detectFormatPrefsForPersistence(request);
+            await createUser({
+              ...authSession,
+              username,
+              formatPrefs,
+              signupIntent,
+            });
+          } catch (createError) {
+            // Two sign-ins for the same person can run at once: if the other
+            // one created the account first, carry on with it.
+            const userNowExists = Boolean(
+              await findUserById(authSession.userId)
+            );
+            if (!userNowExists) {
+              throw createError;
+            }
+          }
+        }
+
+        // Setting the auth session and redirecting to the role's landing page
+        context.setSession(authSession);
+
+        const { organizationId } = await getSelectedOrganization({
+          userId: authSession.userId,
+          request,
+        });
+
+        // The link's `redirectTo` is followed only by an account that has
+        // already onboarded. Everyone else lands on `/`, whose role landing page
+        // sits inside the layout that sends them to onboarding: `redirectTo` can name a page outside that
+        // layout (the QR pages have no onboarding check), and following it
+        // would skip onboarding altogether.
+        const landing = existingUser?.onboarded
+          ? safeRedirect(signupIntent?.redirectTo, "/")
+          : "/";
+
+        return redirect(landing, {
+          headers: [
+            ...(await expireListPreferenceCookies(request, {
+              event: "sign-in",
+            })),
+            setCookie(await setSelectedOrganizationIdCookie(organizationId)),
+            ...(await signupIntentHeaders(signupIntent)),
+          ],
+        });
+      }
+    }
+
+    throw notAllowedMethod(method);
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: data ? appendToMetaTitle(data.title) : "" },
+];
+
+type resendAction = typeof resendOtpAction;
+
+export default function OtpPage() {
+  const [message, setMessage] = useState<{
+    message: string;
+    type: "success" | "error";
+  }>();
+  const data = useActionData<typeof action>();
+  const { ssoDomainHint } = useLoaderData<typeof loader>();
+  const [searchParams] = useSearchParams();
+  const fetcher = useFetcher<resendAction>();
+
+  const formRef = useRef<HTMLFormElement>(null);
+  const zo = useZorm("otpForm", OtpSchema);
+  const zormRef = useCallback(
+    (el: HTMLFormElement | null) => {
+      zo.ref(el);
+      formRef.current = el;
+    },
+    [zo]
+  );
+  const fetcherDisabled = isFormProcessing(fetcher.state);
+  const disabled = useDisabled();
+
+  const email = searchParams.get("email") || "";
+  const mode = searchParams.get("mode") as OtpVerifyMode;
+  const pageData = getOtpPageData(mode);
+
+  function handleResendOtp() {
+    const formData = new FormData();
+    formData.append("email", email);
+    formData.append("mode", mode);
+
+    try {
+      void fetcher.submit(formData, {
+        method: "POST",
+        action: "/resend-otp",
+      });
+    } catch {
+      setMessage({
+        message: "Something went wrong. Please try again.",
+        type: "error",
+      });
+    }
+  }
+
+  /** Handle success and error state when resending with fetcher */
+  useEffect(() => {
+    if (fetcher?.data) {
+      if (fetcher.data.error) {
+        setMessage({
+          message: fetcher.data.error.message,
+          type: "error",
+        });
+      } else {
+        setMessage({ message: pageData.resentMessage, type: "success" });
+      }
+    }
+  }, [fetcher, pageData.resentMessage]);
+
+  return (
+    <>
+      <pageData.SubHeading email={email} />
+
+      <div className="mt-2 flex min-h-full flex-col justify-center">
+        <div className="mx-auto w-full max-w-md px-8">
+          <Form ref={zormRef} method="post" className="space-y-6">
+            <ShelfOTP
+              error={data?.error.message}
+              onComplete={() => formRef.current?.requestSubmit()}
+            />
+
+            <input
+              type="hidden"
+              name="email"
+              value={searchParams.get("email") || ""}
+            />
+
+            {ssoDomainHint ? (
+              <p className="text-sm text-gray-600">
+                If your organization uses single sign-on, you may not receive a
+                code. Use{" "}
+                <Button variant="link" to="/sso-login">
+                  Login with SSO
+                </Button>{" "}
+                instead.
+              </p>
+            ) : null}
+
+            {message?.message && (
+              <p
+                className={tw(
+                  " text-sm",
+                  message.type === "error"
+                    ? "text-error-500"
+                    : "text-success-500"
+                )}
+              >
+                {message.message}
+              </p>
+            )}
+
+            <Button
+              data-test-id="create-account"
+              type="submit"
+              className="w-full "
+              disabled={fetcherDisabled || disabled}
+            >
+              {pageData.buttonTitle}
+            </Button>
+          </Form>
+
+          <button
+            className="mt-6 w-full text-center text-sm font-semibold"
+            onClick={handleResendOtp}
+          >
+            Did not receive a code?{" "}
+            <span className="text-primary-500">
+              {fetcherDisabled ? "Sending code..." : "Send again"}
+            </span>
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}

@@ -1,0 +1,233 @@
+import { TagUseFor } from "@prisma/client";
+import type { LoaderFunctionArgs, MetaFunction } from "react-router";
+import { data, redirect, useActionData, useLoaderData } from "react-router";
+import { useZorm } from "react-zorm";
+import { z } from "zod";
+import { Form } from "~/components/custom-form";
+import {
+  ColorBadgePreview,
+  useColorBadgePreview,
+} from "~/components/forms/color-badge-preview";
+import { ColorInput } from "~/components/forms/color-input";
+import { FormRowErrors, rowErrorId } from "~/components/forms/form-row-errors";
+import Input from "~/components/forms/input";
+import MultiSelect from "~/components/multi-select/multi-select";
+import { Button } from "~/components/shared/button";
+import { useAutoFocus } from "~/hooks/use-auto-focus";
+
+import { useDisabled } from "~/hooks/use-disabled";
+
+import { createTag } from "~/modules/tag/service.server";
+import { tagUseForOptions } from "~/modules/tag/use-for-options";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError } from "~/utils/error";
+import { getRandomColor } from "~/utils/get-random-color";
+import { getValidationErrors } from "~/utils/http";
+import { assertIsPost, payload, error, parseData } from "~/utils/http.server";
+import {
+  labelNameSchema,
+  optionalHexColorSchema,
+} from "~/utils/label-form-fields";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { zodFieldIsRequired } from "~/utils/zod";
+
+export const NewTagFormSchema = z.object({
+  name: labelNameSchema,
+  description: z.string(),
+  color: optionalHexColorSchema,
+  useFor: z
+    .string()
+    .optional()
+    .transform((value) => (value && value.length > 0 ? value.split(",") : []))
+    .pipe(z.array(z.nativeEnum(TagUseFor)).optional().default([])),
+});
+
+const title = "New Tag";
+
+export async function loader({ context, request }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    await requirePermission({
+      userId: authSession.userId,
+      request,
+      entity: PermissionEntity.tag,
+      action: PermissionAction.create,
+    });
+
+    const header = {
+      title,
+    };
+
+    return payload({
+      header,
+      colorFromServer: getRandomColor(),
+      tagUseFor: tagUseForOptions(),
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: data ? appendToMetaTitle(data.header.title) : "" },
+];
+
+export async function action({ context, request }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    assertIsPost(request);
+
+    const { organizationId } = await requirePermission({
+      userId: authSession.userId,
+      request,
+      entity: PermissionEntity.tag,
+      action: PermissionAction.create,
+    });
+
+    const payload = parseData(await request.formData(), NewTagFormSchema, {
+      additionalData: { userId, organizationId },
+    });
+
+    await createTag({
+      ...payload,
+      userId: authSession.userId,
+      organizationId,
+    });
+
+    sendNotification({
+      title: "Tag created",
+      message: "Your tag has been created successfully",
+      icon: { name: "success", variant: "success" },
+      senderId: authSession.userId,
+    });
+
+    return redirect(`/tags`);
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export default function NewTag() {
+  // Focus the Name input on mount of the new-tag page.
+  const nameInputRef = useAutoFocus<HTMLInputElement>();
+  const zo = useZorm("NewQuestionWizardScreen", NewTagFormSchema);
+  const { tagUseFor, colorFromServer } = useLoaderData<typeof loader>();
+  const { previewName, setPreviewName, previewColor, setPreviewColor } =
+    useColorBadgePreview({ entityId: "new", name: "", color: colorFromServer });
+
+  const disabled = useDisabled();
+  const actionData = useActionData<typeof action>();
+  /** Server-side errors, shown when client-side validation is bypassed */
+  const validationErrors = getValidationErrors<typeof NewTagFormSchema>(
+    actionData?.error
+  );
+  const nameError =
+    validationErrors?.name?.message || zo.errors.name()?.message;
+  const colorError =
+    validationErrors?.color?.message || zo.errors.color()?.message;
+  /** The row is bottom-aligned, so field errors render below it, not per input */
+  const errorsId = "tag-form-errors";
+
+  return (
+    <>
+      <Form
+        method="post"
+        className="block rounded border border-gray-200 bg-white px-6 py-5 "
+        ref={zo.ref}
+      >
+        <div className="lg:flex lg:items-end lg:justify-between lg:gap-3">
+          <div className="gap-3 lg:flex lg:items-end">
+            <Input
+              ref={nameInputRef}
+              label="Name"
+              placeholder="Tag name"
+              className="mb-4 lg:mb-0 lg:max-w-[180px]"
+              name={zo.fields.name()}
+              onChange={(e) => setPreviewName(e.target.value)}
+              disabled={disabled}
+              error={nameError}
+              hideErrorText
+              aria-describedby={
+                nameError ? rowErrorId(errorsId, "name") : undefined
+              }
+              required={zodFieldIsRequired(NewTagFormSchema.shape.name)}
+            />
+            <Input
+              label="Description"
+              placeholder="Description (optional)"
+              name={zo.fields.description()}
+              disabled={disabled}
+              data-test-id="tagDescription"
+              className="mb-4 lg:mb-0"
+              required={zodFieldIsRequired(NewTagFormSchema.shape.description)}
+            />
+            <div className="mb-6 lg:mb-0">
+              <ColorInput
+                name={zo.fields.color()}
+                disabled={disabled}
+                error={colorError}
+                hideErrorText
+                aria-describedby={
+                  colorError ? rowErrorId(errorsId, "color") : undefined
+                }
+                colorFromServer={colorFromServer}
+                onColorChange={setPreviewColor}
+                required={zodFieldIsRequired(NewTagFormSchema.shape.color)}
+              />
+            </div>
+            <MultiSelect
+              name="useFor"
+              items={tagUseFor}
+              labelKey="label"
+              valueKey="value"
+              label="Use for"
+              placeholder="Select use for"
+              tooltip={{
+                title: "Use for",
+                content:
+                  "When no specific entry is selected, this tag will be available for all entries.",
+              }}
+            />
+          </div>
+
+          <div className="flex gap-1">
+            <Button
+              variant="secondary"
+              to="/tags"
+              size="sm"
+              disabled={disabled}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" size="sm" disabled={disabled}>
+              Create
+            </Button>
+          </div>
+        </div>
+
+        <ColorBadgePreview name={previewName} color={previewColor} />
+        <FormRowErrors
+          id={errorsId}
+          errors={{ name: nameError, color: colorError }}
+        />
+        {/* Any other failure (e.g. a duplicate name) has no field to point at */}
+        {actionData?.error && !nameError && !colorError ? (
+          <div className="mt-3 text-sm text-error-500">
+            {actionData.error.message}
+          </div>
+        ) : null}
+      </Form>
+    </>
+  );
+}

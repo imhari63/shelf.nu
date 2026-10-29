@@ -1,0 +1,584 @@
+import { useState } from "react";
+import { KIT_MEMBERS_CUSTODY_BLOCKED_REASON } from "@shelf/labels";
+import { useAtomValue } from "jotai";
+import { useNavigation } from "react-router";
+import { useHydrated } from "remix-utils/use-hydrated";
+import { selectedBulkItemsAtom } from "~/atoms/list";
+import { useSearchParams } from "~/hooks/search-params";
+import { useCanArchiveAssets } from "~/hooks/use-can-archive-assets";
+import { useCanViewArchivedAssets } from "~/hooks/use-can-view-archived-assets";
+import { useControlledDropdownMenu } from "~/hooks/use-controlled-dropdown-menu";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { useUserData } from "~/hooks/use-user-data";
+import { getRowKitStatus, isIndividualKitMember } from "~/modules/asset/utils";
+import { getPrimaryCustody } from "~/modules/custody/utils";
+import { isFormProcessing } from "~/utils/form";
+import { isSelectingAllItems } from "~/utils/list";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { userHasPermission } from "~/utils/permissions/permission.validator.client";
+import { tw } from "~/utils/tw";
+import BookSelectedAssetsDropdown from "./assets-index/book-selected-assets-dropdown";
+import BulkAddToAuditDialog from "./bulk-add-to-audit-dialog";
+import BulkAddToKitDialog from "./bulk-add-to-kit-dialog";
+import BulkArchiveDialog from "./bulk-archive-dialog";
+import BulkAssetModelRemoveDialog from "./bulk-asset-model-remove-dialog";
+import BulkAssetModelUpdateDialog from "./bulk-asset-model-update-dialog";
+import BulkAssignCustodyDialog from "./bulk-assign-custody-dialog";
+import BulkAssignTagsDialog from "./bulk-assign-tags-dialog";
+import BulkCategoryUpdateDialog from "./bulk-category-update-dialog";
+import BulkDeleteDialog from "./bulk-delete-dialog";
+import BulkDownloadQrDialog from "./bulk-download-qr-dialog";
+import BulkLocationUpdateDialog from "./bulk-location-update-dialog";
+import BulkMarkAvailabilityDialog from "./bulk-mark-availability-dialog";
+import BulkReleaseCustodyDialog from "./bulk-release-custody-dialog";
+import BulkRemoveFromKits from "./bulk-remove-from-kits";
+import BulkRemoveTagsDialog from "./bulk-remove-tags-dialog";
+import BulkSetReorderPointDialog from "./bulk-set-reorder-point-dialog";
+import BulkStartAuditDialog from "./bulk-start-audit-dialog";
+import { BulkUpdateDialogTrigger } from "../bulk-update-dialog/bulk-update-dialog";
+import Icon from "../icons/icon";
+import { ChevronRight } from "../icons/library";
+import { Button } from "../shared/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../shared/dropdown";
+import { MobileDropdownStyles } from "../shared/mobile-dropdown-styles";
+import When from "../when/when";
+
+export default function BulkActionsDropdown() {
+  const isHydrated = useHydrated();
+
+  if (!isHydrated) {
+    return (
+      <Button variant="secondary" to="#" className="font-medium">
+        <span className="flex items-center gap-2">
+          Actions <ChevronRight className="chev rotate-90" />
+        </span>
+      </Button>
+    );
+  }
+
+  return (
+    <div className="actions-dropdown flex w-full items-center gap-2">
+      <ConditionalDropdown />
+      <BookSelectedAssetsDropdown />
+    </div>
+  );
+}
+
+// react-doctor:no-giant-component — deferred for follow-up refactor
+function ConditionalDropdown() {
+  const navigation = useNavigation();
+  const isLoading = isFormProcessing(navigation.state);
+  const [isBulkDownloadQrOpen, setIsBulkDownloadQrOpen] = useState(false);
+
+  const {
+    ref: dropdownRef,
+    onOpenChange,
+    open,
+    defaultOpen,
+    setOpen,
+  } = useControlledDropdownMenu();
+
+  const selectedAssets = useAtomValue(selectedBulkItemsAtom);
+  const disabled = selectedAssets.length === 0;
+
+  const allSelected = isSelectingAllItems(selectedAssets);
+
+  const [searchParams] = useSearchParams();
+  /** Archive and Reinstate share one grant, `asset: archive` (issue #382). */
+  const canArchiveAssets = useCanArchiveAssets();
+  const canViewArchivedAssets = useCanViewArchivedAssets();
+  /**
+   * The view the list actually shows. The server honours `?archived=` only
+   * for members who may see archived assets; anyone else sees the Active view
+   * whatever the URL says, so their menu must not act as if it were the
+   * Archived one.
+   */
+  const viewParam = canViewArchivedAssets ? searchParams.get("archived") : null;
+  // In the Archived view the selection is archived assets, which are frozen:
+  // every bulk action is disabled except Reinstate (the calm "archived =
+  // read-only except reinstate" rule, issue #382).
+  const archivedView = viewParam === "archived";
+  /**
+   * Whether this selection is frozen. The view alone is not enough: the All
+   * view mixes active and archived rows, so an archived asset picked there
+   * would otherwise light up custody, tags, location, category, kit and
+   * availability. Check the rows themselves, and when "select all" is active
+   * (which puts only the ALL_SELECTED_KEY marker in the selection) fall back
+   * to the view, since any view other than Active can contain archived rows.
+   */
+  const selectionIsArchived = archivedView
+    ? true
+    : allSelected
+    ? viewParam === "all"
+    : selectedAssets.some((asset) => !!asset.archivedAt);
+  // Only members holding `asset: archive` can reinstate, so anyone else who
+  // sees the Archived view (a Manager) is pointed at who can.
+  const archivedBulkDisabled: { reason: string } | false = selectionIsArchived
+    ? {
+        reason: canArchiveAssets
+          ? "Archived assets are read-only. Reinstate them to make changes."
+          : "Archived assets are read-only. Ask an admin to reinstate them.",
+      }
+    : false;
+
+  const roles = useOrganizationRoles();
+  const assignsSelfOnly = useRoleAccess().custody.assign === "self";
+  const user = useUserData();
+
+  /**
+   * Due to select all multi page selection,
+   * some of the checks we do cannot be completed as we dont have the data loaded from the server.
+   * As a solution for now we will handle the validation serverSide if hasSelectedAll is true
+   */
+  const allAssetsAreInCustody =
+    allSelected ||
+    selectedAssets.every((asset) => asset.status === "IN_CUSTODY");
+
+  const allAssetsAreAvailable =
+    allSelected ||
+    selectedAssets.every((asset) => asset.status === "AVAILABLE");
+
+  const someAssetCheckedOut = selectedAssets.some(
+    (asset) => asset.status === "CHECKED_OUT"
+  );
+
+  /**
+   * A selected asset whose kit is not available (in custody or checked out):
+   * its custody is the kit's to change. Read through `getRowKitStatus`, which
+   * understands both index row shapes; simple-mode rows carry no `kit` field.
+   */
+  const someAssetPartOfUnavailableKit = selectedAssets.some((asset) => {
+    const kitStatus = getRowKitStatus(asset);
+    return kitStatus !== null && kitStatus !== "AVAILABLE";
+  });
+
+  /**
+   * An individually tracked kit member takes custody through its kit, so bulk
+   * "Assign custody" is disabled while one is selected. Reads both index row
+   * shapes (`assetKits` in simple mode, `kit` in advanced mode). Advisory: the
+   * server refuses the same request (`assertNotKitMembers`), including for a
+   * "select all" whose rows are not loaded here.
+   */
+  const someAssetIsIndividualKitMember = selectedAssets.some((asset) =>
+    isIndividualKitMember(asset)
+  );
+
+  const selfUserCustody = selectedAssets.some((a) => {
+    const primary = getPrimaryCustody(
+      a?.custody as Record<string, unknown>[] | undefined
+    ) as { custodian?: { userId?: string } } | null;
+    return primary?.custodian?.userId === user?.id;
+  });
+  const disableReleaseCustody = assignsSelfOnly && !selfUserCustody;
+
+  function closeMenu() {
+    setOpen(false);
+  }
+
+  return (
+    <>
+      {open && (
+        <div
+          className={tw(
+            "fixed right-0 top-0 z-10 h-screen w-screen cursor-pointer bg-gray-700/50  transition duration-300 ease-in-out md:hidden"
+          )}
+        />
+      )}
+      <When
+        truthy={userHasPermission({
+          roles,
+          entity: PermissionEntity.asset,
+          action: PermissionAction.update,
+        })}
+      >
+        <BulkLocationUpdateDialog />
+        <BulkAssignTagsDialog />
+        <BulkRemoveTagsDialog />
+        <BulkCategoryUpdateDialog />
+        <BulkSetReorderPointDialog />
+        <BulkAssetModelUpdateDialog />
+        <BulkAssetModelRemoveDialog />
+        <BulkDeleteDialog />
+        <BulkMarkAvailabilityDialog type="available" />
+        <BulkMarkAvailabilityDialog type="unavailable" />
+        <BulkAddToKitDialog />
+        <BulkRemoveFromKits />
+      </When>
+      {/* Archive and Reinstate share their own grant, `asset: archive`. */}
+      <When truthy={canArchiveAssets}>
+        <BulkArchiveDialog type="archive" />
+        <BulkArchiveDialog type="reinstate" />
+      </When>
+
+      {/* Audit dialogs follow the audit grants alone: a Manager runs audits
+          without editing assets. */}
+      <When
+        truthy={userHasPermission({
+          roles,
+          entity: PermissionEntity.audit,
+          action: PermissionAction.create,
+        })}
+      >
+        <BulkStartAuditDialog />
+      </When>
+      <When
+        truthy={userHasPermission({
+          roles,
+          entity: PermissionEntity.audit,
+          action: PermissionAction.update,
+        })}
+      >
+        <BulkAddToAuditDialog />
+      </When>
+
+      <BulkDownloadQrDialog
+        isDialogOpen={isBulkDownloadQrOpen}
+        onClose={() => {
+          setIsBulkDownloadQrOpen(false);
+        }}
+      />
+
+      <When
+        truthy={userHasPermission({
+          roles,
+          entity: PermissionEntity.asset,
+          action: PermissionAction.custody,
+        })}
+      >
+        <BulkAssignCustodyDialog />
+        <BulkReleaseCustodyDialog />
+      </When>
+
+      <DropdownMenu
+        modal={false}
+        onOpenChange={onOpenChange}
+        open={open}
+        defaultOpen={defaultOpen}
+      >
+        <DropdownMenuTrigger
+          className="actions-dropdown hidden font-medium md:flex"
+          onClick={() => setOpen(!open)}
+          asChild
+          disabled={disabled}
+        >
+          <Button
+            type="button"
+            variant="secondary"
+            disabled={
+              disabled
+                ? {
+                    reason:
+                      "You must select at least 1 asset to perform an action",
+                  }
+                : false
+            }
+          >
+            <span className="flex items-center gap-2">Actions</span>
+          </Button>
+        </DropdownMenuTrigger>
+
+        {/* using custom dropdown menu trigger on mobile which only opens dropdown not toggles menu to avoid conflicts with overlay*/}
+        <Button
+          variant="secondary"
+          className="asset-actions flex-1 md:hidden"
+          onClick={() => setOpen(true)}
+          disabled={disabled}
+          type="button"
+        >
+          <span className="flex items-center gap-2">Actions</span>
+        </Button>
+
+        <MobileDropdownStyles open={open} />
+
+        <DropdownMenuContent
+          data-mobile-sheet
+          asChild
+          align="end"
+          className="order actions-dropdown static w-screen rounded-b-none rounded-t-[4px] bg-white p-0 text-right md:static md:w-[230px] md:rounded-t-[4px]"
+          ref={dropdownRef}
+        >
+          <div className="order fixed bottom-0 left-0 w-screen rounded-b-none rounded-t-[4px] bg-white p-0 text-right md:static md:w-[180px] md:rounded-t-[4px]">
+            <DropdownMenuItem
+              onClick={() => {
+                closeMenu();
+                setIsBulkDownloadQrOpen(true);
+              }}
+              className="border-b py-1 lg:p-0"
+            >
+              <Button
+                type="button"
+                variant="link"
+                className="w-full justify-start px-4  py-3 text-gray-700 hover:text-gray-700"
+                width="full"
+              >
+                <span className="flex items-center gap-2">
+                  <Icon icon="download" /> Download QR Codes
+                </span>
+              </Button>
+            </DropdownMenuItem>
+            <When
+              truthy={userHasPermission({
+                roles,
+                entity: PermissionEntity.audit,
+                action: PermissionAction.create,
+              })}
+            >
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="start-audit"
+                  label="Create audit"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+            </When>
+
+            <When
+              truthy={userHasPermission({
+                roles,
+                entity: PermissionEntity.audit,
+                action: PermissionAction.update,
+              })}
+            >
+              <DropdownMenuItem className="border-b py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="add-to-audit"
+                  label="Add to existing audit"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+            </When>
+
+            <When
+              truthy={userHasPermission({
+                roles,
+                entity: PermissionEntity.asset,
+                action: PermissionAction.custody,
+              })}
+            >
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="release-custody"
+                  label="Release custody"
+                  onClick={closeMenu}
+                  disabled={
+                    archivedBulkDisabled ||
+                    (!allAssetsAreInCustody ||
+                    someAssetPartOfUnavailableKit ||
+                    disableReleaseCustody
+                      ? {
+                          reason: someAssetPartOfUnavailableKit
+                            ? "Some of the selected assets have custody assigned via a kit. If you want to change their custody, please update the kit instead."
+                            : disableReleaseCustody
+                            ? "Self service can only release their own custody."
+                            : "Some of the selected assets are not in custody.",
+                        }
+                      : isLoading)
+                  }
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="border-b py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="assign-custody"
+                  label={assignsSelfOnly ? "Take custody" : "Assign custody"}
+                  onClick={closeMenu}
+                  disabled={
+                    archivedBulkDisabled ||
+                    (!allAssetsAreAvailable ||
+                    someAssetPartOfUnavailableKit ||
+                    someAssetIsIndividualKitMember
+                      ? {
+                          reason: someAssetPartOfUnavailableKit
+                            ? "Some of the selected assets have custody assigned via a kit. If you want to change their custody, please update the kit instead."
+                            : someAssetIsIndividualKitMember
+                            ? KIT_MEMBERS_CUSTODY_BLOCKED_REASON
+                            : "Some of the selected assets are not available.",
+                        }
+                      : isLoading)
+                  }
+                />
+              </DropdownMenuItem>
+            </When>
+
+            <When
+              truthy={userHasPermission({
+                roles,
+                entity: PermissionEntity.asset,
+                action: PermissionAction.update,
+              })}
+            >
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="tag-add"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                  label="Assign tags"
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="tag-remove"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                  label="Remove tags"
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="border-t py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="location"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="category"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+              {/* Sits beside category rather than at the bottom of the menu:
+                  min quantity is the input Stock status depends on, and
+                  10 of 12 quantity assets in a real workspace have none. This
+                  is the only bulk way to fix that. */}
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="reorder-point"
+                  label="Set min quantity"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="asset-model"
+                  label="Update asset model"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="asset-model-remove"
+                  label="Remove from asset model"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="border-t py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  label="Add to kit"
+                  type="add-to-kit"
+                  onClick={closeMenu}
+                  disabled={
+                    archivedBulkDisabled ||
+                    (someAssetCheckedOut
+                      ? {
+                          reason:
+                            "Some of the selected kits are checked out. Please finish your booking first, before adding them in kit.",
+                        }
+                      : isLoading)
+                  }
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className=" py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  label="Remove from kit"
+                  type="remove-from-kit"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="border-t py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  label="Mark as available"
+                  type="available"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="border-b py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  label="Mark as unavailable"
+                  type="unavailable"
+                  onClick={closeMenu}
+                  disabled={archivedBulkDisabled || isLoading}
+                />
+              </DropdownMenuItem>
+
+              <When truthy={canArchiveAssets}>
+                <DropdownMenuItem className="py-1 lg:p-0">
+                  <BulkUpdateDialogTrigger
+                    type="archive"
+                    label="Archive"
+                    onClick={closeMenu}
+                    disabled={
+                      archivedView
+                        ? { reason: "These assets are already archived." }
+                        : isLoading
+                    }
+                  />
+                </DropdownMenuItem>
+                <DropdownMenuItem className="border-b py-1 lg:p-0">
+                  <BulkUpdateDialogTrigger
+                    type="reinstate"
+                    label="Reinstate"
+                    onClick={closeMenu}
+                    disabled={
+                      archivedView
+                        ? isLoading
+                        : {
+                            reason:
+                              "Switch to the Archived view to reinstate assets.",
+                          }
+                    }
+                  />
+                </DropdownMenuItem>
+              </When>
+
+              <DropdownMenuItem className="py-1 lg:p-0">
+                <BulkUpdateDialogTrigger
+                  type="trash"
+                  label="Delete"
+                  onClick={closeMenu}
+                  disabled={
+                    // Archived assets can still be permanently deleted in bulk
+                    // (Delete + Reinstate are the only allowed bulk actions).
+                    someAssetCheckedOut
+                      ? {
+                          reason:
+                            "Some of the selected kits are checked out. Please finish your booking first, before deleting them.",
+                        }
+                      : isLoading
+                  }
+                />
+              </DropdownMenuItem>
+              <DropdownMenuItem className="border-t md:hidden lg:p-0">
+                <Button
+                  type="button"
+                  role="button"
+                  variant="secondary"
+                  className="flex items-center justify-center text-gray-700 hover:text-gray-700 "
+                  width="full"
+                  onClick={() => setOpen(false)}
+                >
+                  Close
+                </Button>
+              </DropdownMenuItem>
+            </When>
+          </div>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </>
+  );
+}

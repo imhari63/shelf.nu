@@ -1,0 +1,173 @@
+import type { MetaFunction } from "react-router";
+import { data, type LoaderFunctionArgs } from "react-router";
+import { z } from "zod";
+import type { HeaderData } from "~/components/layout/header/types";
+import { decorateBookingsForList } from "~/modules/booking/list-flags.server";
+import {
+  getBookings,
+  resolveCustodianScope,
+} from "~/modules/booking/service.server";
+import { TAG_WITH_COLOR_SELECT } from "~/modules/tag/constants";
+import { getTagsForBookingTagsFilter } from "~/modules/tag/service.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import {
+  setCookie,
+  updateCookieWithPerPage,
+  userPrefs,
+} from "~/utils/cookies.server";
+import { makeShelfError } from "~/utils/error";
+import {
+  payload,
+  error,
+  getCurrentSearchParams,
+  getParams,
+} from "~/utils/http.server";
+import { getParamsValues } from "~/utils/list";
+import { parseMarkdownToReact } from "~/utils/md";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import BookingsIndexPage, {
+  bookingsSearchFieldTooltipText,
+} from "./bookings._index";
+
+export const meta: MetaFunction<typeof loader> = ({ loaderData }) => [
+  { title: appendToMetaTitle(loaderData?.header?.title) },
+];
+
+export async function loader({ context, request, params }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  const { userId: selectedUserId } = getParams(
+    params,
+    z.object({ userId: z.string() }),
+    {
+      additionalData: { userId },
+    }
+  );
+
+  try {
+    const { organizationId } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.teamMemberProfile,
+      action: PermissionAction.read,
+    });
+
+    const searchParams = getCurrentSearchParams(request);
+    const {
+      page,
+      perPageParam,
+      search,
+      status,
+      tags: filterTags,
+    } = getParamsValues(searchParams);
+
+    const cookie = await updateCookieWithPerPage(request, perPageParam);
+    const { perPage } = cookie;
+
+    // Scopes to the profile being viewed, NOT the viewer: this route renders
+    // one user's bookings. Only roles that see every booking can open another
+    // member's profile (`teamMemberProfile:read` implies
+    // `bookings.see === "all"`, pinned in
+    // `packages/permissions/src/policies.test.ts`), so no visibility filter
+    // applies here. Do not substitute the caller's id. Resolves all of the
+    // viewed user's team-member links so legacy team-member-linked bookings
+    // show, matching their own index.
+    const custodianScope = await resolveCustodianScope({
+      userId: selectedUserId,
+      organizationId,
+    });
+
+    const [{ bookings, bookingCount }, tagsData] = await Promise.all([
+      getBookings({
+        organizationId,
+        page,
+        perPage,
+        search,
+        userId: authSession?.userId,
+        custodianScope,
+        ...(status && {
+          // If status is in the params, we filter based on it
+          statuses: [status],
+        }),
+        tags: filterTags,
+        // PERF: the list renders booking-level fields plus an asset COUNT. The
+        // per-booking `bookingAssets` payload existed only for the assets
+        // drawer, which now fetches it from
+        // `/api/bookings/:bookingId/assets-sidebar` when a row is expanded.
+        includeAssets: false,
+        extraInclude: {
+          // Asset count for the row's drawer trigger, now that the pivot rows
+          // themselves are no longer loaded.
+          _count: { select: { bookingAssets: true } },
+          tags: TAG_WITH_COLOR_SELECT,
+          // The unassigned-units pill reads `item.modelRequests`, and this
+          // route renders the shared bookings row via `BookingsIndexPage`.
+          // Without the include the pill vanishes on a team member's bookings instead of
+          // reading zero — absence reads as "nothing to do".
+          modelRequests: {
+            include: {
+              assetModel: { select: { id: true, name: true } },
+            },
+          },
+        },
+      }),
+      getTagsForBookingTagsFilter({
+        organizationId,
+      }),
+    ]);
+    // Flag bookings whose QUANTITY_TRACKED assets are over-committed in their
+    // window, so the shared list renders the amber "Stock conflict" pill here
+    // too (see `~/modules/booking/stock-conflicts.server`).
+    const decoratedBookings = await decorateBookingsForList({
+      bookings,
+      organizationId,
+    });
+
+    const totalPages = Math.ceil(bookingCount / perPage);
+
+    const header: HeaderData = {
+      title: "Team member bookings",
+    };
+    const modelName = {
+      singular: "booking",
+      plural: "bookings",
+    };
+
+    return data(
+      payload({
+        header,
+        items: decoratedBookings,
+        search,
+        page,
+        totalItems: bookingCount,
+        totalPages,
+        perPage,
+        modelName,
+        ...tagsData,
+        searchFieldTooltip: {
+          title: "Search your bookings",
+          text: parseMarkdownToReact(bookingsSearchFieldTooltipText),
+        },
+      }),
+      {
+        headers: [setCookie(await userPrefs.serialize(cookie))],
+      }
+    );
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export const handle = {
+  name: "$userId.bookings",
+};
+
+export default function UserBookingsPage() {
+  return <BookingsIndexPage disableBulkActions />;
+}

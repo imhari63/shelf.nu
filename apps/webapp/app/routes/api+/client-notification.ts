@@ -1,0 +1,566 @@
+import { Prisma } from "@prisma/client";
+import { data, type LoaderFunctionArgs } from "react-router";
+import { z } from "zod";
+
+import { db } from "~/database/db.server";
+import {
+  resolveAssetImage,
+  serializeImageExpiration,
+} from "~/modules/asset/image-resolution";
+import { ASSET_MODEL_IMAGE_SELECT } from "~/modules/asset/image-select";
+import { resolveBookableListScope } from "~/modules/asset/list-scope.server";
+import { getAssets } from "~/modules/asset/service.server";
+import { getPrimaryLocation } from "~/modules/asset/utils";
+import {
+  custodianScopeClause,
+  resolveCustodianScope,
+} from "~/modules/booking/service.server";
+import { getPrimaryCustody } from "~/modules/custody/utils";
+import { KIT_ACTIVE_MEMBER_COUNT } from "~/modules/kit/fields";
+import {
+  redactCustodianForViewer,
+  type RowWithCustody,
+} from "~/utils/custody-visibility.server";
+import { makeShelfError } from "~/utils/error";
+import { payload, error } from "~/utils/http.server";
+import { isPersonalOrg } from "~/utils/organization";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { hasPermission } from "~/utils/permissions/permission.validator.server";
+import { requirePermission } from "~/utils/roles.server";
+import type { UserNameFields } from "~/utils/user";
+import { resolveUserDisplayName } from "~/utils/user";
+
+const querySchema = z.object({
+  q: z.string().trim().max(100).optional(),
+});
+
+/**
+ * Cross-entity search behind the command palette.
+ *
+ * Queries assets, audits, kits, bookings, locations and team members in one
+ * round trip, each scoped to the active organization.
+ *
+ * Each entity type is searched only for members whose matrix grant covers
+ * reading it. Bookings carry an extra restriction: unless the member's access
+ * (role policy and workspace setting) covers every booking, results are
+ * limited to the caller's own, across both custody links, since a booking may
+ * name them through the user link or through any team-member row they hold.
+ * That restriction is AND-ed, never folded into the search `OR`, so a search
+ * term cannot widen it.
+ *
+ * @param args.context - Carries the auth session
+ * @param args.request - Read for the query string and active organization
+ * @returns Matches per entity, each already scoped to what the caller may see
+ */
+export async function loader({ context, request }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    const url = new URL(request.url);
+    const validated = querySchema.parse({
+      q: url.searchParams.get("q") ?? undefined,
+    });
+    const query = validated.q?.trim() ?? "";
+
+    if (!query) {
+      return data(
+        payload({
+          query,
+          assets: [],
+          audits: [],
+          kits: [],
+          bookings: [],
+          locations: [],
+          teamMembers: [],
+        })
+      );
+    }
+
+    const { organizationId, userOrganizations, currentOrganization, access } =
+      await requirePermission({
+        userId,
+        request,
+        entity: PermissionEntity.commandPaletteSearch,
+        action: PermissionAction.read,
+      });
+
+    const terms = query
+      .split(/[\s,]+/)
+      .map((term) => term.trim())
+      .filter(Boolean)
+      .slice(0, 5);
+
+    const searchTerms = terms.length > 0 ? terms : [query];
+
+    // Helper function to create search conditions for text fields
+    const createTextSearchConditions = (term: string, fields: string[]) =>
+      fields.map((field) => ({
+        [field]: { contains: term, mode: Prisma.QueryMode.insensitive },
+      }));
+
+    // Kit search conditions
+    const kitSearchConditions: Prisma.KitWhereInput[] = searchTerms.map(
+      (term) => ({
+        OR: [
+          ...createTextSearchConditions(term, ["name", "description"]),
+          { id: { contains: term, mode: Prisma.QueryMode.insensitive } },
+        ],
+      })
+    );
+
+    // Booking search conditions
+    const bookingSearchConditions: Prisma.BookingWhereInput[] = searchTerms.map(
+      (term) => ({
+        OR: [
+          ...createTextSearchConditions(term, ["name", "description"]),
+          { id: { contains: term, mode: Prisma.QueryMode.insensitive } },
+        ],
+      })
+    );
+
+    // Location search conditions
+    const locationSearchConditions: Prisma.LocationWhereInput[] =
+      searchTerms.map((term) => ({
+        OR: [
+          ...createTextSearchConditions(term, [
+            "name",
+            "description",
+            "address",
+          ]),
+          { id: { contains: term, mode: Prisma.QueryMode.insensitive } },
+        ],
+      }));
+
+    // Team member search conditions
+    const teamMemberSearchConditions: Prisma.TeamMemberWhereInput[] =
+      searchTerms.map((term) => ({
+        OR: [
+          { name: { contains: term, mode: Prisma.QueryMode.insensitive } },
+          { id: { contains: term, mode: Prisma.QueryMode.insensitive } },
+          {
+            user: {
+              OR: [
+                {
+                  firstName: {
+                    contains: term,
+                    mode: Prisma.QueryMode.insensitive,
+                  },
+                },
+                {
+                  lastName: {
+                    contains: term,
+                    mode: Prisma.QueryMode.insensitive,
+                  },
+                },
+                // `displayName` replaces first/last name in the UI for users
+                // who set one, so it is the name a searcher can actually see.
+                {
+                  displayName: {
+                    contains: term,
+                    mode: Prisma.QueryMode.insensitive,
+                  },
+                },
+                {
+                  email: {
+                    contains: term,
+                    mode: Prisma.QueryMode.insensitive,
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      }));
+
+    // Audit search conditions
+    const auditSearchConditions: Prisma.AuditSessionWhereInput[] =
+      searchTerms.map((term) => ({
+        OR: [
+          ...createTextSearchConditions(term, ["name", "description"]),
+          { id: { contains: term, mode: Prisma.QueryMode.insensitive } },
+        ],
+      }));
+
+    // Check if this is a personal workspace - they don't have bookings or team members
+    const isPersonalWorkspace = isPersonalOrg(currentOrganization);
+
+    // Each entity type follows the matrix grant for reading it.
+    const roles =
+      userOrganizations.find((o) => o.organization.id === organizationId)
+        ?.roles ?? [];
+    const canRead = (entity: PermissionEntity) =>
+      hasPermission({
+        organizationId,
+        userId,
+        roles,
+        entity,
+        action: PermissionAction.read,
+      });
+    const [canReadKits, canReadBookings, canReadLocations, canReadTeam] =
+      await Promise.all([
+        canRead(PermissionEntity.kit),
+        canRead(PermissionEntity.booking),
+        canRead(PermissionEntity.location),
+        canRead(PermissionEntity.teamMember),
+      ]);
+    const hasKitPermission = canReadKits;
+    const hasBookingPermission = !isPersonalWorkspace && canReadBookings;
+    const hasLocationPermission = canReadLocations;
+    const hasTeamMemberPermission = !isPersonalWorkspace && canReadTeam;
+    const hasAuditPermission = true;
+
+    // Prepare where clauses for other entities
+
+    const kitWhere: Prisma.KitWhereInput = {
+      organizationId,
+      ...(kitSearchConditions.length ? { OR: kitSearchConditions } : {}),
+    };
+
+    const bookingWhere: Prisma.BookingWhereInput = {
+      organizationId,
+      ...(bookingSearchConditions.length
+        ? { OR: bookingSearchConditions }
+        : {}),
+      // Members who cannot see every booking see only their own. AND-ed
+      // rather than merged in beside the search `OR` above: custody is itself
+      // an OR across the user link and any team-member link, and a search
+      // term must not be able to widen it away.
+      ...(access.bookings.seeAll
+        ? {}
+        : {
+            AND: [
+              custodianScopeClause(
+                await resolveCustodianScope({ userId, organizationId })
+              ),
+            ],
+          }),
+    };
+
+    const locationWhere: Prisma.LocationWhereInput = {
+      organizationId,
+      ...(locationSearchConditions.length
+        ? { OR: locationSearchConditions }
+        : {}),
+    };
+
+    const teamMemberWhere: Prisma.TeamMemberWhereInput = {
+      organizationId,
+      deletedAt: null,
+      // Combined with AND, not spread in beside each other: both this query's
+      // search `OR` and the custody-scope `OR` below use the same `OR` key, so
+      // spreading them into one object would let the second clobber the
+      // first instead of narrowing it.
+      AND: [
+        ...(teamMemberSearchConditions.length
+          ? [{ OR: teamMemberSearchConditions }]
+          : []),
+        // Members who cannot see all custody see only team members they
+        // share custody with, and themselves
+        ...(access.custody.seeAll
+          ? []
+          : [
+              {
+                OR: [
+                  // Team members they have assets in custody from
+                  {
+                    custodies: {
+                      some: {
+                        custodian: { userId },
+                      },
+                    },
+                  },
+                  // Team members they have kits in custody from
+                  {
+                    kitCustodies: {
+                      some: {
+                        custodian: { userId },
+                      },
+                    },
+                  },
+                  // Their own team member record
+                  { userId },
+                ],
+              },
+            ]),
+      ],
+    };
+
+    const auditWhere: Prisma.AuditSessionWhereInput = {
+      organizationId,
+      ...(auditSearchConditions.length ? { OR: auditSearchConditions } : {}),
+      // Members who cannot see every audit see only those assigned to them
+      ...(!access.audits.seeAll && userId
+        ? {
+            assignments: {
+              some: {
+                userId,
+              },
+            },
+          }
+        : {}),
+    };
+
+    // Execute parallel searches
+    const [assetResults, audits, kits, bookings, locations, teamMembers] =
+      await Promise.all([
+        // Assets (always allowed) - using enhanced search from asset service.
+        // The asset-index default include no longer eagerly loads customFields
+        // (see fields.ts), so add them back here for the command palette,
+        // which surfaces matching custom-field values in its results.
+        getAssets({
+          search: query,
+          organizationId,
+          page: 1,
+          orderBy: "title",
+          orderDirection: "asc",
+          perPage: 8,
+          // The same list scope as the asset index: roles limited to bookable
+          // assets find only those, plus the ones in their own custody.
+          bookableScope: resolveBookableListScope({ access, userId }),
+          extraInclude: {
+            // Model cover image for assets with no image of their own
+            ...ASSET_MODEL_IMAGE_SELECT,
+            barcodes: {
+              select: { id: true, value: true, type: true },
+            },
+            // Pulled so the search-result row can show the asset's
+            // primary placement (read via `getPrimaryLocation`).
+            assetLocations: {
+              select: { location: { select: { name: true } } },
+            },
+            customFields: {
+              where: {
+                customField: { active: true, deletedAt: null },
+              },
+            },
+          },
+        }),
+
+        // Audits (permission-gated)
+        hasAuditPermission
+          ? db.auditSession.findMany({
+              where: auditWhere,
+              take: 6,
+              orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
+              select: {
+                id: true,
+                name: true,
+                description: true,
+                status: true,
+                dueDate: true,
+              },
+            })
+          : Promise.resolve([]),
+
+        // Kits (permission-gated)
+        hasKitPermission
+          ? db.kit.findMany({
+              where: kitWhere,
+              take: 6,
+              orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
+              include: {
+                // Archived members are out of service and not counted.
+                _count: KIT_ACTIVE_MEMBER_COUNT,
+              },
+            })
+          : Promise.resolve([]),
+
+        // Bookings (permission-gated)
+        hasBookingPermission
+          ? db.booking.findMany({
+              where: bookingWhere,
+              take: 6,
+              orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
+              include: {
+                custodianUser: {
+                  select: {
+                    firstName: true,
+                    lastName: true,
+                    displayName: true,
+                    email: true,
+                  },
+                },
+                custodianTeamMember: { select: { name: true } },
+              },
+            })
+          : Promise.resolve([]),
+
+        // Locations (permission-gated)
+        hasLocationPermission
+          ? db.location.findMany({
+              where: locationWhere,
+              take: 6,
+              orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
+              include: {
+                // Archived assets are out of service and not counted.
+                _count: {
+                  select: {
+                    assetLocations: { where: { asset: { archivedAt: null } } },
+                  },
+                },
+              },
+            })
+          : Promise.resolve([]),
+
+        // Team members (permission-gated)
+        hasTeamMemberPermission
+          ? db.teamMember.findMany({
+              where: teamMemberWhere,
+              take: 8,
+              orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
+              include: {
+                user: {
+                  select: {
+                    firstName: true,
+                    lastName: true,
+                    displayName: true,
+                    email: true,
+                  },
+                },
+              },
+            })
+          : Promise.resolve([]),
+      ]);
+
+    return data(
+      payload({
+        query,
+        // A caller who cannot see all custody must not learn who holds an
+        // asset they found by search, so custodians are redacted exactly as
+        // on the asset index before any name is read below.
+        assets: redactCustodianForViewer(
+          // `getAssets` widens its include, so its type shows `custody` as
+          // bare columns while the rows carry the index's custodian select.
+          // Restate that shape at this boundary, as the mapping below does.
+          assetResults.assets as unknown as Array<
+            Omit<(typeof assetResults.assets)[number], "custody"> &
+              RowWithCustody
+          >,
+          { canSeeAllCustody: access.custody.seeAll, userId }
+        ).map((asset) => {
+          /** Custody records from getAssets may include custodian if the query includes it */
+          const primaryCustody = getPrimaryCustody(
+            asset.custody as Array<
+              Record<string, unknown> & {
+                custodian?: {
+                  name?: string;
+                  // `displayName` is required, not optional: `assetIndexFields`
+                  // selects it, and a cast that omits it silently narrows the
+                  // row back to the legal name.
+                  user?: UserNameFields | null;
+                };
+              }
+            >
+          );
+          return {
+            id: asset.id,
+            title: asset.title,
+            sequentialId: asset.sequentialId,
+            // Hand-written projection, so typecheck can't catch a dropped
+            // field — resolve the model-image cascade explicitly.
+            ...(() => {
+              const image = resolveAssetImage({
+                mainImage: asset.mainImage,
+                thumbnailImage: asset.thumbnailImage,
+                assetModel:
+                  (
+                    asset as unknown as {
+                      assetModel: {
+                        image: string | null;
+                        thumbnailImage: string | null;
+                      } | null;
+                    }
+                  ).assetModel ?? null,
+              });
+              const isPlaceholder = image.source === "placeholder";
+              return {
+                mainImage: isPlaceholder ? null : image.fullUrl,
+                thumbnailImage: isPlaceholder ? null : image.thumbnailUrl,
+                mainImageExpiration: serializeImageExpiration(
+                  image.source,
+                  asset.mainImageExpiration?.toISOString() ?? null
+                ),
+              };
+            })(),
+            // `getAssets` widens its `extraInclude` arg to
+            // `Prisma.AssetInclude`, so the return type can't narrow back
+            // to the `assetLocations` shape we requested above. Cast at
+            // the boundary — the docstring on `getPrimaryLocation`
+            // documents this as the escape hatch.
+            locationName:
+              getPrimaryLocation(
+                asset as unknown as {
+                  assetLocations: { location: { name: string } }[];
+                }
+              )?.name ?? null,
+            description: asset.description,
+            qrCodes: asset.qrCodes?.map((qr) => qr.id) ?? [],
+            categoryName: asset.category?.name ?? null,
+            tagNames: asset.tags?.map((tag) => tag.name) ?? [],
+            custodianName: primaryCustody?.custodian?.name ?? null,
+            custodianUserName: primaryCustody?.custodian?.user
+              ? resolveUserDisplayName(primaryCustody.custodian.user)
+              : null,
+            barcodes: asset.barcodes?.map((barcode) => barcode.value) ?? [],
+            customFieldValues:
+              asset.customFields
+                ?.map((cf) => {
+                  const value = cf.value as any;
+                  const extractedValue = value?.raw ?? value ?? "";
+                  return String(extractedValue);
+                })
+                .filter(Boolean) ?? [],
+          };
+        }),
+        audits: audits.map((audit) => ({
+          id: audit.id,
+          name: audit.name,
+          description: audit.description || null,
+          status: audit.status,
+          dueDate: audit.dueDate?.toISOString() || null,
+        })),
+        kits: kits.map((kit) => ({
+          id: kit.id,
+          name: kit.name,
+          description: kit.description || null,
+          status: kit.status,
+          assetCount: kit._count?.assetKits ?? 0,
+        })),
+        bookings: bookings.map((booking) => ({
+          id: booking.id,
+          name: booking.name,
+          description: booking.description || null,
+          status: booking.status,
+          custodianName: booking.custodianUser
+            ? resolveUserDisplayName(booking.custodianUser)
+            : booking.custodianTeamMember?.name || null,
+          from: booking.from?.toISOString() || null,
+          to: booking.to?.toISOString() || null,
+        })),
+        locations: locations.map((location) => ({
+          id: location.id,
+          name: location.name,
+          description: location.description || null,
+          address: location.address || null,
+          assetCount: location._count?.assetLocations || 0,
+        })),
+        teamMembers: teamMembers.map((member) => ({
+          id: member.id,
+          name: member.name,
+          email: member.user?.email || null,
+          firstName: member.user?.firstName || null,
+          lastName: member.user?.lastName || null,
+          displayName: member.user?.displayName ?? null,
+          userId: member.userId,
+        })),
+      })
+    );
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+}

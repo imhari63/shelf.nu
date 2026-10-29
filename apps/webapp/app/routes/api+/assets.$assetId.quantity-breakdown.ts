@@ -1,0 +1,150 @@
+import type { Prisma } from "@prisma/client";
+import { data, type ActionFunctionArgs } from "react-router";
+import { addAssetsToExistingBookingSchema } from "~/components/assets/assets-index/add-assets-to-existing-booking-dialog";
+import {
+  processBooking,
+  updateBookingAssets,
+} from "~/modules/booking/service.server";
+import { createNotes } from "~/modules/note/service.server";
+import { getUserByID } from "~/modules/user/service.server";
+import { getClientHint } from "~/utils/client-hints";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import { assertIsPost, payload, error, parseData } from "~/utils/http.server";
+import { wrapLinkForNote, wrapUserLinkForNote } from "~/utils/markdoc-wrappers";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { intersected } from "~/utils/utils";
+
+/** Shown whenever nothing in the selection can be added to the booking. */
+const ALL_ASSETS_ALREADY_IN_BOOKING =
+  "The booking you have selected already contains all the selected assets. Please select a different booking or different assets.";
+
+export async function action({ request, context }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const userId = authSession.userId;
+
+  try {
+    assertIsPost(request);
+
+    const { organizationId, access } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.booking,
+      action: PermissionAction.update,
+    });
+
+    const formData = await request.formData();
+    const { id, assetsIds, addOnlyRestAssets } = parseData(
+      formData,
+      addAssetsToExistingBookingSchema,
+      {
+        additionalData: { userId },
+      }
+    );
+
+    let { finalAssetIds, bookingInfo } = await processBooking(
+      id,
+      assetsIds,
+      organizationId,
+      { userId, access }
+    );
+
+    /**
+     * Remove already added assets and proceed with not added assets.
+     */
+    if (addOnlyRestAssets) {
+      const bookingAssetIds = bookingInfo.bookingAssets.map((ba) => ba.assetId);
+      finalAssetIds = finalAssetIds.filter(
+        (assetId) => !bookingAssetIds.includes(assetId)
+      );
+
+      // Nothing is left to add when every selected asset is already in the
+      // booking. Say that, rather than handing an empty list on to be reported
+      // as assets that no longer exist.
+      if (finalAssetIds.length === 0) {
+        throw new ShelfError({
+          cause: null,
+          message: ALL_ASSETS_ALREADY_IN_BOOKING,
+          additionalData: { bookingId: id },
+          label: "Booking",
+          status: 400,
+          shouldBeCaptured: false,
+        });
+      }
+    }
+
+    if (
+      bookingInfo.bookingAssets.length &&
+      intersected(
+        bookingInfo.bookingAssets.map((ba) => ba.assetId),
+        finalAssetIds
+      )
+    ) {
+      const alreadyAddedAssets = bookingInfo.bookingAssets.filter((ba) =>
+        finalAssetIds.includes(ba.assetId)
+      );
+      const allAssetsInBooking =
+        alreadyAddedAssets.length === finalAssetIds.length;
+
+      throw new ShelfError({
+        cause: null,
+        message: allAssetsInBooking
+          ? ALL_ASSETS_ALREADY_IN_BOOKING
+          : "The booking you have selected already contains the asset you are trying to add. Please select a different booking.",
+        additionalData: {
+          alreadyAddedAssets,
+          allAssetsInBooking,
+        },
+        label: "Booking",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const user = await getUserByID(userId, {
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      } satisfies Prisma.UserSelect,
+    });
+    const booking = await updateBookingAssets({
+      id,
+      organizationId,
+      assetIds: finalAssetIds,
+      // Re-checks the add rule against the locked booking status.
+      access,
+      hints: getClientHint(request),
+    });
+
+    const actor = wrapUserLinkForNote({ ...user, id: authSession.userId });
+    const bookingLink = wrapLinkForNote(
+      `/bookings/${booking.id}`,
+      booking.name.trim()
+    );
+    await createNotes({
+      content: `${actor} added asset to ${bookingLink}.`,
+      type: "UPDATE",
+      userId: authSession.userId,
+      assetIds: finalAssetIds,
+      organizationId,
+    });
+
+    sendNotification({
+      title: "Booking Updated",
+      message: "Your booking has been updated successfully",
+      icon: { name: "success", variant: "success" },
+      senderId: authSession.userId,
+    });
+
+    return data(payload({ success: true, bookingId: booking.id }));
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    return data(error(reason), { status: reason.status });
+  }
+}

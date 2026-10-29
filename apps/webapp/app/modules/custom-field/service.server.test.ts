@@ -1,0 +1,955 @@
+import { Prisma } from "@prisma/client";
+import type {
+  CustomField,
+  Organization,
+  User,
+  UserOrganization,
+} from "@prisma/client";
+import { db } from "~/database/db.server";
+import { getDefinitionFromCsvHeader } from "~/utils/custom-fields";
+import type { ErrorLabel } from "~/utils/error";
+import {
+  ShelfError,
+  isLikeShelfError,
+  isNotFoundError,
+  maybeUniqueConstraintViolation,
+  rethrowIfClientError,
+} from "~/utils/error";
+import { getRedirectUrlFromRequest } from "~/utils/http";
+import type { OptionRename } from "./option-list";
+import type { CustomFieldDraftPayload } from "./types";
+import { recordEvents } from "../activity-event/service.server";
+import type { CreateAssetFromContentImportPayload } from "../asset/types";
+import type { Column } from "../asset-index-settings/helpers";
+import { syncCustomFieldColumn } from "../asset-index-settings/helpers";
+import {
+  removeCustomFieldFromAssetIndexSettings,
+  updateAssetIndexSettingsAfterCfUpdate,
+  updateAssetIndexSettingsWithNewCustomFields,
+} from "../asset-index-settings/service.server";
+
+const label: ErrorLabel = "Custom fields";
+
+/**
+ * Creates a custom field and gives it a column on the asset index.
+ *
+ * An active field gets a column in every settings row in the organization —
+ * one per user — so it is visible to everyone from the moment it exists. An
+ * inactive one gets none; activating it later adds the columns.
+ *
+ * @param args - The field's definition, its organization, and its author
+ * @returns The created CustomField
+ * @throws {ShelfError} 409 if the organization already has a field with this
+ *   name, or on any other write failure
+ */
+export async function createCustomField({
+  name,
+  helpText,
+  type,
+  required,
+  organizationId,
+  active,
+  userId,
+  options = [],
+  categories = [],
+}: CustomFieldDraftPayload) {
+  try {
+    const [customField, assetIndexSettingsEntries] = await Promise.all([
+      db.customField.create({
+        data: {
+          name,
+          helpText,
+          type,
+          required,
+          active,
+          options,
+          organization: {
+            connect: {
+              id: organizationId,
+            },
+          },
+          createdBy: {
+            connect: {
+              id: userId,
+            },
+          },
+          categories: {
+            connect: categories.map((category) => ({ id: category })),
+          },
+        },
+      }),
+      db.assetIndexSettings.findMany({
+        where: { organizationId },
+      }),
+    ]);
+
+    /** We need to add it to the advanced index settings for each entry belonging to this organization */
+    if (customField.active) {
+      await Promise.all(
+        assetIndexSettingsEntries.map(async (entry) => {
+          const columns = syncCustomFieldColumn(
+            Array.from(entry.columns as Prisma.JsonArray) as Column[],
+            {
+              // A field being created has no former name and no column yet.
+              oldName: customField.name,
+              newName: customField.name,
+              active: true,
+              cfType: customField.type,
+            }
+          );
+
+          await db.assetIndexSettings.update({
+            where: { id: entry.id, organizationId },
+            data: { columns },
+          });
+        })
+      );
+    }
+
+    return customField;
+  } catch (cause) {
+    throw maybeUniqueConstraintViolation(cause, "Custom field", {
+      additionalData: { userId, organizationId },
+    });
+  }
+}
+
+export async function getFilteredAndPaginatedCustomFields(params: {
+  organizationId: Organization["id"];
+  /** Page number. Starts at 1 */
+  page?: number;
+  /** Items to be loaded per page */
+  perPage?: number;
+  search?: string | null;
+}) {
+  const { organizationId, page = 1, perPage = 8, search } = params;
+
+  try {
+    const skip = page > 1 ? (page - 1) * perPage : 0;
+    const take = perPage >= 1 ? perPage : 8; // min 1 and max 25 per page
+
+    /** Default value of where. Takes the items belonging to current user */
+    const where: Prisma.CustomFieldWhereInput = {
+      organizationId,
+      deletedAt: null,
+    };
+
+    /** If the search string exists, add it to the where object */
+    if (search) {
+      where.name = {
+        contains: search,
+        mode: "insensitive",
+      };
+    }
+
+    const [customFields, totalCustomFields, usageCounts] = await Promise.all([
+      /** Get the items */
+      db.customField.findMany({
+        skip,
+        take,
+        where,
+        orderBy: [{ active: "desc" }, { updatedAt: "desc" }],
+        include: { categories: true },
+      }),
+
+      /** Count them */
+      db.customField.count({ where }),
+
+      /**
+       * Get usage counts for all custom fields in this organization
+       * Uses COUNT(DISTINCT "assetId") to ensure each asset is counted only once per custom field,
+       * preventing inflated counts if duplicate AssetCustomFieldValue records exist
+       */
+      db.$queryRaw<Array<{ customFieldId: string; count: bigint }>>`SELECT
+          acfv."customFieldId",
+          COUNT(DISTINCT acfv."assetId")::int as count
+        FROM "AssetCustomFieldValue" acfv
+        INNER JOIN "CustomField" cf ON acfv."customFieldId" = cf.id
+        WHERE cf."organizationId" = ${organizationId}
+          AND cf."deletedAt" IS NULL
+        GROUP BY acfv."customFieldId"`,
+    ]);
+
+    /** Create a map of custom field ID to usage count */
+    const usageCountMap = new Map(
+      usageCounts.map((item) => [item.customFieldId, Number(item.count)])
+    );
+
+    /** Attach usage count to each custom field */
+    const customFieldsWithUsage = customFields.map((field) => ({
+      ...field,
+      usageCount: usageCountMap.get(field.id) || 0,
+    }));
+
+    return {
+      customFields: customFieldsWithUsage,
+      totalCustomFields,
+    };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while fetching the custom fields",
+      additionalData: { ...params },
+      label,
+    });
+  }
+}
+
+type CustomFieldWithInclude<T extends Prisma.CustomFieldInclude | undefined> =
+  T extends Prisma.CustomFieldInclude
+    ? Prisma.CustomFieldGetPayload<{ include: T }>
+    : CustomField;
+
+export async function getCustomField<
+  T extends Prisma.CustomFieldInclude | undefined,
+>({
+  organizationId,
+  id,
+  userOrganizations,
+  request,
+  include,
+}: Pick<CustomField, "id"> & {
+  organizationId: Organization["id"];
+  userOrganizations?: Pick<UserOrganization, "organizationId">[];
+  request?: Request;
+  include?: T;
+}) {
+  try {
+    const otherOrganizationIds = userOrganizations?.map(
+      (org) => org.organizationId
+    );
+
+    const customField = await db.customField.findFirstOrThrow({
+      where: {
+        deletedAt: null,
+        OR: [
+          { id, organizationId },
+          ...(userOrganizations?.length
+            ? [{ id, organizationId: { in: otherOrganizationIds } }]
+            : []),
+        ],
+      },
+      include: { ...include },
+    });
+
+    /* User is trying to access customField in wrong organization. */
+    if (
+      userOrganizations?.length &&
+      customField.organizationId !== organizationId &&
+      otherOrganizationIds?.includes(customField.organizationId)
+    ) {
+      const redirectTo =
+        typeof request !== "undefined"
+          ? getRedirectUrlFromRequest(request)
+          : undefined;
+
+      throw new ShelfError({
+        cause: null,
+        title: "Custom field not found",
+        message: "",
+        additionalData: {
+          model: "customField",
+          organization: userOrganizations.find(
+            (org) => org.organizationId === customField.organizationId
+          ),
+          redirectTo,
+        },
+        label,
+        status: 404,
+        shouldBeCaptured: false,
+      });
+    }
+
+    return customField as CustomFieldWithInclude<T>;
+  } catch (cause) {
+    const isShelfError = isLikeShelfError(cause);
+    throw new ShelfError({
+      cause,
+      title: "Custom field not found",
+      message:
+        "The custom field you are trying to access does not exist or you do not have permission to access it.",
+      additionalData: {
+        id,
+        organizationId,
+        ...(isShelfError ? cause.additionalData : {}),
+      },
+      label,
+      shouldBeCaptured: isShelfError
+        ? cause.shouldBeCaptured
+        : !isNotFoundError(cause),
+    });
+  }
+}
+
+/**
+ * Updates a custom field's definition and, for an OPTION field, moves assets
+ * along with renamed or merged options.
+ *
+ * `optionRenames` maps a saved spelling to the option that now holds its
+ * assets. The field update, the value rewrite and one
+ * `ASSET_CUSTOM_FIELD_CHANGED` event per rewritten asset commit together, so an
+ * option is never renamed while its assets still store the old spelling. The
+ * field row is locked for the transaction, so two saves of the same field
+ * validate their renames one after the other.
+ *
+ * @param payload - The field id and organization, the acting user, the fields
+ *   to change, and the option rewrites to apply
+ * @returns The updated CustomField
+ * @throws {ShelfError} 400 when the renames do not describe the saved and new
+ *   options (see `assertRenamesMatchOptions`); 404 when the field does not
+ *   exist in the organization
+ */
+export async function updateCustomField(payload: {
+  id: CustomField["id"];
+  name?: CustomField["name"];
+  helpText?: CustomField["helpText"];
+  type?: CustomField["type"];
+  required?: CustomField["required"];
+  active?: CustomField["active"];
+  options?: CustomField["options"];
+  optionRenames?: OptionRename[];
+  categories?: string[];
+  organizationId: CustomField["organizationId"];
+  /** The user making the change, recorded as the actor of rename events. */
+  userId: User["id"];
+}) {
+  const {
+    id,
+    name,
+    helpText,
+    required,
+    active,
+    options,
+    optionRenames = [],
+    categories,
+    organizationId,
+    userId,
+  } = payload;
+
+  try {
+    //dont ever update type
+    //updating type would require changing all custom field values to that type
+    //which might fail when changing to incompatible type hence need a careful definition
+    const data = {
+      name,
+      helpText,
+      required,
+      active,
+      options,
+    } satisfies Prisma.CustomFieldUpdateInput;
+    const hasCategories = categories && categories.length > 0;
+
+    Object.assign(data, {
+      categories: {
+        set: hasCategories // if categories are empty, remove all categories
+          ? categories.map((category) => ({ id: category }))
+          : [],
+      },
+    });
+
+    const renames = optionRenames.filter(({ from, to }) => from !== to);
+
+    const { oldField, updatedField } = await db.$transaction(
+      async (tx) => {
+        // Holds the field row until commit, so a concurrent save of the same
+        // field reads the options this one writes before checking its renames.
+        await tx.$queryRaw(Prisma.sql`
+          SELECT id FROM "CustomField"
+          WHERE id = ${id} AND "organizationId" = ${organizationId}
+          FOR UPDATE
+        `);
+
+        const oldField = await tx.customField.findFirst({
+          where: { id, organizationId, deletedAt: null },
+        });
+
+        if (!oldField) {
+          throw new ShelfError({
+            cause: null,
+            title: "Custom field not found",
+            message:
+              "The custom field you are trying to update does not exist or you do not have access to it.",
+            additionalData: { id, organizationId },
+            label,
+            status: 404,
+            shouldBeCaptured: false,
+          });
+        }
+
+        assertRenamesMatchOptions({
+          renames,
+          savedOptions: oldField.options,
+          nextOptions: options ?? oldField.options,
+          additionalData: { id, organizationId },
+        });
+
+        const updatedField = await tx.customField.update({
+          where: { id, organizationId },
+          data,
+        });
+
+        if (renames.length > 0) {
+          const rewritten = await tx.$queryRaw<RewrittenOptionValue[]>(
+            buildOptionRenameStatement(id, renames)
+          );
+
+          // One event per asset whose stored value changed, shaped like the
+          // event a single-asset edit of the same field records.
+          await recordEvents(
+            rewritten.map(({ assetId, from, to }) => ({
+              organizationId,
+              actorUserId: userId,
+              action: "ASSET_CUSTOM_FIELD_CHANGED",
+              entityType: "ASSET",
+              entityId: assetId,
+              assetId,
+              field: updatedField.name,
+              fromValue: from,
+              toValue: to,
+              meta: { isFirstTimeSet: false, viaOptionRename: true },
+            })),
+            tx
+          );
+        }
+
+        return { oldField, updatedField };
+      },
+      { timeout: 30000 }
+    );
+
+    await updateAssetIndexSettingsAfterCfUpdate({
+      oldField,
+      newField: updatedField,
+    });
+
+    return updatedField;
+  } catch (cause) {
+    rethrowIfClientError(cause);
+    throw maybeUniqueConstraintViolation(cause, "Custom field", {
+      additionalData: {
+        id,
+      },
+    });
+  }
+}
+
+/**
+ * Refuses renames that do not describe this field: each `from` must be an
+ * option saved right now and each `to` one of the options being saved. A
+ * `from` that is no longer saved means someone else edited the field since the
+ * page loaded. Each `from` may appear once, because a stored value can only
+ * move to one place.
+ *
+ * A `from` that is still one of the new options keeps its assets, unless
+ * another rename moves assets onto it: that is a swap or rotation of
+ * spellings, where every set of assets follows its row. Without that, moving
+ * assets off an option that stays selectable would split one choice in two.
+ */
+function assertRenamesMatchOptions({
+  renames,
+  savedOptions,
+  nextOptions,
+  additionalData,
+}: {
+  renames: OptionRename[];
+  savedOptions: string[];
+  nextOptions: string[];
+  additionalData: Record<string, unknown>;
+}) {
+  const froms = renames.map(({ from }) => from);
+  const tos = new Set(renames.map(({ to }) => to));
+  const fits = renames.every(
+    ({ from, to }) =>
+      savedOptions.includes(from) &&
+      nextOptions.includes(to) &&
+      (!nextOptions.includes(from) || tos.has(from))
+  );
+
+  if (!fits || new Set(froms).size !== froms.length) {
+    const message =
+      "The options of this field changed since you opened it. Reload the page and try again.";
+    throw new ShelfError({
+      cause: null,
+      title: "Options changed",
+      message,
+      // Shown under the option list by the form's server-error fallback.
+      additionalData: {
+        ...additionalData,
+        renames,
+        validationErrors: { options: { message } },
+      },
+      label,
+      status: 400,
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/** A value row the rename statement changed, with the spellings it moved between. */
+type RewrittenOptionValue = { assetId: string; from: string; to: string };
+
+/**
+ * One statement that rewrites every renamed option value of a field and
+ * returns each changed row as a {@link RewrittenOptionValue}. Each row is
+ * matched against the value it held before the statement ran, so swapping two
+ * spellings in the same save moves each set of assets exactly once. `raw` and
+ * `valueOption` hold the same string for OPTION values and change together.
+ */
+function buildOptionRenameStatement(
+  customFieldId: CustomField["id"],
+  renames: OptionRename[]
+) {
+  const pairs = Prisma.join(
+    renames.map(({ from, to }) => Prisma.sql`(${from}::text, ${to}::text)`)
+  );
+
+  return Prisma.sql`
+    UPDATE "AssetCustomFieldValue" AS v
+    SET "value" = jsonb_set(
+          jsonb_set(v."value"::jsonb, '{raw}', to_jsonb(m."to")),
+          '{valueOption}',
+          to_jsonb(m."to")
+        ),
+        "updatedAt" = now()
+    FROM (VALUES ${pairs}) AS m("from", "to")
+    WHERE v."customFieldId" = ${customFieldId}
+      AND v."value"->>'valueOption' = m."from"
+    RETURNING v."assetId" AS "assetId", m."from" AS "from", m."to" AS "to"
+  `;
+}
+
+/**
+ * How many assets store each option of an OPTION field, keyed by the stored
+ * spelling. Spellings no longer in the field's options are included, because
+ * assets keep their value when an option is removed.
+ *
+ * @param args - The field and the organization it must belong to
+ * @returns Asset count per stored option value
+ * @throws {ShelfError} If the query fails
+ */
+export async function getOptionUsageCounts({
+  customFieldId,
+  organizationId,
+}: {
+  customFieldId: CustomField["id"];
+  organizationId: Organization["id"];
+}): Promise<Record<string, number>> {
+  try {
+    const rows = await db.$queryRaw<{ option: string; count: number }[]>(
+      Prisma.sql`
+        SELECT v."value"->>'valueOption' AS "option", COUNT(DISTINCT v."assetId")::int AS "count"
+        FROM "AssetCustomFieldValue" AS v
+        JOIN "CustomField" AS cf ON cf.id = v."customFieldId"
+        WHERE cf.id = ${customFieldId}
+          AND cf."organizationId" = ${organizationId}
+          AND v."value"->>'valueOption' IS NOT NULL
+        GROUP BY 1
+      `
+    );
+
+    return Object.fromEntries(rows.map(({ option, count }) => [option, count]));
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while counting the assets that use each option. Please try again or contact support.",
+      additionalData: { customFieldId, organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * Soft deletes a custom field by setting its deletedAt timestamp and appending a Unix timestamp to the name.
+ *
+ * This operation:
+ * 1. Appends Unix timestamp to the field name (e.g., "Serial Number" → "Serial Number_1234567890")
+ * 2. Sets deletedAt to current timestamp (soft delete)
+ * 3. Immediately removes the column from all users' AssetIndexSettings
+ * 4. Preserves all AssetCustomFieldValue records (no CASCADE deletion)
+ * 5. Deleted fields don't count toward premium tier limits
+ * 6. Name is freed up for creating a new field with the same name
+ *
+ * Note: This is a soft delete - data is preserved but not restorable via name reuse.
+ * The `active` flag remains separate and controls feature toggle functionality.
+ *
+ * @throws ShelfError if custom field doesn't exist or deletion fails
+ */
+export async function softDeleteCustomField({
+  id,
+  organizationId,
+}: Pick<CustomField, "id"> & { organizationId: Organization["id"] }) {
+  try {
+    const customField = await db.$transaction(
+      async (tx) => {
+        // 1. Verify the custom field exists, belongs to the organization, and is not already deleted
+        const existingCustomField = await tx.customField.findFirst({
+          where: { id, organizationId, deletedAt: null },
+        });
+
+        if (!existingCustomField) {
+          throw new ShelfError({
+            cause: null,
+            message:
+              "The custom field you are trying to delete does not exist.",
+            additionalData: { id, organizationId },
+            label,
+            status: 404,
+            shouldBeCaptured: false,
+          });
+        }
+
+        // 2. Soft delete the custom field by appending timestamp to name and setting deletedAt
+        // This frees up the original name for creating a new field
+        const timestamp = Math.floor(Date.now() / 1000);
+        const deletedField = await tx.customField.update({
+          where: { id, organizationId },
+          data: {
+            name: `${existingCustomField.name}_${timestamp}`,
+            deletedAt: new Date(),
+          },
+        });
+
+        // 3. Remove column from all users' AssetIndexSettings immediately
+        // This ensures consistency with deactivation behavior
+        await removeCustomFieldFromAssetIndexSettings({
+          customFieldName: existingCustomField.name,
+          organizationId,
+          prisma: tx,
+        });
+
+        return deletedField;
+      },
+      {
+        timeout: 30000, // 30 second timeout for consistency
+      }
+    );
+
+    return customField;
+  } catch (cause) {
+    if (isLikeShelfError(cause)) {
+      throw cause;
+    }
+
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while deleting the custom field. Please try again or contact support.",
+      additionalData: { id, organizationId },
+      label,
+    });
+  }
+}
+
+export async function upsertCustomField(
+  definitions: CustomFieldDraftPayload[]
+): Promise<{
+  customFields: Record<string, CustomField>;
+  newOrUpdatedFields: CustomField[];
+}> {
+  try {
+    const customFields: Record<string, CustomField> = {};
+    const newOrUpdatedFields: CustomField[] = [];
+
+    for (const def of definitions) {
+      let existingCustomField = await db.customField.findFirst({
+        where: {
+          // `in` + insensitive is an exact LOWER(name) match, like the unique
+          // index. `equals` + insensitive would be an ILIKE, where `_` and `%`
+          // in a field name act as wildcards.
+          name: {
+            in: [def.name],
+            mode: "insensitive",
+          },
+          organizationId: def.organizationId,
+          deletedAt: null,
+        },
+      });
+
+      if (!existingCustomField) {
+        const newCustomField = await createCustomField(def);
+        customFields[def.name] = newCustomField;
+        newOrUpdatedFields.push(newCustomField);
+      } else {
+        if (existingCustomField.type !== def.type) {
+          throw new ShelfError({
+            cause: null,
+            message: `Duplicate custom field name with different type. '${def.name}' already exist with different type '${existingCustomField.type}'`,
+            additionalData: {
+              validationErrors: {
+                name: {
+                  message: `${def.name} already exist with different type ${existingCustomField.type}`,
+                },
+              },
+            },
+            label,
+            shouldBeCaptured: false,
+          });
+        }
+        if (existingCustomField.type === "OPTION") {
+          const newOptions = def.options?.filter(
+            (op) => !existingCustomField?.options?.includes(op)
+          );
+          if (newOptions?.length) {
+            //create non existing options
+            const options = (existingCustomField?.options || []).concat(
+              Array.from(new Set(newOptions))
+            );
+            const updatedCustomField = await updateCustomField({
+              id: existingCustomField.id,
+              options,
+              organizationId: def.organizationId,
+              userId: def.userId,
+            });
+            existingCustomField = updatedCustomField;
+            newOrUpdatedFields.push(updatedCustomField);
+          }
+        }
+        customFields[def.name] = existingCustomField;
+      }
+    }
+
+    // Update asset index settings if we have any new or updated fields
+    if (newOrUpdatedFields.length > 0) {
+      void updateAssetIndexSettingsWithNewCustomFields({
+        newCustomFields: newOrUpdatedFields,
+        organizationId: definitions[0].organizationId,
+      });
+    }
+
+    return { customFields, newOrUpdatedFields };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: isLikeShelfError(cause)
+        ? cause.message
+        : "Failed to update or create custom fields. Please try again or contact support.",
+      additionalData: { definitions },
+      label: "Custom fields",
+    });
+  }
+}
+
+export async function createCustomFieldsIfNotExists({
+  data,
+  userId,
+  organizationId,
+}: {
+  data: CreateAssetFromContentImportPayload[];
+  userId: User["id"];
+  organizationId: Organization["id"];
+}) {
+  try {
+    //{CF header:[all options in csv combined]}
+    const optionMap: Record<string, string[]> = {};
+    //{CF header: definition to create}
+    const fieldToDefDraftMap: Record<string, CustomFieldDraftPayload> = {};
+
+    for (const item of data) {
+      for (const k of Object.keys(item)) {
+        if (k.startsWith("cf:")) {
+          const def = getDefinitionFromCsvHeader(k);
+          if (!fieldToDefDraftMap[k]) {
+            fieldToDefDraftMap[k] = { ...def, userId, organizationId };
+          }
+          /** Only add the options if they have a value */
+          if (def.type === "OPTION" && item[k] !== "") {
+            optionMap[k] = (optionMap[k] || []).concat([item[k]]);
+          }
+        }
+      }
+    }
+
+    for (const [customFieldDefStr, def] of Object.entries(fieldToDefDraftMap)) {
+      if (def.type === "OPTION" && optionMap[customFieldDefStr]?.length) {
+        const uniqueSet = new Set(optionMap[customFieldDefStr]);
+        def.options = Array.from(uniqueSet);
+      }
+    }
+    return await upsertCustomField(Object.values(fieldToDefDraftMap));
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: isLikeShelfError(cause)
+        ? cause.message
+        : "Something went wrong while creating custom fields. Seems like some of the custom field data in your import file is invalid. Please check and try again.",
+      additionalData: { userId, organizationId },
+      label,
+      /** No need to capture those. They are mostly related to malformed CSV data */
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/**
+ * Retrieves active custom fields for an organization with flexible category filtering
+ *
+ * Usage:
+ * 1. Get ALL active custom fields regardless of category:
+ *    await getActiveCustomFields({ organizationId, includeAllCategories: true })
+ *
+ * 2. Get custom fields for a specific category + uncategorized fields:
+ *    await getActiveCustomFields({ organizationId, category: "categoryId" })
+ *
+ * 3. Get ONLY uncategorized custom fields:
+ *    await getActiveCustomFields({ organizationId })
+ *
+ * @param params.organizationId - The organization ID to fetch custom fields for
+ * @param params.category - Optional category ID to filter by. When provided, returns fields specific to this category AND uncategorized fields
+ * @param params.includeAllCategories - When true, ignores category filtering and returns ALL active custom fields. Takes precedence over category param
+ *
+ * @returns Array of CustomField objects that are active and match the category filtering criteria
+ *
+ * @example
+ * // Get all active custom fields for asset index or similar global contexts
+ * const allCustomFields = await getActiveCustomFields({
+ *   organizationId,
+ *   includeAllCategories: true
+ * });
+ *
+ * @example
+ * // Get custom fields for a specific asset category plus uncategorized fields
+ * const categoryCustomFields = await getActiveCustomFields({
+ *   organizationId,
+ *   category: assetCategoryId
+ * });
+ */
+export async function getActiveCustomFields({
+  organizationId,
+  category,
+  includeAllCategories = false,
+}: {
+  organizationId: string;
+  category?: string | null;
+  includeAllCategories?: boolean;
+}) {
+  try {
+    return await db.customField.findMany({
+      where: {
+        organizationId,
+        active: { equals: true },
+        deletedAt: null,
+        /**
+         * Category filtering logic:
+         * - If includeAllCategories: no category filtering
+         * - If category provided: get fields for that category + uncategorized
+         * - Otherwise: get only uncategorized fields
+         */
+        ...(includeAllCategories
+          ? {} // No category filtering
+          : typeof category === "string"
+          ? {
+              OR: [
+                { categories: { none: {} } }, // Uncategorized fields
+                { categories: { some: { id: category } } }, // Category-specific fields
+              ],
+            }
+          : { categories: { none: {} } }), // Only uncategorized fields
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Failed to get active custom fields. Please try again or contact support.",
+      additionalData: { organizationId, category, includeAllCategories },
+      label,
+    });
+  }
+}
+
+export async function countActiveCustomFields({
+  organizationId,
+}: {
+  organizationId: string;
+}) {
+  try {
+    return await db.customField.count({
+      where: { organizationId, active: true, deletedAt: null },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while fetching active custom fields. Please try again or contact support.",
+      additionalData: { organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * Activates or deactivates several custom fields at once, keeping the asset
+ * index in step.
+ *
+ * Every settings row in the organization is reconciled for every field in the
+ * batch, so the columns follow whichever way the fields move: activating adds
+ * the ones a row is missing and leaves the rest as the user arranged them,
+ * deactivating takes them away.
+ *
+ * @param args.customFields - The fields to move; their `name` and `type` are
+ *   read for the columns
+ * @param args.organizationId - The active organization
+ * @param args.userId - The acting user, recorded on failure
+ * @param args.active - The state to move every field in the batch to
+ * @returns The Prisma batch payload for the field update
+ * @throws {ShelfError} If the field update or any settings write fails
+ */
+export async function bulkActivateOrDeactivateCustomFields({
+  customFields,
+  organizationId,
+  userId,
+  active,
+}: {
+  customFields: CustomField[];
+  organizationId: CustomField["organizationId"];
+  userId: CustomField["userId"];
+  active: boolean;
+}) {
+  try {
+    const customFieldsIds = customFields.map((field) => field.id);
+
+    const updatedFields = await db.customField.updateMany({
+      where: { id: { in: customFieldsIds }, organizationId },
+      data: { active },
+    });
+
+    /** Get the asset index settings for the organization */
+    const settings = await db.assetIndexSettings.findMany({
+      where: { organizationId },
+    });
+
+    /** Update the asset index settings for each entry */
+    const updates = settings.map((entry) => {
+      // Each field folds into the running column list, so a batch touching
+      // several fields on one row lands as one write.
+      const columns = customFields.reduce(
+        (acc, field) =>
+          syncCustomFieldColumn(acc, {
+            // The batch only flips `active`; names are unchanged by it.
+            oldName: field.name,
+            newName: field.name,
+            active,
+            cfType: field.type,
+          }),
+        Array.from(entry.columns as Prisma.JsonArray) as Column[]
+      );
+
+      return db.assetIndexSettings.update({
+        where: { id: entry.id, organizationId },
+        data: { columns },
+      });
+    });
+
+    await Promise.all(updates.filter(Boolean));
+
+    return updatedFields;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while bulk activating custom fields.",
+      additionalData: { customFields, organizationId, userId },
+      label,
+    });
+  }
+}

@@ -1,0 +1,379 @@
+import type { KeyboardEvent, ReactNode } from "react";
+import { useId, useState } from "react";
+import {
+  Popover,
+  PopoverContent,
+  PopoverPortal,
+  PopoverTrigger,
+} from "@radix-ui/react-popover";
+import { Reorder, useDragControls } from "framer-motion";
+import { useFetcher, useLoaderData } from "react-router";
+import { FakeCheckbox } from "~/components/forms/fake-checkbox";
+import { ChevronRight } from "~/components/icons/library";
+import { Button } from "~/components/shared/button";
+import {
+  ReorderHandle,
+  ReorderHint,
+  reorderItemProps,
+} from "~/components/shared/reorder-handle";
+import { useAssetIndexView } from "~/hooks/use-asset-index-view";
+import { useDisabled } from "~/hooks/use-disabled";
+import { useKeyboardReorder } from "~/hooks/use-keyboard-reorder";
+import {
+  parseColumnName,
+  type Column,
+} from "~/modules/asset-index-settings/helpers";
+import type { AssetIndexLoaderData } from "~/routes/_layout+/assets._index";
+import { tw } from "~/utils/tw";
+
+/**
+ * Picks which asset columns the advanced index shows, and in what order.
+ *
+ * The same setting drives two tables, so the control names its target. On the
+ * list view it configures the rows in front of the reader. On the model view the
+ * rows are models, which have their own fixed columns; the setting still governs
+ * the asset table inside a model's drill-down, which is the only place asset
+ * columns are rendered there. It is labelled for that table and says so when
+ * opened, because a control that silently governs something off screen reads as
+ * a broken one.
+ *
+ * @see {@link file://./asset-model-assets-sheet.tsx}
+ */
+export function ConfigureColumnsDropdown() {
+  const fetcher = useFetcher({
+    key: "asset-index-settings-columns",
+  });
+
+  const [isPopoverOpen, setIsPopoverOpen] = useState(false);
+  const { settings } = useLoaderData<AssetIndexLoaderData>();
+  const { isModelView } = useAssetIndexView();
+  const triggerLabel = isModelView
+    ? "Columns for a model's asset list"
+    : "Columns configuration";
+  const initialColumns = (settings?.columns as Column[])?.sort(
+    (a, b) => a.position - b.position
+  );
+
+  const [currentColumns, setCurrentColumns] = useState(initialColumns);
+  // Re-sync with loader-provided columns when they change (e.g. after a server save
+  // from another source). We compare against the previously-seen reference so we
+  // only reset on actual prop change. This avoids the useEffect derived-state anti-pattern.
+  // See https://react.dev/reference/react/useState#storing-information-from-previous-renders
+  const [prevInitialColumns, setPrevInitialColumns] = useState(initialColumns);
+  if (initialColumns !== prevInitialColumns) {
+    setPrevInitialColumns(initialColumns);
+    setCurrentColumns(initialColumns);
+  }
+
+  // Initialize keyboard reordering hook
+  const { handleKeyDown, announcement, itemRefs } = useKeyboardReorder({
+    items: currentColumns,
+    onReorder: setCurrentColumns,
+    getItemName: (column) => parseColumnName(column.name),
+  });
+  const instructionsId = useId();
+
+  const handleCheckboxChange = (index: number) => {
+    setCurrentColumns((prevColumns) => {
+      const newColumns = prevColumns.map((column, i) =>
+        i === index ? { ...column, visible: !column.visible } : column
+      );
+      return newColumns;
+    });
+  };
+
+  /** Handle selecting all columns */
+  const handleSelectAll = () => {
+    setCurrentColumns((prevColumns) =>
+      prevColumns.map((column) => ({ ...column, visible: true }))
+    );
+  };
+
+  /** Handle deselecting all columns */
+  const handleDeselectAll = () => {
+    setCurrentColumns((prevColumns) =>
+      prevColumns.map((column) => ({ ...column, visible: false }))
+    );
+  };
+
+  const hasChanges =
+    JSON.stringify(initialColumns) !== JSON.stringify(currentColumns);
+
+  const disabled = useDisabled(fetcher);
+
+  return (
+    <Popover open={isPopoverOpen} onOpenChange={setIsPopoverOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="secondary"
+          icon="columns"
+          className="mt-2 font-normal text-gray-500 md:mt-0"
+          width="full"
+          title={triggerLabel}
+          aria-label={triggerLabel}
+        />
+      </PopoverTrigger>
+      <PopoverPortal>
+        <PopoverContent
+          align="end"
+          className={tw(
+            "z-20 mt-1  w-[240px] rounded-md border border-gray-300 bg-white p-0"
+          )}
+        >
+          <fetcher.Form action="/api/asset-index-settings" method="post">
+            <input type="hidden" name="intent" value="changeColumns" />
+            {/* ARIA live region for screen reader announcements */}
+            <div
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              className="sr-only"
+            >
+              {announcement}
+            </div>
+            <div className="content-inner relative mb-[60px] max-h-[412px] overflow-y-scroll">
+              {isModelView ? (
+                <p className="border-b px-[10px] py-2 text-xs text-gray-500">
+                  These columns apply to the asset list inside a model, not to
+                  the model rows.
+                </p>
+              ) : null}
+              <div className="py-[2px]">
+                <div className="px-[10px] py-2 text-gray-500">
+                  Fixed columns
+                </div>
+                <ColumnRow className="flex items-center gap-1 pb-2">
+                  <FakeCheckbox
+                    checked={true}
+                    className={tw("mr-1 text-gray-600")}
+                  />
+                  Name
+                </ColumnRow>
+              </div>
+
+              <div className="border-t py-[2px]">
+                <div className="flex items-center justify-between px-[10px] py-2 text-gray-500">
+                  <div>
+                    <div>Columns ({currentColumns.length})</div>
+                    <ReorderHint />
+                  </div>
+                  <ColumnsBulkActions
+                    onSelectAll={handleSelectAll}
+                    onDeselectAll={handleDeselectAll}
+                  />
+                </div>
+                {/* Screen reader instructions */}
+                <div className="sr-only" id={instructionsId}>
+                  Press Space or Enter on a column label to toggle its
+                  visibility. Press Alt plus Arrow Up or Arrow Down on a drag
+                  handle to move the column.
+                </div>
+                <Reorder.Group
+                  values={currentColumns}
+                  onReorder={setCurrentColumns}
+                  as="ul"
+                  role="list"
+                  aria-label="Reorderable columns list"
+                  aria-describedby={instructionsId}
+                >
+                  {currentColumns.map((column, index) => (
+                    <ColumnItem
+                      key={column.name}
+                      column={column}
+                      index={index}
+                      total={currentColumns.length}
+                      instructionsId={instructionsId}
+                      handleRef={(el) => {
+                        itemRefs.current[index] = el;
+                      }}
+                      onHandleKeyDown={(e) => handleKeyDown(e, index)}
+                      onToggle={() => handleCheckboxChange(index)}
+                    />
+                  ))}
+                </Reorder.Group>
+              </div>
+            </div>
+            <footer className="absolute bottom-0 w-full border-t bg-white p-[10px]">
+              <Button
+                type="submit"
+                disabled={!hasChanges || disabled}
+                variant="secondary"
+                width="full"
+              >
+                Apply
+              </Button>
+            </footer>
+          </fetcher.Form>
+        </PopoverContent>
+      </PopoverPortal>
+    </Popover>
+  );
+}
+
+/** One draggable column: hidden form inputs, visibility toggle, drag handle. */
+function ColumnItem({
+  column,
+  index,
+  total,
+  instructionsId,
+  handleRef,
+  onHandleKeyDown,
+  onToggle,
+}: {
+  column: Column;
+  /** Position in the list; also the index of the posted `columns[i]` inputs. */
+  index: number;
+  /** Number of columns, read out as "position {index + 1} of {total}". */
+  total: number;
+  /** Id of the sr-only keyboard instructions the handle points at. */
+  instructionsId: string;
+  /** Stores the handle in `useKeyboardReorder`'s `itemRefs` at `index`. */
+  handleRef: (element: HTMLButtonElement | null) => void;
+  /** Alt+Arrow handler from `useKeyboardReorder`, bound to `index`. */
+  onHandleKeyDown: (event: KeyboardEvent<HTMLButtonElement>) => void;
+  /** Flips the column's visibility. */
+  onToggle: () => void;
+}) {
+  const dragControls = useDragControls();
+  const name = parseColumnName(column.name);
+
+  return (
+    <Reorder.Item
+      value={column}
+      as="li"
+      role="listitem"
+      aria-label={`${name}, position ${index + 1} of ${total}`}
+      dragListener={false}
+      dragControls={dragControls}
+      {...reorderItemProps}
+    >
+      <ColumnRow>
+        <div className="flex items-center gap-1">
+          {/* We only add this data for custom fields, because cfType has to be  of type CustomFieldType. It cant be an empty string  */}
+          {column.name.startsWith("cf_") && (
+            <input
+              type="hidden"
+              name={`columns[${index}][cfType]`}
+              value={column.cfType}
+            />
+          )}
+
+          <input
+            type="hidden"
+            name={`columns[${index}][name]`}
+            value={column.name}
+          />
+          <input
+            type="hidden"
+            name={`columns[${index}][position]`}
+            value={index}
+          />
+          <input
+            type="checkbox"
+            id={column.name}
+            className="mr-1 hidden"
+            name={`columns[${index}][visible]`}
+            checked={column.visible}
+            onChange={onToggle}
+          />
+
+          <div
+            role="checkbox"
+            aria-checked={column.visible}
+            tabIndex={0}
+            onClick={onToggle}
+            onKeyDown={(e) => {
+              if (e.key === " " || e.key === "Enter") {
+                e.preventDefault();
+                onToggle();
+              }
+            }}
+            className="flex flex-1 items-center text-[14px] font-medium text-gray-700 hover:cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary"
+          >
+            {" "}
+            <FakeCheckbox
+              checked={column.visible}
+              className={tw(
+                "mr-1 text-white",
+                column.visible ? "text-primary" : ""
+              )}
+            />
+            <span>{name}</span>
+            {column.name.startsWith("cf_") && (
+              <span className=" lowercase text-gray-500"> (cf)</span>
+            )}
+          </div>
+          <ReorderHandle
+            ref={handleRef}
+            dragControls={dragControls}
+            label={name}
+            onKeyDown={onHandleKeyDown}
+            describedById={instructionsId}
+          />
+        </div>
+      </ColumnRow>
+    </Reorder.Item>
+  );
+}
+
+function ColumnRow({
+  children,
+  className,
+}: {
+  children: ReactNode | string;
+  className?: string;
+}) {
+  return <div className={tw("px-[10px] py-[6px]", className)}>{children}</div>;
+}
+
+function ColumnsBulkActions({
+  onSelectAll,
+  onDeselectAll,
+}: {
+  onSelectAll: () => void;
+  onDeselectAll: () => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  return (
+    <Popover open={isOpen} onOpenChange={setIsOpen}>
+      <PopoverTrigger>
+        <ChevronRight className="mr-2 rotate-90" />
+      </PopoverTrigger>
+      <PopoverPortal>
+        <PopoverContent
+          align="end"
+          className={tw(
+            "z-20 mt-2 w-[200px] rounded-md border border-gray-300 bg-white p-0"
+          )}
+        >
+          <Button
+            type="button"
+            className=" justify-start whitespace-nowrap p-2 text-gray-700 hover:bg-gray-50 hover:text-gray-700 "
+            variant="link"
+            width="full"
+            onClick={() => {
+              onSelectAll();
+              setIsOpen(false);
+            }}
+          >
+            Select all
+          </Button>
+
+          <Button
+            type="button"
+            className=" justify-start whitespace-nowrap p-2 text-gray-700 hover:bg-gray-50 hover:text-gray-700  "
+            variant="link"
+            width="full"
+            onClick={() => {
+              onDeselectAll();
+              setIsOpen(false);
+            }}
+          >
+            Deselect all
+          </Button>
+        </PopoverContent>
+      </PopoverPortal>
+    </Popover>
+  );
+}

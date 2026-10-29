@@ -1,0 +1,408 @@
+import { useEffect, useMemo, useRef } from "react";
+import { useSetAtom, useAtomValue, useStore } from "jotai";
+import type {
+  LoaderFunctionArgs,
+  ActionFunctionArgs,
+  MetaFunction,
+  LinksFunction,
+  ShouldRevalidateFunctionArgs,
+} from "react-router";
+import { data, redirect, useFetcher, useLoaderData } from "react-router";
+import { z } from "zod";
+
+import { showNotificationAtom } from "~/atoms/notifications";
+import {
+  addScannedItemAtom,
+  auditSessionAtom,
+  lastDuplicateScanAtom,
+  type AuditScannedItem,
+} from "~/atoms/qr-scanner";
+import { scannedItemsAtom } from "~/atoms/qr-scanner";
+import AuditDrawer from "~/components/audit/audit-drawer";
+import { ErrorContent } from "~/components/errors";
+import ContextualSidebar from "~/components/layout/contextual-sidebar";
+import Header from "~/components/layout/header";
+import type { HeaderData } from "~/components/layout/header/types";
+import { CodeScanner } from "~/components/scanner/code-scanner";
+import type { OnCodeDetectionSuccessProps } from "~/components/scanner/code-scanner";
+import { db } from "~/database/db.server";
+import { useAuditScanPersistence } from "~/hooks/use-audit-scan-persistence";
+import { useAuditSessionInitialization } from "~/hooks/use-audit-session-initialization";
+import { useFillViewportHeight } from "~/hooks/use-fill-viewport-height";
+import { completeAuditWithImages } from "~/modules/audit/complete-audit-with-images.server";
+import {
+  getAuditSessionDetails,
+  getAuditScans,
+  requireAuditAssignee,
+  requireAuditAssigneeForScopedViewer,
+  removeAuditScan,
+} from "~/modules/audit/service.server";
+import scannerCss from "~/styles/scanner.css?url";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import { error, getParams, payload } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+
+export const links: LinksFunction = () => [
+  { rel: "stylesheet", href: scannerCss },
+];
+
+export const meta: MetaFunction<typeof loader> = ({ loaderData }) => [
+  { title: loaderData ? appendToMetaTitle(loaderData.header.title) : "" },
+];
+
+export const handle = {
+  breadcrumb: () => "Scan QR codes",
+  name: "audit.scan",
+};
+
+/**
+ * Prevent revalidation for certain actions that should not trigger a full scan route reload.
+ * Specifically, quick image uploads from AuditAssetActions should not revalidate the scan route.
+ */
+export function shouldRevalidate({
+  formAction,
+  defaultShouldRevalidate,
+}: ShouldRevalidateFunctionArgs) {
+  // Don't revalidate when quick image upload is triggered
+  if (formAction?.includes("/upload-image")) {
+    return false;
+  }
+
+  // Default revalidation for all other actions
+  return defaultShouldRevalidate;
+}
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const { userId } = context.getSession();
+  const { auditId } = getParams(params, z.object({ auditId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const { organizationId, access } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.audit,
+      action: PermissionAction.update,
+    });
+
+    const auditSession = await db.auditSession.findFirst({
+      where: { id: auditId, organizationId },
+      select: { status: true },
+    });
+
+    if (!auditSession) {
+      throw new ShelfError({
+        cause: null,
+        message: "Audit session not found",
+        additionalData: { auditId, organizationId },
+        label: "Audit",
+        status: 404,
+      });
+    }
+
+    if (auditSession.status === "CANCELLED") {
+      throw new ShelfError({
+        cause: null,
+        message: "This audit has been cancelled and can no longer be modified.",
+        additionalData: { auditId },
+        label: "Audit",
+        status: 400,
+      });
+    }
+
+    // Assignee-gated: callers who see every audit may act on any audit,
+    // everyone else only when assigned.
+    await requireAuditAssignee({
+      auditSessionId: auditId,
+      organizationId,
+      userId,
+      assignedOnly: !access.audits.seeAll,
+    });
+
+    const formData = await request.clone().formData();
+    const intent = formData.get("intent");
+
+    if (intent === "complete-audit") {
+      await completeAuditWithImages({
+        request,
+        auditSessionId: auditId,
+        organizationId,
+        userId,
+      });
+
+      return redirect(`/audits/${auditId}/overview`);
+    }
+
+    if (intent === "remove-scan") {
+      const assetId = formData.get("assetId");
+
+      if (!assetId || typeof assetId !== "string") {
+        throw new ShelfError({
+          cause: null,
+          message: "Asset ID is required",
+          additionalData: { auditId },
+          label: "Audit",
+          status: 400,
+        });
+      }
+
+      await removeAuditScan({
+        auditSessionId: auditId,
+        assetId,
+        organizationId,
+        userId,
+      });
+
+      return payload({ success: true });
+    }
+
+    throw new ShelfError({
+      cause: null,
+      message: "Invalid action intent",
+      additionalData: { intent },
+      label: "Audit",
+      status: 400,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, auditId });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export async function loader({ context, request, params }: LoaderFunctionArgs) {
+  const { userId } = context.getSession();
+  const { auditId } = getParams(params, z.object({ auditId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const permissionResult = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.audit,
+      action: PermissionAction.update,
+    });
+
+    const { organizationId, userOrganizations, access } = permissionResult;
+
+    const { session, expectedAssets } = await getAuditSessionDetails({
+      // The scan drawer renders the expected-asset photos.
+      refreshExpectedAssetImages: true,
+      id: auditId,
+      organizationId,
+      userOrganizations,
+      request,
+    });
+
+    if (session.status === "CANCELLED") {
+      return redirect(`/audits/${auditId}/overview`);
+    }
+
+    // Scan access: callers who see every audit can scan any audit, everyone
+    // else only when assigned.
+    requireAuditAssigneeForScopedViewer({
+      audit: session,
+      userId,
+      assignedOnly: !access.audits.seeAll,
+      auditId,
+    });
+
+    // Fetch existing scans to restore state
+    const existingScans = await getAuditScans({
+      auditSessionId: auditId,
+      organizationId,
+    });
+
+    const title = `Scan assets for audit | ${session.name}`;
+    const header: HeaderData = {
+      title,
+    };
+
+    return data(
+      payload({ title, header, session, expectedAssets, existingScans })
+    );
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export const ErrorBoundary = () => <ErrorContent />;
+
+export default function AuditSessionRoute() {
+  const { session, expectedAssets, existingScans } =
+    useLoaderData<typeof loader>();
+  const scanPersistFetcher = useFetcher({ key: "audit-scan-persist" });
+
+  const addItem = useSetAtom(addScannedItemAtom);
+  const auditSession = useAtomValue(auditSessionAtom);
+  const scannedItems = useAtomValue(scannedItemsAtom);
+  const showNotification = useSetAtom(showNotificationAtom);
+  const store = useStore();
+  // Track the last handled duplicate timestamp so the handler only fires a toast
+  // for each newly-detected duplicate (not for repeated reads of the same event).
+  const lastHandledDuplicateTimestampRef = useRef<number | null>(null);
+
+  // Track which items have been persisted to avoid duplicate API calls
+  const persistedItemsRef = useRef<Set<string>>(new Set());
+  const isRestoringRef = useRef(true); // Start true, set false after initialization
+  const pendingPersistsRef = useRef<Map<string, string>>(new Map()); // Maps assetId -> qrId
+
+  // Fills the screen below wherever the layout's chrome ends, measured rather
+  // than subtracted, so the page itself never scrolls behind the drawer.
+  const { ref: scannerContainerRef, height } =
+    useFillViewportHeight<HTMLDivElement>();
+
+  const expectedItems: AuditScannedItem[] = useMemo(
+    () =>
+      expectedAssets.map(
+        (asset) =>
+          ({
+            id: asset.id,
+            name: asset.name,
+            type: "asset",
+            auditStatus: "missing",
+            auditAssetId: asset.auditAssetId,
+            auditNotesCount: asset.auditNotesCount ?? 0,
+            auditImagesCount: asset.auditImagesCount ?? 0,
+            mainImage: asset.mainImage,
+            thumbnailImage: asset.thumbnailImage,
+            locationName: asset.locationName,
+          }) as AuditScannedItem
+      ),
+    [expectedAssets]
+  );
+
+  // Initialize audit session and restore existing scans
+  useAuditSessionInitialization({
+    session,
+    expectedItems,
+    existingScans,
+    persistedItemsRef,
+  });
+
+  // Set flag after initial restoration completes
+  useEffect(() => {
+    if (existingScans.length > 0) {
+      // Give atoms time to settle after restoration
+      const timer = setTimeout(() => {
+        isRestoringRef.current = false;
+      }, 100);
+      return () => clearTimeout(timer);
+    } else {
+      isRestoringRef.current = false;
+    }
+  }, [existingScans.length]);
+
+  // Persist scans to database as they are resolved
+  useAuditScanPersistence({
+    auditSession,
+    scannedItems,
+    expectedAssets: expectedItems,
+    scanPersistFetcher,
+    persistedItemsRef,
+    pendingPersistsRef,
+    isRestoringRef,
+  });
+
+  // Count resolved items that haven't been persisted yet
+  const pendingScanCount = Object.values(scannedItems).filter(
+    (item) =>
+      item?.data?.id &&
+      !item.error &&
+      !persistedItemsRef.current.has(item.data.id)
+  ).length;
+
+  const scopeMeta =
+    typeof session.scopeMeta === "object" && session.scopeMeta
+      ? (session.scopeMeta as Record<string, unknown>)
+      : null;
+
+  const contextLabel =
+    typeof scopeMeta?.contextType === "string"
+      ? (scopeMeta.contextType as string)
+      : "Selection";
+
+  const contextName =
+    typeof scopeMeta?.contextName === "string"
+      ? (scopeMeta.contextName as string)
+      : session.name;
+
+  /**
+   * Handles successful QR code/barcode detection from the scanner.
+   *
+   * Scans are persisted to the database via useAuditScanPersistence hook,
+   * allowing audits to be resumed across sessions.
+   *
+   * @param props - Detection result containing scanned code value, error, and type
+   * @param props.value - The scanned QR code, barcode, or SAM ID
+   * @param props.error - Optional error message if the code couldn't be processed
+   * @param props.type - The type of code that was scanned
+   */
+  function handleCodeDetectionSuccess({
+    value: qrId,
+    error,
+    type,
+  }: OnCodeDetectionSuccessProps) {
+    addItem(qrId, error, type);
+
+    // After adding, inspect the duplicate-scan atom directly. If the most recent
+    // duplicate event is new (timestamp not yet handled), surface a toast. Handled
+    // here instead of in a useEffect so the side effect is triggered by user input.
+    const duplicate = store.get(lastDuplicateScanAtom);
+    if (
+      duplicate &&
+      duplicate.timestamp !== lastHandledDuplicateTimestampRef.current
+    ) {
+      lastHandledDuplicateTimestampRef.current = duplicate.timestamp;
+      showNotification({
+        title: "Already scanned",
+        message: `Asset "${duplicate.assetTitle}" has already been scanned`,
+        icon: { name: "scan", variant: "gray" },
+        senderId: null,
+      });
+    }
+  }
+
+  return (
+    <>
+      <ContextualSidebar className="md:w-[45vw] md:max-w-[40vw]" />
+      <Header hidePageDescription />
+
+      <AuditDrawer
+        contextLabel={contextLabel}
+        contextName={contextName}
+        expectedAssets={expectedItems}
+        pendingScanCount={pendingScanCount}
+        portalContainer={
+          typeof document !== "undefined" ? document.body : undefined
+        }
+        defaultExpanded
+        onScanRemoved={(assetId) => {
+          persistedItemsRef.current.delete(assetId);
+          pendingPersistsRef.current.delete(assetId);
+        }}
+      />
+
+      <div
+        ref={scannerContainerRef}
+        className="-mx-4 flex flex-col overflow-hidden"
+        style={height === undefined ? undefined : { height: `${height}px` }}
+      >
+        <CodeScanner
+          onCodeDetectionSuccess={handleCodeDetectionSuccess}
+          backButtonText="Audit"
+          allowNonShelfCodes
+          paused={!auditSession}
+          setPaused={() => {}}
+        />
+      </div>
+    </>
+  );
+}

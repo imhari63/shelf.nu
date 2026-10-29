@@ -1,0 +1,145 @@
+import { data, type ActionFunctionArgs } from "react-router";
+import { z } from "zod";
+import { BookingsListSchema } from "~/components/booking/bookings-list-fields";
+import { BulkArchiveBookingsSchema } from "~/components/booking/bulk-archive-dialog";
+import { BulkCancelBookingsSchema } from "~/components/booking/bulk-cancel-dialog";
+import { BulkDeleteBookingSchema } from "~/components/booking/bulk-delete-dialog";
+import { CurrentSearchParamsSchema } from "~/modules/asset/utils.server";
+import {
+  bulkArchiveBookings,
+  bulkCancelBookings,
+  bulkDeleteBookings,
+} from "~/modules/booking/service.server";
+import { checkExhaustiveSwitch } from "~/utils/check-exhaustive-switch";
+import { getClientHint } from "~/utils/client-hints";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError } from "~/utils/error";
+import { assertIsPost, payload, error, parseData } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+
+export async function action({ request, context }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    assertIsPost(request);
+
+    const formData = await request.formData();
+
+    const { intent, currentSearchParams } = parseData(
+      formData,
+      z
+        .object({
+          intent: z.enum(["bulk-delete", "bulk-archive", "bulk-cancel"]),
+        })
+        .and(CurrentSearchParamsSchema)
+    );
+
+    // The list the dialog was opened on, which a "Select all" stands for. It
+    // only narrows: the services AND it with the workspace and ownership scope.
+    const list = parseData(formData, BookingsListSchema);
+
+    const intentToActionMap: Record<typeof intent, PermissionAction> = {
+      "bulk-delete": PermissionAction.delete,
+      // Archive and cancel have their own grants, which BASE does not hold.
+      // `update` is not the gate for them: BASE holds it.
+      "bulk-archive": PermissionAction.archive,
+      "bulk-cancel": PermissionAction.cancel,
+    };
+
+    // `access` decides whether the bulk query is scoped to the caller's own
+    // bookings, the same authority the singular write paths use.
+    const { organizationId, access } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.booking,
+      action: intentToActionMap[intent],
+    });
+
+    switch (intent) {
+      case "bulk-delete": {
+        const { bookingIds, confirmation } = parseData(
+          formData,
+          BulkDeleteBookingSchema
+        );
+
+        await bulkDeleteBookings({
+          bookingIds,
+          organizationId,
+          userId,
+          access,
+          hints: getClientHint(request),
+          currentSearchParams,
+          list,
+          confirmation,
+        });
+
+        sendNotification({
+          title: "Bookings deleted",
+          message: "Your bookings has been deleted successfully",
+          icon: { name: "trash", variant: "error" },
+          senderId: userId,
+        });
+
+        return data(payload({ success: true }));
+      }
+
+      case "bulk-archive": {
+        const { bookingIds } = parseData(formData, BulkArchiveBookingsSchema);
+
+        await bulkArchiveBookings({
+          bookingIds,
+          organizationId,
+          userId,
+          access,
+          currentSearchParams,
+          list,
+        });
+
+        sendNotification({
+          title: "Bookings archived",
+          message: "Your bookings has been archived successfully",
+          icon: { name: "success", variant: "success" },
+          senderId: userId,
+        });
+
+        return data(payload({ success: true }));
+      }
+
+      case "bulk-cancel": {
+        const { bookingIds } = parseData(formData, BulkCancelBookingsSchema);
+
+        await bulkCancelBookings({
+          bookingIds,
+          organizationId,
+          userId,
+          access,
+          hints: getClientHint(request),
+          currentSearchParams,
+          list,
+        });
+
+        sendNotification({
+          title: "Bookings cancelled",
+          message: "Your bookings has been cancelled successfully",
+          icon: { name: "success", variant: "success" },
+          senderId: userId,
+        });
+
+        return data(payload({ success: true }));
+      }
+
+      default: {
+        checkExhaustiveSwitch(intent);
+        return data(payload(null));
+      }
+    }
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+}

@@ -1,0 +1,1775 @@
+import type {
+  Asset,
+  AssetIndexSettings,
+  Note,
+  Organization,
+  Prisma,
+  Tag,
+  TeamMember,
+} from "@prisma/client";
+import { CustomFieldType } from "@prisma/client";
+import { parseFormData } from "@remix-run/form-data-parser";
+import { STOCK_STATUS_LABELS } from "@shelf/labels";
+
+import chardet from "chardet";
+import { CsvError, parse } from "csv-parse";
+import iconv from "iconv-lite";
+import type { BookingsList } from "~/components/booking/bookings-list-fields";
+import type { SortingDirection } from "~/components/list/filters/sort-by";
+import { db } from "~/database/db.server";
+import { stripHiddenAuditColumns } from "~/modules/asset/last-audit-date-access";
+import type { LastAuditDateAccess } from "~/modules/asset/last-audit-date-access";
+import { lastAuditDateAccessFor } from "~/modules/asset/last-audit-date-access.server";
+import { getAdvancedPaginatedAndFilterableAssets } from "~/modules/asset/service.server";
+import type {
+  AdvancedIndexAsset,
+  ShelfAssetCustomFieldValueType,
+} from "~/modules/asset/types";
+import { isQuantityTracked } from "~/modules/asset/utils";
+import type {
+  BarcodeField,
+  Column,
+  FixedField,
+} from "~/modules/asset-index-settings/helpers";
+import {
+  columnsLabelsMap,
+  parseColumnName,
+} from "~/modules/asset-index-settings/helpers";
+import { BOOKING_COMMON_INCLUDE } from "~/modules/booking/constants";
+import {
+  bookingDraftVisibilityClause,
+  getBookings,
+  getBookingsListWhereParams,
+  resolveCustodianScope,
+} from "~/modules/booking/service.server";
+import type { BookingWithCustodians } from "~/modules/booking/types";
+import { calculatePartialCheckinProgress } from "~/modules/booking/utils.server";
+import { getPrimaryCustody } from "~/modules/custody/utils";
+import { getActiveCustomFields } from "~/modules/custom-field/service.server";
+import { getQrUrl } from "~/modules/qr/qr-url.server";
+import { getNrmSelectionWhere } from "~/modules/team-member/nrm-scope";
+import type { RoleAccess } from "~/utils/permissions/role-access";
+import { getAssetTotalValue } from "./asset-value";
+import { getBookingAssetCheckinLabel } from "./booking-assets";
+import { checkExhaustiveSwitch } from "./check-exhaustive-switch";
+import { getClientHint } from "./client-hints";
+import { getAdvancedFiltersFromRequest } from "./cookies.server";
+import { neutralizeCsvFormula, restoreCsvFormulaCell } from "./csv-cells";
+import { formatCurrency } from "./currency";
+import { formatDate, type ResolvedFormatPrefs } from "./date-format";
+import { resolveUserFormatPrefsById } from "./date-format.server";
+import { SERVER_URL } from "./env";
+import { isLikeShelfError, ShelfError } from "./error";
+import { isMaxFileSizeError } from "./form-data-parse-errors.server";
+import { getCurrentSearchParams } from "./http.server";
+import {
+  buildImportReadyCsvFromAssets,
+  type ColumnScope,
+} from "./import-ready-export.server";
+import { ALL_SELECTED_KEY } from "./list";
+import { cleanMarkdownFormatting } from "./markdown-cleaner";
+import { sanitizeNoteContent } from "./note-sanitizer.server";
+import type { UserNameFields } from "./user";
+import { resolveTeamMemberName, resolveUserDisplayName } from "./user";
+
+export type CSVData = [string[], ...string[][]] | [];
+
+/**
+ * Guesses the delimiter of csv based on the most common delimiter found in the
+ * file.
+ *
+ * Only delimiters BETWEEN cells count. A quoted cell may hold any number of
+ * commas and semicolons — an exported note, a JSON relation, a tag named
+ * "Berlin, DE" — and counting those would let one verbose cell outvote the
+ * structure of every row.
+ */
+function guessDelimiters(csv: string, delimiters: string[]) {
+  const structure = csv.replace(/"(?:[^"]|"")*"/g, "");
+  const delimiterCounts = delimiters.map(
+    (delimiter) => structure.split(delimiter).length
+  );
+
+  const max = Math.max(...delimiterCounts);
+
+  const delimiter = delimiters[delimiterCounts.indexOf(max)];
+  return delimiter;
+}
+
+/** Parses csv Data into an array with type {@link CSVData} */
+export const parseCsv = (csvData: ArrayBuffer) => {
+  const results: string[][] = [];
+  /** Detect the file encoding */
+  const encoding = chardet.detect(Buffer.from(csvData));
+
+  /** Convert the file to utf-8 from the detected encoding */
+  const csv = iconv.decode(Buffer.from(csvData), encoding || "utf-8");
+  const delimiter = guessDelimiters(csv, [",", ";"]);
+
+  return new Promise<CSVData>((resolve, reject) => {
+    const parser = parse({
+      encoding: "utf-8", // Set encoding to utf-8
+      delimiter, // Set delimiter
+      bom: true, // Handle BOM
+      quote: '"', // Set quote to " as this allows for commas in the data
+      escape: '"', // Set escape to \ as this allows for commas in the data
+      ltrim: true, // Trim whitespace from left side of cell
+      relax_column_count: true, // Ignore inconsistent column count
+    })
+      .on("data", (data: string[]) => {
+        // Undo the export's formula guard so a Shelf export re-imports as-is.
+        results.push(data.map(restoreCsvFormulaCell));
+      })
+      .on("error", (error) => {
+        reject(error);
+      })
+      .on("end", () => {
+        resolve(results as CSVData);
+      });
+
+    parser.write(csv);
+    parser.end();
+  });
+};
+
+/** Checks if a CSV row is empty (all cells are empty or whitespace-only) */
+function isEmptyRow(row: string[]): boolean {
+  return row.every((cell) => cell.trim() === "");
+}
+
+/**
+ * Takes a request object and extracts the file from it and parses it as csvData.
+ *
+ * @param args.request - The multipart request carrying a `file` field
+ * @param args.maxFileSize - Largest accepted upload in bytes; the multipart
+ *   parser's default (2 MB) applies when omitted
+ * @throws {ShelfError} "File too large" past the limit, or a parse error
+ */
+export const csvDataFromRequest = async ({
+  request,
+  maxFileSize,
+}: {
+  request: Request;
+  maxFileSize?: number;
+}) => {
+  try {
+    // Files are automatically stored in memory with parseFormData
+    const formData = await parseFormData(
+      request,
+      maxFileSize ? { maxFileSize } : undefined
+    );
+
+    const csvFile = formData.get("file") as File;
+
+    const csvData = await csvFile.arrayBuffer();
+
+    const parsed = await parseCsv(csvData);
+
+    // Filter out empty rows (keep the header row, filter data rows)
+    if (parsed.length > 1) {
+      const [header, ...dataRows] = parsed;
+      const filteredRows = dataRows.filter((row) => !isEmptyRow(row));
+      return [header, ...filteredRows] as CSVData;
+    }
+
+    return parsed;
+  } catch (cause) {
+    if (isMaxFileSizeError(cause)) {
+      throw new ShelfError({
+        cause,
+        title: "File too large",
+        message: maxFileSize
+          ? `The CSV file is larger than ${(
+              maxFileSize /
+              (1024 * 1024)
+            ).toLocaleString("en-US", {
+              maximumFractionDigits: 1,
+            })} MB. Split it into smaller files or remove empty rows and try again.`
+          : "The CSV file is too large. Please reduce the file size by removing empty rows or splitting it into smaller files and try again.",
+        label: "CSV",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    throw new ShelfError({
+      cause,
+      message:
+        cause instanceof CsvError
+          ? cause.message
+          : "Something went wrong while parsing the CSV file.",
+      label: "CSV",
+      shouldBeCaptured: !(cause instanceof CsvError),
+    });
+  }
+};
+
+/**
+ * Resolves the assets to export, honoring the select-all sentinel and the
+ * index's current filters. Shared by the standard and import-ready exports.
+ *
+ * @param args.request - The incoming request (carries cookie-based filters).
+ * @param args.assetIds - Comma-separated asset ids, or containing
+ *   {@link ALL_SELECTED_KEY} when the "select all" sentinel is active.
+ * @param args.settings - The asset index settings (mode + column config).
+ * @param args.currentOrganization - The active workspace; scopes the fetch.
+ * @param args.assetIndexCurrentSearchParams - The index's current URL search
+ *   params, used instead of cookie filters when select-all is active.
+ * @param args.timeZone - Acting user's IANA timezone; forwarded to the fetch so
+ *   date-column filters truncate the day in the user's tz, matching the rows
+ *   the index showed. Both exports pass it; "UTC" is only a fallback.
+ * @param args.lastAuditDateAccess - How the last audit date may be used. The
+ *   service defaults to `hidden`, which also drops an active last audit date
+ *   filter. Both exports pass the resolved level so a select-all export
+ *   matches the rows the index showed.
+ * @param args.includeHiddenColumns - Compute the last audit date even when the
+ *   column is hidden in the user's settings (the "All columns" scope).
+ * @returns The full filtered asset set (no pagination when selecting all).
+ */
+async function resolveExportAssets({
+  request,
+  assetIds,
+  settings,
+  currentOrganization,
+  assetIndexCurrentSearchParams,
+  timeZone = "UTC",
+  lastAuditDateAccess,
+  includeHiddenColumns,
+}: {
+  request: Request;
+  assetIds: string;
+  settings: AssetIndexSettings;
+  currentOrganization: Pick<
+    Organization,
+    "id" | "barcodesEnabled" | "currency"
+  >;
+  assetIndexCurrentSearchParams: string | null;
+  timeZone?: string;
+  lastAuditDateAccess?: LastAuditDateAccess;
+  includeHiddenColumns?: boolean;
+}): Promise<{ assets: AdvancedIndexAsset[] }> {
+  /** Make an array of the ids and check if we have to take all */
+  const ids = assetIds.split(",");
+  const takeAll = ids.includes(ALL_SELECTED_KEY);
+
+  /**
+   * When taking all (select all button), use the current page's search params —
+   * even an empty string, which means "no filters". Only fall back to the
+   * cookie-based filters when the param was not sent at all (`null`); a
+   * truthiness check would treat an unfiltered index (`""`) as "not sent" and
+   * wrongly reapply stale cookie filters.
+   */
+  const filtersToUse =
+    takeAll && assetIndexCurrentSearchParams !== null
+      ? assetIndexCurrentSearchParams
+      : (
+          await getAdvancedFiltersFromRequest(
+            request,
+            currentOrganization.id,
+            settings
+          )
+        ).filters;
+
+  const { assets } = await getAdvancedPaginatedAndFilterableAssets({
+    request,
+    organizationId: currentOrganization.id,
+    filters: filtersToUse,
+    settings,
+    takeAll,
+    assetIds: takeAll ? undefined : ids,
+    canUseBarcodes: currentOrganization.barcodesEnabled ?? false,
+    timeZone,
+    lastAuditDateAccess,
+    includeHiddenColumns,
+    // The export reproduces the index view it was started from, Archived and
+    // All included (issue #382). Reaching it takes `asset: export`, which only
+    // ADMIN and OWNER hold, the same members who hold `asset: archive`.
+    honorArchivedView: true,
+    // Hand-picked rows carry no view (only a select-all forwards the index's
+    // params), so the ids alone decide: an archived row the user ticked in
+    // the Archived or All view is exported, not dropped by the Active default.
+    archivedFilter: takeAll ? undefined : "all",
+  });
+
+  return { assets };
+}
+
+/**
+ * Builds the human/analytics asset export CSV (display labels,
+ * currency-formatted values, a synthetic `total_value` column).
+ *
+ * @param args.request - The incoming request (filters, locale, timezone).
+ * @param args.userId - The acting user; their date/time prefs humanize columns.
+ * @param args.assetIds - Comma-separated asset ids, or the select-all sentinel.
+ * @param args.settings - The asset index settings (mode + column config).
+ * @param args.currentOrganization - The active workspace; scopes the fetch.
+ * @param args.assetIndexCurrentSearchParams - Current URL search params for
+ *   the select-all-with-filters path.
+ * @param args.columnScope - `"visible"` (default) exports only the columns
+ *   the user currently has shown; `"all"` exports every configured column
+ *   regardless of visibility.
+ * @param args.access - The caller's role access. With the workspace's audit
+ *   add-on it decides the last audit date access: `hidden` drops the column,
+ *   `locked` keeps it with empty values (it is never queried).
+ * @returns The CSV file contents (CRLF-joined rows).
+ */
+export async function exportAssetsFromIndexToCsv({
+  request,
+  userId,
+  assetIds,
+  settings,
+  currentOrganization,
+  assetIndexCurrentSearchParams,
+  columnScope = "visible",
+  access,
+}: {
+  request: Request;
+  userId: string;
+  assetIds: string;
+  settings: AssetIndexSettings;
+  currentOrganization: Pick<
+    Organization,
+    "id" | "barcodesEnabled" | "currency" | "auditsEnabled"
+  >;
+  assetIndexCurrentSearchParams: string | null;
+  columnScope?: ColumnScope;
+  access: RoleAccess;
+}) {
+  const lastAuditDateAccess = lastAuditDateAccessFor(
+    access,
+    currentOrganization
+  );
+  // Acting user's prefs: this export was triggered by userId, so their
+  // date/time preferences drive every humanized column AND the timezone the
+  // built-in date-column filters resolve the day in. Resolved before the fetch
+  // so `timeZone` can flow into the filter query.
+  const prefs = await resolveUserFormatPrefsById(
+    userId,
+    getClientHint(request)
+  );
+
+  const [{ assets }, workspaceCustomFields] = await Promise.all([
+    resolveExportAssets({
+      request,
+      assetIds,
+      settings,
+      currentOrganization,
+      assetIndexCurrentSearchParams,
+      timeZone: prefs.timeZone,
+      lastAuditDateAccess,
+      // "All columns" exports hidden columns too, so the date is computed even
+      // when the user has hidden it in their settings.
+      includeHiddenColumns: columnScope === "all",
+    }),
+    // The custom fields the update importer matches headers against (same
+    // filter as `buildUpdatePreview`).
+    db.customField.findMany({
+      where: {
+        organizationId: currentOrganization.id,
+        active: true,
+        deletedAt: null,
+      },
+      select: { name: true },
+    }),
+  ]);
+
+  const csvData = buildCsvExportDataFromAssets({
+    assets,
+    columns: buildIndexExportColumns({
+      settingsColumns: stripHiddenAuditColumns(
+        settings.columns as Column[],
+        lastAuditDateAccess
+      ),
+      columnScope,
+    }),
+    currentOrganization,
+    prefs,
+    workspaceCustomFieldNames: workspaceCustomFields.map((cf) => cf.name),
+  });
+
+  // Join rows with CRLF as per CSV spec
+  return csvData.join("\r\n");
+}
+
+/**
+ * Assembles the column list for the standard (human/analytics) index export
+ * from a user's saved asset index columns.
+ *
+ * On top of the saved columns it adds:
+ * - `name` first, always exported.
+ * - `unitOfMeasure` right after `quantity` when Quantity is exported and Unit
+ *   of measure is not (see {@link withUnitOfMeasureBesideQuantity}).
+ * - the synthetic `total_value` column last.
+ *
+ * @param args.settingsColumns - The user's saved asset index columns
+ * @param args.columnScope - `"visible"` keeps the saved visibility; `"all"`
+ *   exports every configured column regardless of visibility
+ * @returns Columns for {@link buildCsvExportDataFromAssets}
+ */
+export function buildIndexExportColumns({
+  settingsColumns,
+  columnScope,
+}: {
+  settingsColumns: Column[];
+  columnScope: ColumnScope;
+}): Column[] {
+  // "All columns" for the human export = every configured column, visible or
+  // not (actions is still dropped downstream in buildCsvExportDataFromAssets).
+  const scopedColumns =
+    columnScope === "all"
+      ? settingsColumns.map((c) => ({ ...c, visible: true }))
+      : settingsColumns;
+
+  return [
+    { name: "name", visible: true, position: 0 },
+    ...withUnitOfMeasureBesideQuantity(scopedColumns),
+    // Synthetic export-only column: emits `valuation × quantity` so QT
+    // inventories report total worth without overwriting the per-unit
+    // `valuation` column (kept lossless for CSV → re-import round-trip).
+    // Always appended at the end so existing user column ordering is
+    // unaffected. Not in `defaultFields` / column-picker schema, so
+    // users can't toggle or reorder it via settings.
+    { name: "total_value", visible: true, position: Number.MAX_SAFE_INTEGER },
+  ];
+}
+
+/**
+ * Exports the unit of measure wherever the quantity is exported.
+ *
+ * The Quantity column holds the bare number and the unit has its own column,
+ * which a user can leave hidden in the index. When Quantity is exported and
+ * Unit of measure is not, this adds Unit of measure directly after Quantity,
+ * moving the columns after it down by one. When both are exported, or
+ * Quantity is not, the columns are returned as they are.
+ *
+ * @param columns - Export columns with their visibility; not modified
+ * @returns The columns, with Unit of measure visible next to Quantity when needed
+ */
+function withUnitOfMeasureBesideQuantity(columns: Column[]): Column[] {
+  const quantity = columns.find((col) => col.name === "quantity");
+  const unitOfMeasure = columns.find((col) => col.name === "unitOfMeasure");
+  if (!quantity?.visible || unitOfMeasure?.visible) return columns;
+
+  const unitPosition = quantity.position + 1;
+  return [
+    ...columns
+      .filter((col) => col.name !== "unitOfMeasure")
+      .map((col) =>
+        col.position >= unitPosition
+          ? { ...col, position: col.position + 1 }
+          : col
+      ),
+    { name: "unitOfMeasure", visible: true, position: unitPosition },
+  ];
+}
+
+/**
+ * Builds an import-ready CSV (headers = content-importer keys, values
+ * importer-native) so the file re-imports into another workspace. Works in
+ * both index modes; SIMPLE mode has no per-user column config, so scope is
+ * forced to "all".
+ *
+ * @param args.request - The incoming request (filters, locale, timezone).
+ * @param args.userId - The acting user; their time zone resolves the day of
+ *   every select-all date filter, so the rows match the index.
+ * @param args.assetIds - Comma-separated asset ids, or the select-all sentinel.
+ * @param args.settings - The asset index settings (mode + column config).
+ * @param args.currentOrganization - The active workspace; scopes the fetch.
+ * @param args.assetIndexCurrentSearchParams - Current URL search params for
+ *   the select-all-with-filters path.
+ * @param args.columnScope - `"visible"` exports only the columns the user
+ *   currently has shown; `"all"` exports every importable column. Ignored
+ *   (forced to `"all"`) when `settings.mode` is `SIMPLE`, which has no
+ *   per-user column visibility to key off of.
+ * @param args.access - The caller's role access. It decides whether an active
+ *   last audit date filter applies; the column itself is never written to the
+ *   import-ready file.
+ * @returns The CSV file contents.
+ */
+export async function exportAssetsForImportToCsv({
+  request,
+  userId,
+  assetIds,
+  settings,
+  currentOrganization,
+  assetIndexCurrentSearchParams,
+  columnScope,
+  access,
+}: {
+  request: Request;
+  /** The acting user; their time zone resolves the day of every date filter. */
+  userId: string;
+  assetIds: string;
+  settings: AssetIndexSettings;
+  currentOrganization: Pick<
+    Organization,
+    "id" | "barcodesEnabled" | "currency" | "auditsEnabled"
+  >;
+  assetIndexCurrentSearchParams: string | null;
+  columnScope: ColumnScope;
+  access: RoleAccess;
+}): Promise<string> {
+  // The file never carries the last audit date column, but a select-all export
+  // must still honour an active last audit date filter so it matches the rows
+  // the index showed.
+  const lastAuditDateAccess = lastAuditDateAccessFor(
+    access,
+    currentOrganization
+  );
+  // The file holds raw values, so the prefs only supply the time zone that a
+  // select-all's date filters resolve the day in, the same as the index.
+  const { timeZone } = await resolveUserFormatPrefsById(
+    userId,
+    getClientHint(request)
+  );
+  const [{ assets }, activeCustomFields] = await Promise.all([
+    resolveExportAssets({
+      request,
+      assetIds,
+      settings,
+      currentOrganization,
+      assetIndexCurrentSearchParams,
+      timeZone,
+      lastAuditDateAccess,
+    }),
+    getActiveCustomFields({
+      organizationId: currentOrganization.id,
+      includeAllCategories: true,
+    }),
+  ]);
+
+  const effectiveScope: ColumnScope =
+    settings.mode === "ADVANCED" ? columnScope : "all";
+
+  return buildImportReadyCsvFromAssets({
+    assets,
+    settingsColumns: settings.columns as Column[],
+    activeCustomFields,
+    barcodesEnabled: currentOrganization.barcodesEnabled ?? false,
+    columnScope: effectiveScope,
+  });
+}
+
+/**
+ * Builds CSV export data from assets using the column settings to maintain order
+ * @param assets - Array of assets to export
+ * @param columns - Column settings that define the order and visibility of fields
+ * @param prefs - Acting user's resolved date/time preferences for humanized columns
+ * @param workspaceCustomFieldNames - Names of the workspace's active custom
+ *   fields, exported or not; the `QR URL` column gives way to one of that name
+ * @returns Array of string arrays representing CSV rows, including headers
+ */
+export const buildCsvExportDataFromAssets = ({
+  assets,
+  columns,
+  currentOrganization,
+  prefs,
+  workspaceCustomFieldNames,
+}: {
+  assets: AdvancedIndexAsset[];
+  columns: Column[];
+  currentOrganization: Pick<
+    Organization,
+    "id" | "barcodesEnabled" | "currency"
+  >;
+  prefs: ResolvedFormatPrefs;
+  workspaceCustomFieldNames: string[];
+}): string[][] => {
+  if (!assets.length) return [];
+
+  const exportedColumns = columns
+    .filter((col) => col.visible && col.name !== "actions")
+    .sort((a, b) => a.position - b.position);
+
+  // The export-only `qrUrl` column rides directly behind `qrId`, so it is
+  // shown exactly when the QR ID is. It gives way to any workspace custom
+  // field with the same header, exported or not: the update importer resolves
+  // that header to the custom field, so a `qrUrl` column under it would write
+  // the code's URL into the field.
+  const qrUrlLabel = columnsLabelsMap.qrUrl.toLowerCase();
+  const customFieldTakesQrUrlHeader = workspaceCustomFieldNames.some(
+    (name) => name.trim().toLowerCase() === qrUrlLabel
+  );
+  const visibleColumns = exportedColumns.flatMap((col): Column[] =>
+    col.name === "qrId" && !customFieldTakesQrUrlHeader
+      ? [col, { name: "qrUrl", visible: true, position: col.position }]
+      : [col]
+  );
+
+  // Create headers row using column names
+  const headers = visibleColumns.map((col) =>
+    formatValueForCsv(parseColumnName(col.name))
+  );
+
+  // Create date formatter for reminder dates (acting user's prefs)
+  const formatDateForCsv = (date: Date | string) =>
+    formatDate(date, prefs, { includeTime: true });
+
+  // Create data rows
+  const rows = assets.map((asset) =>
+    visibleColumns.map((column) => {
+      // Handle different column types
+      let value: any;
+
+      // If it's not a custom field, it must be a fixed field or 'name'
+      if (!column.name.startsWith("cf_")) {
+        const fieldName = column.name as
+          | FixedField
+          | BarcodeField
+          | "name"
+          | "total_value"
+          | "qrUrl";
+
+        switch (fieldName) {
+          case "id":
+            value = asset.id;
+            break;
+          case "sequentialId":
+            value = asset.sequentialId ?? "";
+            break;
+          case "qrId":
+            value = asset.qrId;
+            break;
+          case "qrUrl":
+            // The URL the printed code encodes; empty when the asset has none.
+            value = getQrUrl(asset.qrId);
+            break;
+          case "name":
+            value = asset.title;
+            break;
+          case "description":
+            value = asset.description ?? "";
+            break;
+          case "category":
+            value = asset.category?.name ?? "Uncategorized";
+            break;
+          case "location":
+            value = asset.location?.name;
+            break;
+          case "kit":
+            value = asset.kit?.name;
+            break;
+          case "custody": {
+            const primaryCustody = getPrimaryCustody(asset.custody);
+            value = primaryCustody
+              ? resolveTeamMemberName(primaryCustody.custodian)
+              : "";
+            break;
+          }
+          case "tags":
+            value = asset.tags?.map((t) => t.name).join(", ") ?? "";
+            break;
+          case "status":
+            value = asset.status;
+            break;
+          case "createdAt":
+            // Human/analytics export → format in the acting user's date/time
+            // prefs. The Import-ready export handles machine round-trips and
+            // doesn't even include createdAt/updatedAt (they aren't import
+            // fields), so there is no lossless-ISO contract to preserve here.
+            value = asset.createdAt ? formatDateForCsv(asset.createdAt) : "";
+            break;
+          case "updatedAt":
+            // Human/analytics export → format in the user's prefs (see createdAt).
+            value = asset.updatedAt ? formatDateForCsv(asset.updatedAt) : "";
+            break;
+          case "valuation":
+            // Per-unit price — matches `Asset.valuation` in the DB so CSV
+            // round-trip (export → re-import) is lossless. The qty-aware
+            // total is emitted separately under `total_value` (see below)
+            // so users see both without breaking the import contract.
+            // `!= null` so `valuation: 0` exports as "$0.00" instead of "".
+            value =
+              asset.valuation != null
+                ? formatCurrency({
+                    value: asset.valuation,
+                    locale: "en-US", // Default locale for CSV exports
+                    currency: currentOrganization.currency,
+                  })
+                : "";
+            break;
+          case "total_value":
+            // Synthetic export-only column injected by the caller (see
+            // `exportAssetsToCsv` and the `ColumnLabelKey` doc). Emits
+            // `valuation × quantity` so QT inventories report correctly —
+            // a Pens row stocked at 100 boxes at €1 each shows €100 here
+            // while the `valuation` column above stays at €1 per-unit.
+            value =
+              asset.valuation != null
+                ? formatCurrency({
+                    value: getAssetTotalValue(asset),
+                    locale: "en-US",
+                    currency: currentOrganization.currency,
+                  })
+                : "";
+            break;
+          case "availableToBook":
+            value = asset.availableToBook ? "Yes" : "No";
+            break;
+          case "upcomingReminder": {
+            if (asset.upcomingReminder?.alertDateTime) {
+              try {
+                const date = new Date(asset.upcomingReminder.alertDateTime);
+                // Check if date is valid
+                if (!isNaN(date.getTime())) {
+                  value = formatDateForCsv(date);
+                } else {
+                  value = "";
+                }
+              } catch {
+                value = "";
+              }
+            } else {
+              value = "";
+            }
+            break;
+          }
+          case "lastAuditDate": {
+            // Absent for never-audited assets; guard against unparseable values.
+            const lastAudit = asset.lastAuditDate
+              ? new Date(asset.lastAuditDate)
+              : null;
+            value =
+              lastAudit && !isNaN(lastAudit.getTime())
+                ? formatDateForCsv(lastAudit)
+                : "";
+            break;
+          }
+          case "upcomingBookings": {
+            value = asset.bookings
+              ? asset.bookings.map((b) => b.name).join(", ")
+              : "";
+            break;
+          }
+          case "barcode_Code128":
+          case "barcode_Code39":
+          case "barcode_DataMatrix":
+          case "barcode_ExternalQR":
+          case "barcode_EAN13": {
+            value =
+              asset.barcodes?.find(
+                (b) => b.type === columnsLabelsMap[fieldName].replace(/ /g, "")
+              )?.value ?? "";
+            break;
+          }
+
+          case "quantity":
+            // Bare number, so the column sums in a spreadsheet. The unit is
+            // exported in its own "unitOfMeasure" column.
+            value =
+              isQuantityTracked(asset) && asset.quantity != null
+                ? `${asset.quantity}`
+                : "";
+            break;
+          case "unitOfMeasure":
+            // Free text; formatValueForCsv applies the formula guard to it.
+            value =
+              isQuantityTracked(asset) && asset.unitOfMeasure
+                ? asset.unitOfMeasure
+                : "";
+            break;
+          case "minQuantity":
+            // Low-stock reorder threshold: plain number, mirrors "quantity" above.
+            value =
+              isQuantityTracked(asset) && asset.minQuantity != null
+                ? `${asset.minQuantity}`
+                : "";
+            break;
+          case "type":
+            // Handled by default column logic — asset.type is a direct string field
+            value = isQuantityTracked(asset)
+              ? "Tracked by quantity"
+              : "Individual";
+            break;
+          case "available":
+            // Derived, so export-only in practice: the importer has no
+            // "available" input and never will, it is an output of custody,
+            // kits and bookings. Included because "filter to Running low, then
+            // export" is the reorder list an inventory manager actually wants,
+            // and it is useless without the number next to the name.
+            value =
+              isQuantityTracked(asset) && asset.available != null
+                ? `${asset.available}`
+                : "";
+            break;
+          case "reserved":
+            // NOT gated on quantity-tracking, matching the column exactly. An
+            // individually-tracked asset is a pool of one and reads 1 here when
+            // a booking claims it, gating this emitted a blank cell for every
+            // booked camera while the screen showed 1, so the export quietly
+            // disagreed with the page it was exported from.
+            value = asset.reserved != null ? `${asset.reserved}` : "";
+            break;
+          case "stockStatus":
+            // Emit the human label, not the enum key: a CSV opened in a
+            // spreadsheet is read by people, and "Running low" is the word they
+            // saw on screen. Blank for INDIVIDUAL assets and for quantity
+            // assets with no reorder point, matching the column exactly, a
+            // CSV that disagrees with the screen is worse than an empty cell.
+            value =
+              asset.stockStatus && asset.stockStatus !== "NO_THRESHOLD"
+                ? STOCK_STATUS_LABELS[asset.stockStatus]
+                : "";
+            break;
+          case "assetModel":
+            value = asset.assetModelName ?? "";
+            break;
+          case "actions":
+            value = "";
+            break;
+          default:
+            checkExhaustiveSwitch(fieldName);
+            value = "";
+        }
+      } else {
+        // Handle custom fields
+        const fieldName = column.name.replace("cf_", "");
+        const customField = asset.customFields?.find(
+          (cf) => cf.customField.name === fieldName
+        );
+        if (!customField) {
+          value = "";
+        } else {
+          const fieldValue =
+            customField.value as unknown as ShelfAssetCustomFieldValueType["value"];
+          value = formatCustomFieldForCsv(
+            fieldValue,
+            column.cfType,
+            currentOrganization,
+            prefs
+          );
+        }
+      }
+
+      const isMarkdown = column.cfType === CustomFieldType.MULTILINE_TEXT;
+      return formatValueForCsv(value, isMarkdown);
+    })
+  );
+
+  // Return headers followed by data rows
+  return [headers, ...rows];
+};
+
+/**
+ * Formats one value as a quoted CSV cell.
+ *
+ * The value is trimmed, a date is written as `yyyy-MM-dd`, and markdown is
+ * cleaned when asked. A value a spreadsheet would run as a formula gets a
+ * leading `'` (see `neutralizeCsvFormula`), which `parseCsv` removes on import;
+ * a plain negative number such as `-5` or `-$5.00` is left numeric.
+ *
+ * @param value - The cell value: text, number, boolean or date.
+ * @param isMarkdown - Strip markdown formatting before writing the cell.
+ * @returns The cell, wrapped in double quotes with inner quotes doubled.
+ */
+export const formatValueForCsv = (value: any, isMarkdown = false): string => {
+  // Handle null/undefined/empty values
+  if (value === null || value === undefined || value === "") {
+    return '""';
+  }
+
+  // Handle boolean values
+  if (typeof value === "boolean") {
+    return value ? '"Yes"' : '"No"';
+  }
+
+  // Convert to string and trim
+  let stringValue = String(value).trim();
+
+  // If empty after trim, return empty quoted string
+  if (!stringValue) {
+    return '""';
+  }
+
+  // For dates, ensure consistent format
+  // why: kept ISO/English on purpose — generic CSV date serialization stays
+  // ISO (yyyy-MM-dd) so exported data round-trips losslessly on re-import,
+  // independent of the user's display date format.
+  if (value instanceof Date) {
+    stringValue = value.toISOString().split("T")[0];
+  }
+  // Clean any markdown formatting
+  if (isMarkdown) {
+    stringValue = cleanMarkdownFormatting(stringValue);
+  }
+
+  // Every caller writes member-typed text, so the formula guard is applied
+  // here rather than per column.
+  stringValue = neutralizeCsvFormula(stringValue).replace(/"/g, '""');
+
+  return `"${stringValue}"`;
+};
+
+/**
+ * Formats a custom field value specifically for CSV export
+ */
+const formatCustomFieldForCsv = (
+  fieldValue: ShelfAssetCustomFieldValueType["value"],
+  cfType: CustomFieldType | undefined,
+  currentOrganization: Pick<
+    Organization,
+    "id" | "barcodesEnabled" | "currency"
+  >,
+  prefs: ResolvedFormatPrefs
+): string => {
+  if (!fieldValue || fieldValue.raw === undefined || fieldValue.raw === null) {
+    return "";
+  }
+
+  switch (cfType) {
+    case CustomFieldType.BOOLEAN:
+      if (fieldValue.raw === undefined || fieldValue.raw === null) {
+        return "";
+      }
+      return fieldValue.valueBoolean ? "Yes" : "No";
+
+    case CustomFieldType.MULTILINE_TEXT: {
+      const rawText = String(fieldValue.raw || "");
+      return cleanMarkdownFormatting(rawText);
+    }
+
+    case CustomFieldType.DATE:
+      if (!fieldValue.valueDate) return "";
+      try {
+        // Standard export is display-only (re-import uses the Import-ready
+        // export), so custom-field dates render in the user's date format.
+        // Format the bare `raw` calendar date ("YYYY-MM-DD"), NOT `valueDate`
+        // (a UTC-midnight ISO like "2026-07-06T00:00:00.000Z"): passing the ISO
+        // through localeOnly parses it to a UTC instant and then reads the
+        // SERVER's local components, shifting a day west of UTC on a non-UTC
+        // host. `raw` takes formatDate's no-shift date-only path and matches the
+        // UI, which also renders `raw`.
+        return formatDate(String(fieldValue.raw), prefs, { localeOnly: true });
+      } catch {
+        return String(fieldValue.raw);
+      }
+
+    case CustomFieldType.AMOUNT:
+      return formatCurrency({
+        value: fieldValue.raw as number,
+        locale: "en-US", // Default locale for CSV exports
+        currency: currentOrganization.currency,
+      });
+
+    default:
+      return String(fieldValue.raw || "");
+  }
+};
+
+/**
+ * Builds the custody restriction for a caller who may only export their own
+ * bookings, matching custody recorded on EITHER link.
+ *
+ * The team-member half exists because legacy rows carry custody on
+ * `custodianTeamMemberId` with a null `custodianUserId` — for example a booking
+ * assigned while no user was attached to the team member, the two being linked
+ * only later when the invite was accepted. The bookings index matches those
+ * rows (the loaders resolve the same team-member ids with
+ * `resolveCustodianScope` into `getBookings`' `custodianScope`), so
+ * restricting the export to the user link alone would silently drop rows the
+ * user can see on screen and selected for export.
+ *
+ * This never widens access: `teamMemberIds` are resolved server-side from the
+ * authenticated `userId`, never from request input, so both halves describe the
+ * same person. A caller with no team-member row in this org simply falls back
+ * to the user link, which is fail-closed.
+ *
+ * @param params.userId - The authenticated caller
+ * @param params.organizationId - The active workspace
+ * @returns An OR-clause to push into `where.AND` as a single member
+ */
+async function buildExportCustodyScopeClause({
+  userId,
+  organizationId,
+}: {
+  userId: string;
+  organizationId: string;
+}): Promise<Prisma.BookingWhereInput> {
+  // Resolve ALL of the user's team-member links (a user can hold more than one
+  // per org — the schema has no unique constraint), so the export matches the
+  // index's custody scope instead of an arbitrary single row.
+  const { teamMemberIds } = await resolveCustodianScope({
+    userId,
+    organizationId,
+  });
+
+  return {
+    OR: [
+      { custodianUserId: userId },
+      ...(teamMemberIds.length
+        ? [{ custodianTeamMemberId: { in: teamMemberIds } }]
+        : []),
+    ],
+  };
+}
+
+/**
+ * Builds the bookings CSV string for the export route.
+ *
+ * Resolves which bookings to export, then enriches them with batched partial
+ * check-in state and delegates row construction to
+ * {@link buildCsvExportDataFromBookings}. The bookings are either the explicit
+ * `bookingsIds`, or with the select-all sentinel every booking `list` holds at
+ * the request's filters, resolved with {@link getBookingsListWhereParams} like
+ * that list's loader.
+ *
+ * @param request - The incoming request (carries filters, locale, timezone)
+ * @param userId - The acting user; scopes custody and DRAFT visibility on both
+ *   paths. `bookingsIds` is unvalidated request input, so this is a security
+ *   boundary rather than a convenience filter.
+ * @param bookingsIds - Selected booking IDs, or `[ALL_SELECTED_KEY]` for all
+ * @param canSeeAllBookings - Whether the user may export bookings they don't own
+ * @param organizationId - The active workspace; scopes every booking read
+ * @param list - The list select-all stands for; `null` when the request named none
+ * @returns The CSV body as a single CRLF-joined string
+ * @throws {ShelfError} 400 when a select-all names no list
+ * @throws {ShelfError} If fetching bookings or building rows fails
+ */
+export async function exportBookingsFromIndexToCsv({
+  request,
+  userId,
+  bookingsIds,
+  canSeeAllBookings,
+  organizationId,
+  list,
+}: {
+  request: Request;
+  userId: string;
+  bookingsIds: string[];
+  canSeeAllBookings: boolean;
+  organizationId: string;
+  list: BookingsList | null;
+}) {
+  try {
+    const hasSelectAll = bookingsIds.includes(ALL_SELECTED_KEY);
+
+    /** If all are selected in the list, then we have to consider filter to get the entries */
+    let bookings;
+    if (hasSelectAll) {
+      if (!list) {
+        // Without the list, guessing could export bookings the user never saw.
+        throw new ShelfError({
+          cause: null,
+          title: "Nothing was exported",
+          message:
+            "This page is out of date. Reload it and select the bookings again.",
+          additionalData: { organizationId },
+          label: "Booking",
+          status: 400,
+          shouldBeCaptured: false,
+        });
+      }
+
+      const searchParams = getCurrentSearchParams(request);
+      const bookingsData = await getBookings({
+        ...getBookingsListWhereParams({
+          list,
+          searchParams,
+          organizationId,
+          userId,
+          custodianScope: canSeeAllBookings
+            ? null
+            : await resolveCustodianScope({ userId, organizationId }),
+        }),
+        page: 1,
+        takeAll: true,
+        // The export never reads the total.
+        skipCount: true,
+        orderBy: searchParams.get("orderBy") ?? "from",
+        orderDirection: (searchParams.get("orderDirection") ??
+          "asc") as SortingDirection,
+        extraInclude: { tags: { select: { name: true } } },
+      });
+      bookings = bookingsData.bookings;
+    } else {
+      bookings = await db.booking.findMany({
+        where: {
+          id: { in: bookingsIds },
+          organizationId,
+          /**
+           * `bookingsIds` comes straight from the `?bookingsIds=` query param
+           * and is unvalidated, so the org scope alone is not a boundary:
+           * without these clauses a self-service / base user (both hold
+           * `booking.export`) can export any booking in the organization by
+           * supplying its id.
+           *
+           * Mirrors the restriction the bookings lists apply via
+           * {@link getBookingsListWhereParams} + {@link getBookings}, so a user can
+           * export exactly the rows they can see — no more, and no fewer.
+           */
+          AND: [
+            bookingDraftVisibilityClause(userId),
+            ...(canSeeAllBookings
+              ? []
+              : [
+                  await buildExportCustodyScopeClause({
+                    userId,
+                    organizationId,
+                  }),
+                ]),
+          ],
+        },
+        include: {
+          ...BOOKING_COMMON_INCLUDE,
+          bookingAssets: {
+            select: {
+              /**
+               * `quantity` and `asset.type` are needed so the CSV builder
+               * can render `"Title × N"` for QUANTITY_TRACKED assets.
+               * Without these the row would silently show just the
+               * title and drop the booked quantity. `asset.id` is
+               * required to match each row against the booking's
+               * partial check-ins for the per-asset check-in status
+               * column added by the booking export checkin-status feature.
+               */
+              quantity: true,
+              asset: {
+                select: {
+                  id: true,
+                  title: true,
+                  type: true,
+                },
+              },
+            },
+          },
+          tags: { select: { name: true } },
+        },
+      });
+    }
+
+    // Fetch partial check-in state for the exported bookings in a single
+    // batched query (avoids an N+1 across the selection) so the export can
+    // surface which assets are still checked out vs already returned.
+    const checkinsByBooking = await buildBookingCheckinMap(
+      bookings.map((booking) => booking.id)
+    );
+
+    // Acting user's prefs: this export was triggered by userId, so their
+    // date/time preferences drive every humanized column.
+    const prefs = await resolveUserFormatPrefsById(
+      userId,
+      getClientHint(request)
+    );
+
+    // Pass both assets and columns to the build function
+    const csvData = buildCsvExportDataFromBookings(
+      bookings as FlexibleBooking[],
+      prefs,
+      checkinsByBooking
+    );
+
+    // Join rows with CRLF as per CSV spec
+    return csvData.join("\r\n");
+  } catch (cause) {
+    const message =
+      cause instanceof ShelfError
+        ? cause.message
+        : "Something went wrong while bulk archive booking.";
+
+    throw new ShelfError({
+      cause,
+      message,
+      additionalData: { bookingsIds, organizationId },
+      label: "Booking",
+    });
+  }
+}
+
+const ACTIVITY_HEADER = "Date,Author,Type,Content";
+
+type ActivityNote = Pick<Note, "content" | "createdAt" | "type"> & {
+  user: UserNameFields | null;
+};
+
+const sanitizeCsvValue = (value: string | null | undefined) =>
+  formatValueForCsv((value ?? "").replace(/\r?\n/g, " "));
+
+const notesToCsv = (notes: ActivityNote[], prefs: ResolvedFormatPrefs) => {
+  const rows = notes.map((note) => {
+    // Resolved, not joined: `displayName` replaces the legal name for the
+    // users who set one, and a hand-rolled join here is invisible to the
+    // compiler no matter what the row carries.
+    const author = resolveUserDisplayName(note.user);
+
+    return [
+      sanitizeCsvValue(
+        formatDate(note.createdAt, prefs, { includeTime: true })
+      ),
+      sanitizeCsvValue(author),
+      sanitizeCsvValue(note.type),
+      sanitizeCsvValue(sanitizeNoteContent(note.content ?? "", prefs)),
+    ].join(",");
+  });
+
+  return [ACTIVITY_HEADER, ...rows].join("\n");
+};
+
+type ActivityNoteRecord = {
+  user: UserNameFields | null;
+  content: string | null;
+  createdAt: Date;
+  type: string;
+};
+
+type NoteFetcher<Where> = (args: {
+  where: Where;
+  include: {
+    user: {
+      select: {
+        firstName: true;
+        lastName: true;
+        displayName: true;
+      };
+    };
+  };
+  orderBy: {
+    createdAt: "desc";
+  };
+}) => Promise<ActivityNoteRecord[]>;
+
+type ExportNotesToCsvArgs<Where> = {
+  request: Request;
+  userId: string;
+  where: Where;
+  findMany: NoteFetcher<Where>;
+};
+
+async function exportNotesToCsv<Where>({
+  request,
+  userId,
+  where,
+  findMany,
+}: ExportNotesToCsvArgs<Where>) {
+  // Acting user's prefs: this export was triggered by userId, so their
+  // date/time preferences drive the note timestamps and any `{% date %}`
+  // tags inside note content.
+  const prefs = await resolveUserFormatPrefsById(
+    userId,
+    getClientHint(request)
+  );
+
+  const notes = await findMany({
+    where,
+    include: {
+      user: {
+        select: {
+          firstName: true,
+          lastName: true,
+          displayName: true,
+        },
+      },
+    },
+    orderBy: {
+      createdAt: "desc",
+    },
+  });
+
+  const activityNotes = notes.map<ActivityNote>((note) => ({
+    content: note.content ?? "",
+    createdAt: note.createdAt,
+    type: note.type as ActivityNote["type"],
+    user: note.user,
+  }));
+
+  return notesToCsv(activityNotes, prefs);
+}
+
+export async function exportAssetNotesToCsv({
+  request,
+  userId,
+  assetId,
+  organizationId,
+}: {
+  request: Request;
+  userId: string;
+  assetId: string;
+  organizationId: string;
+}) {
+  return exportNotesToCsv<Prisma.NoteWhereInput>({
+    request,
+    userId,
+    where: {
+      assetId,
+      asset: { organizationId },
+    },
+    findMany: (args) => db.note.findMany(args) as Promise<ActivityNoteRecord[]>,
+  });
+}
+
+export async function exportBookingNotesToCsv({
+  request,
+  userId,
+  bookingId,
+  organizationId,
+}: {
+  request: Request;
+  userId: string;
+  bookingId: string;
+  organizationId: string;
+}) {
+  return exportNotesToCsv<Prisma.BookingNoteWhereInput>({
+    request,
+    userId,
+    where: {
+      bookingId,
+      booking: { organizationId },
+    },
+    findMany: (args) =>
+      db.bookingNote.findMany(args) as Promise<ActivityNoteRecord[]>,
+  });
+}
+
+export async function exportAuditNotesToCsv({
+  request,
+  userId,
+  auditId,
+  organizationId,
+}: {
+  request: Request;
+  userId: string;
+  auditId: string;
+  organizationId: string;
+}) {
+  return exportNotesToCsv<Prisma.AuditNoteWhereInput>({
+    request,
+    userId,
+    where: {
+      auditSessionId: auditId,
+      auditSession: { organizationId },
+    },
+    findMany: (args) =>
+      db.auditNote.findMany(args) as Promise<ActivityNoteRecord[]>,
+  });
+}
+
+export async function exportLocationNotesToCsv({
+  request,
+  userId,
+  locationId,
+  organizationId,
+}: {
+  request: Request;
+  userId: string;
+  locationId: string;
+  organizationId: string;
+}) {
+  return exportNotesToCsv<Prisma.LocationNoteWhereInput>({
+    request,
+    userId,
+    where: {
+      locationId,
+      location: { organizationId },
+    },
+    findMany: (args) =>
+      db.locationNote.findMany(args) as Promise<ActivityNoteRecord[]>,
+  });
+}
+
+/**
+ * Normalized asset shape shared across the different booking export fetches —
+ * always has a `title`, with the remaining asset fields optional.
+ */
+type FlexibleAsset = Partial<Asset> & {
+  title: string;
+};
+
+/**
+ * Normalized booking shape the CSV builder consumes, regardless of which fetch
+ * path (by-id vs. select-all) produced it: a booking with its custodians, the
+ * BookingAsset pivot list (each with optional `quantity` + {@link FlexibleAsset}),
+ * and name-only tags.
+ *
+ * `quantity` is optional so the type accepts bookings fetched without it
+ * (falls back to "no quantity annotation" in the renderer), but both query
+ * paths in `exportBookingsFromIndexToCsv` now populate it.
+ */
+type FlexibleBooking = Omit<BookingWithCustodians, "bookingAssets"> & {
+  bookingAssets: { quantity?: number; asset: FlexibleAsset }[];
+  tags: Pick<Tag, "name">[];
+};
+
+/**
+ * Per-booking partial check-in state needed by the CSV export.
+ * - `checkedInAssetIds`: set of asset IDs that have been (partially) checked in
+ * - `checkinDateByAsset`: earliest check-in timestamp per asset, for the date column
+ */
+type BookingCheckinInfo = {
+  checkedInAssetIds: Set<string>;
+  checkinDateByAsset: Map<string, Date>;
+};
+
+/**
+ * Batch-fetch partial check-in state for a set of bookings.
+ *
+ * Reads every {@link PartialBookingCheckin} for the given bookings in one query
+ * and folds them into a per-booking lookup. For each asset only the earliest
+ * check-in is kept (an asset can in principle appear in more than one check-in
+ * session), matching {@link getDetailedPartialCheckinData}'s "first wins" rule.
+ *
+ * @param bookingIds - The bookings being exported
+ * @returns Map of bookingId → {@link BookingCheckinInfo}; bookings with no
+ *   partial check-ins are simply absent from the map
+ */
+async function buildBookingCheckinMap(
+  bookingIds: string[]
+): Promise<Map<string, BookingCheckinInfo>> {
+  const map = new Map<string, BookingCheckinInfo>();
+
+  if (!bookingIds.length) {
+    return map;
+  }
+
+  const checkins = await db.partialBookingCheckin.findMany({
+    where: { bookingId: { in: bookingIds } },
+    select: { bookingId: true, assetIds: true, checkinTimestamp: true },
+    // Earliest first so the "first check-in wins" assignment below is stable.
+    orderBy: { checkinTimestamp: "asc" },
+  });
+
+  for (const checkin of checkins) {
+    let info = map.get(checkin.bookingId);
+    if (!info) {
+      info = {
+        checkedInAssetIds: new Set<string>(),
+        checkinDateByAsset: new Map<string, Date>(),
+      };
+      map.set(checkin.bookingId, info);
+    }
+
+    for (const assetId of checkin.assetIds) {
+      info.checkedInAssetIds.add(assetId);
+      // Keep the earliest check-in per asset (rows are ordered ascending).
+      if (!info.checkinDateByAsset.has(assetId)) {
+        info.checkinDateByAsset.set(assetId, checkin.checkinTimestamp);
+      }
+    }
+  }
+
+  return map;
+}
+
+/**
+ * Builds CSV export data from bookings.
+ *
+ * Each booking is emitted as a "main" row (booking fields + its first asset)
+ * followed by one row per additional asset. Per-asset columns
+ * (`Assets`, `Item check-in status`, `Check-in date`) are populated on every
+ * row for that row's asset; booking-level columns are populated on the main
+ * row only and left blank on the trailing asset rows.
+ *
+ * @param bookings - Array of bookings to export
+ * @param prefs - Acting user's resolved date/time preferences for humanized columns
+ * @param checkinsByBooking - Per-booking partial check-in state, from
+ *   {@link buildBookingCheckinMap}. Used to derive the per-asset check-in
+ *   status/date columns and the booking-level checked-in rollup.
+ * @returns Array of string arrays representing CSV rows, including headers
+ */
+/**
+ * Render a booking-asset row label for the CSV "Assets" column.
+ *
+ * For QUANTITY_TRACKED assets we append `" × N"` so the exported sheet
+ * shows the booked quantity — matching the display convention used in
+ * booking emails and the booking PDF. INDIVIDUAL assets render as just
+ * the title (quantity is implicitly 1).
+ *
+ * Falls back gracefully when the asset type or quantity is missing
+ * (e.g. older tests or legacy fixtures that don't provide those fields).
+ */
+const formatBookingAssetForCsv = (ba: {
+  quantity?: number;
+  asset: FlexibleAsset;
+}): string => {
+  const title = ba.asset.title || "Unnamed Asset";
+  const isQtyTracked = ba.asset.type === "QUANTITY_TRACKED";
+  if (isQtyTracked && ba.quantity != null && ba.quantity > 0) {
+    return `${title} × ${ba.quantity}`;
+  }
+  return title;
+};
+
+export const buildCsvExportDataFromBookings = (
+  bookings: FlexibleBooking[],
+  prefs: ResolvedFormatPrefs,
+  checkinsByBooking: Map<string, BookingCheckinInfo> = new Map()
+): string[][] => {
+  if (!bookings.length) return [];
+
+  // Create date formatter for CSV export (acting user's prefs)
+  const format = (date: Date | string) =>
+    formatDate(date, prefs, { includeTime: true });
+
+  // Create headers row using column names. The check-in columns are appended
+  // last so existing consumers that key off earlier column positions are
+  // unaffected. Per-asset columns (assetCheckinStatus/assetCheckinDate) sit
+  // beside `asset`; the booking-level rollup (checkedInCount/totalAssets)
+  // follows.
+  const headers = {
+    url: "Booking URL", // custom string
+    id: "Booking ID", // string
+    name: "Name", // string
+    status: "Status", // string
+    from: "Actual start date", // date
+    originalFrom: "Planned start date",
+    to: "Actual end date", // date
+    originalTo: "Planned end date",
+    custodian: "Custodian",
+    description: "Description", // string
+    tags: "Tags",
+    asset: "Assets", // asset title (per row)
+    assetCheckinStatus: "Item check-in status", // "Checked in" / "Checked out" (per asset)
+    assetCheckinDate: "Check-in date", // when the asset was checked in (per asset)
+    checkedInCount: "Checked in", // assets returned for this booking (per booking)
+    totalAssets: "Total assets", // assets on this booking (per booking)
+  };
+
+  // Create data rows with assets
+  const rows: string[][] = [];
+
+  bookings.forEach((booking) => {
+    // Normalise to a non-empty list of BookingAsset pivot rows so a booking
+    // with no assets still emits a single row. The placeholder has no asset
+    // id, so its check-in / status columns stay blank.
+    const bookingAssetRows =
+      booking.bookingAssets && booking.bookingAssets.length > 0
+        ? booking.bookingAssets
+        : [
+            {
+              quantity: undefined,
+              asset: {
+                id: undefined as unknown as string | undefined,
+                title: "No assets",
+              } as FlexibleAsset,
+            },
+          ];
+
+    // Per-booking partial check-in state. `calculatePartialCheckinProgress` is
+    // the same helper that powers the booking detail "X / Y checked in" bar, so
+    // the export rollup matches what users see in-app. Count UNIQUE assets
+    // (not slices) — a qty-tracked asset with one standalone + one kit-driven
+    // slice is still one asset for progress purposes.
+    const checkinInfo = checkinsByBooking.get(booking.id);
+    const checkedInAssetIds =
+      checkinInfo?.checkedInAssetIds ?? new Set<string>();
+    const uniqueAssetIdCount = new Set(
+      (booking.bookingAssets ?? [])
+        .map((ba) => ba.asset.id)
+        .filter((id): id is string => Boolean(id))
+    ).size;
+    const progress = calculatePartialCheckinProgress(
+      uniqueAssetIdCount,
+      [...checkedInAssetIds],
+      booking.status
+    );
+
+    bookingAssetRows.forEach((ba, index) => {
+      // The first BookingAsset row shares the booking's "main" row; the rest
+      // get their own rows with booking-level columns blanked.
+      const isMainRow = index === 0;
+      const asset = ba.asset;
+
+      const row = Object.keys(headers).map((column) => {
+        // --- Per-asset columns: populated on every row for that asset ---
+        if (column === "asset") {
+          // formatBookingAssetForCsv adds the "× N" suffix for qty-tracked.
+          return formatValueForCsv(
+            asset.id
+              ? formatBookingAssetForCsv(ba)
+              : asset.title ?? "No assets",
+            false
+          );
+        }
+        if (column === "assetCheckinStatus") {
+          const label = asset.id
+            ? getBookingAssetCheckinLabel(
+                asset.id,
+                checkedInAssetIds,
+                booking.status
+              )
+            : "";
+          return formatValueForCsv(label, false);
+        }
+        if (column === "assetCheckinDate") {
+          const checkinDate = asset.id
+            ? checkinInfo?.checkinDateByAsset.get(asset.id)
+            : undefined;
+          return formatValueForCsv(
+            checkinDate ? format(checkinDate) : "",
+            false
+          );
+        }
+
+        // --- Booking-level columns: main row only, blank on asset rows ---
+        if (!isMainRow) {
+          return formatValueForCsv("", false);
+        }
+
+        let value: any;
+        switch (column) {
+          case "url":
+            value = `${SERVER_URL}/bookings/${booking.id}`;
+            break;
+          case "id":
+            value = booking.id;
+            break;
+          case "name":
+            value = booking.name;
+            break;
+          case "status":
+            value =
+              booking.status.charAt(0).toUpperCase() +
+              booking.status.slice(1).toLowerCase();
+            break;
+          case "from":
+            value = booking.from ? format(booking.from).split(",") : "";
+            break;
+          case "originalFrom":
+            value = booking.originalFrom
+              ? format(booking.originalFrom).split(",")
+              : booking.from
+              ? format(booking.from).split(",")
+              : "";
+            break;
+          case "to":
+            value = booking.to ? format(booking.to).split(",") : "";
+            break;
+          case "originalTo":
+            value = booking.originalTo
+              ? format(booking.originalTo).split(",")
+              : booking.to
+              ? format(booking.to).split(",")
+              : "";
+            break;
+          case "custodian": {
+            const teamMember = {
+              name: booking.custodianTeamMember?.name ?? "",
+              user: booking?.custodianUser ?? null,
+            };
+
+            value = resolveTeamMemberName(teamMember, true);
+            break;
+          }
+          case "description":
+            value = booking.description ?? "";
+            break;
+          case "tags":
+            value = booking.tags.length
+              ? booking.tags.map((tag) => tag.name).join(", ")
+              : "No tags";
+            break;
+          case "checkedInCount":
+            value = progress.checkedInCount;
+            break;
+          case "totalAssets":
+            value = progress.totalAssets;
+            break;
+          default:
+            value = "";
+        }
+        return formatValueForCsv(value, false);
+      });
+
+      rows.push(row);
+    });
+  });
+
+  // Return headers followed by data rows
+  return [Object.values(headers), ...rows];
+};
+
+/**
+ * Exports the selected NRMs to CSV.
+ *
+ * @param params.nrmIds - Selected ids, or a list containing ALL_SELECTED_KEY
+ * @param params.organizationId - The active organization
+ * @param params.search - The index's active search, forwarded on select-all so
+ *   "select all" exports what the user is actually looking at
+ * @returns The CSV string
+ * @throws {ShelfError} If the query or serialisation fails
+ */
+export async function exportNRMsToCsv({
+  nrmIds,
+  organizationId,
+  search,
+}: {
+  nrmIds: TeamMember["id"][];
+  organizationId: Organization["id"];
+  search?: string | null;
+}) {
+  try {
+    // Derived from the shared NRM scope so the export can never diverge from
+    // the index again (it used to select the whole org on select-all).
+    const where = getNrmSelectionWhere({ nrmIds, organizationId, search });
+
+    const teamMembers = await db.teamMember.findMany({
+      where,
+      include: { _count: { select: { custodies: true } } },
+    });
+
+    return buildCsvExportDataFromTeamMembers({ teamMembers });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      label: "Team Member",
+      message: isLikeShelfError(cause)
+        ? cause.message
+        : "Something went wrong while exporting NRMs to csv.",
+      additionalData: { nrmIds, organizationId, search },
+    });
+  }
+}
+
+export function buildCsvExportDataFromTeamMembers({
+  teamMembers,
+}: {
+  teamMembers: Prisma.TeamMemberGetPayload<{
+    include: { _count: { select: { custodies: true } } };
+  }>[];
+}) {
+  try {
+    const headers = {
+      id: "Id",
+      name: "Name",
+      custodies: "Custodies",
+    };
+
+    const rows: string[][] = [];
+
+    teamMembers.forEach((teamMember) => {
+      let value = "";
+
+      const teamMemberRow = Object.keys(headers).map((header) => {
+        switch (header) {
+          case "id":
+            value = teamMember.id;
+            break;
+
+          case "name":
+            value = teamMember.name;
+            break;
+
+          case "custodies":
+            value = teamMember._count.custodies.toString();
+            break;
+
+          default:
+            value = "";
+        }
+
+        return formatValueForCsv(value, false);
+      });
+
+      rows.push(teamMemberRow);
+    });
+
+    const finalCsv = [Object.values(headers), ...rows];
+
+    // Join rows with CRLF as per CSV spec
+    return finalCsv.join("\r\n");
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      label: "Team Member",
+      message:
+        "Something went wrong while building csv from team members data.",
+    });
+  }
+}

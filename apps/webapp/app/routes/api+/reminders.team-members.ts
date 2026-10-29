@@ -1,0 +1,414 @@
+/**
+ * Report PDF Data Route
+ *
+ * Fetches report data for client-side PDF generation.
+ * Returns JSON that the client renders as a styled HTML preview,
+ * then converts to PDF via react-to-print.
+ *
+ * Serves the three reports that ship a PDF: booking compliance, asset
+ * inventory and custody snapshot. `REPORTS_WITH_PDF` in
+ * `report-export-actions.tsx` gates which pages offer the button, and the
+ * switch below must cover exactly that list. Sends one `pdf_preview_opened`
+ * event per preview.
+ *
+ * @see {@link file://../../components/reports/report-pdf.tsx} the renderer this feeds
+ * @see {@link file://../../components/reports/report-export-actions.tsx} `REPORTS_WITH_PDF`
+ */
+
+import { data } from "react-router";
+import type { LoaderFunctionArgs } from "react-router";
+import { z } from "zod";
+
+import { db } from "~/database/db.server";
+import { captureServerEvent } from "~/integrations/posthog/client.server";
+import { resolveReportFilters } from "~/modules/reports/filters.server";
+import {
+  resolveTimeframe,
+  bookingComplianceReport,
+  assetInventoryReport,
+  custodySnapshotReport,
+  type BookingComplianceSortColumn,
+} from "~/modules/reports/helpers.server";
+import { sumQuantityAwareValue } from "~/modules/reports/pdf-totals";
+import { getReportById } from "~/modules/reports/registry";
+import type {
+  TimeframePreset,
+  ReportPdfMeta,
+  CompliancePdfMeta,
+  AssetInventoryPdfMeta,
+  CustodySnapshotPdfMeta,
+} from "~/modules/reports/types";
+import { getClientHint, getLocale } from "~/utils/client-hints";
+import { formatDate } from "~/utils/date-format";
+import { resolveUserFormatPrefsById } from "~/utils/date-format.server";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import {
+  payload,
+  error,
+  getParams,
+  getCurrentSearchParams,
+} from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { assertUserCanUseReports } from "~/utils/subscription.server";
+
+/**
+ * Format return status for PDF - matches the CSV export format.
+ * Shows "On time" or the lateness duration (e.g., "4h 30m late").
+ */
+function formatReturnStatus(
+  isOnTime: boolean,
+  latenessMs: number | null
+): string {
+  if (isOnTime) {
+    return "On time";
+  }
+
+  if (latenessMs === null) {
+    return "Pending";
+  }
+
+  const absMs = Math.abs(latenessMs);
+  const minutes = Math.floor(absMs / (1000 * 60));
+  const hours = Math.floor(absMs / (1000 * 60 * 60));
+  const days = Math.floor(absMs / (1000 * 60 * 60 * 24));
+
+  let value: string;
+  if (days > 0) {
+    const remainingHours = hours % 24;
+    value = remainingHours > 0 ? `${days}d ${remainingHours}h` : `${days}d`;
+  } else if (hours > 0) {
+    const remainingMinutes = minutes % 60;
+    value =
+      remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+  } else {
+    value = `${minutes}m`;
+  }
+
+  return latenessMs > 0 ? `${value} late` : `${value} early`;
+}
+
+/**
+ * Returns the data the client renders into a report PDF, with the same filters
+ * as the report page and every row instead of one page.
+ *
+ * @returns `{ pdfMeta }` for the report named by `reportId`
+ * @throws {ShelfError} 403 when the caller lacks `reports: export` or the
+ *   workspace's plan does not include reports; 404 for an unknown report
+ */
+export const loader = async ({
+  context,
+  request,
+  params,
+}: LoaderFunctionArgs) => {
+  const { userId } = context.getSession();
+  const { reportId } = getParams(
+    params,
+    z.object({
+      reportId: z.string(),
+    }),
+    {
+      additionalData: { userId },
+    }
+  );
+
+  try {
+    const { organizationId, organizations } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.reports,
+      // PDF generation hands the data out of the app, like the CSV route:
+      // both are export surfaces and share the export action.
+      action: PermissionAction.export,
+    });
+
+    // Reports are part of the Plus and Team plans. Refuse the data with a 403
+    // before anything else is read for this request.
+    await assertUserCanUseReports({ organizationId, organizations });
+
+    // Validate report exists
+    const reportDef = getReportById(reportId);
+    if (!reportDef) {
+      throw new ShelfError({
+        cause: null,
+        message: `Report "${reportId}" not found`,
+        label: "Report",
+        status: 404,
+      });
+    }
+
+    // Parse filters
+    const searchParams = getCurrentSearchParams(request);
+    const timeframePreset =
+      (searchParams.get("timeframe") as TimeframePreset) || "last_30d";
+    const customFrom = searchParams.get("from");
+    const customTo = searchParams.get("to");
+
+    // Acting user's resolved prefs drive both the timeframe label ordering and
+    // the PDF table date formatter below (resolved once, reused twice).
+    const prefs = await resolveUserFormatPrefsById(
+      userId,
+      getClientHint(request)
+    );
+
+    const timeframe = resolveTimeframe(
+      timeframePreset,
+      customFrom ? new Date(customFrom) : undefined,
+      customTo ? new Date(customTo) : undefined,
+      prefs
+    );
+
+    // Get organization info. `currency` is required so PDF monetary values
+    // render in the workspace's configured currency rather than a hardcoded "$".
+    // Same resolution the report page runs, so the PDF holds exactly the
+    // rows the filtered page shows.
+    const [organization, reportFilters] = await Promise.all([
+      db.organization.findUnique({
+        where: { id: organizationId },
+        select: {
+          name: true,
+          imageId: true,
+          updatedAt: true,
+          currency: true,
+        },
+      }),
+      resolveReportFilters({ organizationId, searchParams, reportDef }),
+    ]);
+
+    if (!organization) {
+      throw new ShelfError({
+        cause: null,
+        message: "Organization not found",
+        label: "Organization",
+        status: 404,
+      });
+    }
+
+    // Locale drives number + currency formatting inside the PDF renderer.
+    const locale = getLocale(request);
+
+    // Common monetary fields threaded into every pdfMeta variant.
+    const monetaryMeta = {
+      currency: organization.currency,
+      locale,
+    };
+
+    // Report tables use a date-only label (year + short month + day). formatDate
+    // reassembles per the acting user's date-order preference (reuses the prefs
+    // resolved once above — do not resolve again).
+    const dateFormat = {
+      format: (date: Date) =>
+        formatDate(date, prefs, {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        }),
+    };
+
+    // Generate report data based on type. Each case parses the same filter
+    // params its page-loader counterpart honors (see reports.$reportId.tsx)
+    // and hands them to the same query function — the client forwards the
+    // page's full query string, so the PDF contains exactly the rows the
+    // filtered page shows.
+    let pdfMeta: ReportPdfMeta;
+
+    switch (reportId) {
+      case "booking-compliance": {
+        // Sort params mirror the page so the PDF row order matches the table.
+        const sortBy = (searchParams.get("sortBy") ||
+          "scheduledEnd") as BookingComplianceSortColumn;
+        const sortOrder = (searchParams.get("sortOrder") || "desc") as
+          | "asc"
+          | "desc";
+        const reportData = await bookingComplianceReport({
+          organizationId,
+          timeframe,
+          // Anchor trend-chart axis labels in the acting user's timezone (D2).
+          timeZone: prefs.timeZone,
+          statusFilter:
+            reportFilters.bookingStatuses.length > 0
+              ? reportFilters.bookingStatuses
+              : undefined,
+          custodianTeamMemberId: reportFilters.teamMemberId ?? undefined,
+          assetFilter: reportFilters.assetFilter,
+          page: 1,
+          pageSize: 10000, // PDF can handle large tables
+          sortBy,
+          sortOrder,
+        });
+
+        const overdueKpi = reportData.kpis.find(
+          (k) => k.id === "currently_overdue"
+        );
+
+        pdfMeta = {
+          ...monetaryMeta,
+          reportId,
+          reportTitle: reportDef.title,
+          reportDescription: reportDef.description,
+          organizationName: organization.name,
+          organizationImageId: organization.imageId,
+          organizationUpdatedAt: organization.updatedAt,
+          generatedAt: dateFormat.format(new Date()),
+          timeframeLabel: timeframe.label,
+          timeframeFrom: dateFormat.format(timeframe.from),
+          timeframeTo: dateFormat.format(timeframe.to),
+          complianceRate: reportData.complianceData?.rate ?? 0,
+          onTimeCount: reportData.complianceData?.onTime ?? 0,
+          lateCount: reportData.complianceData?.late ?? 0,
+          // Use totalRows from report (includes COMPLETE + OVERDUE) for accurate row count
+          totalCount: reportData.totalRows,
+          overdueCount: (overdueKpi?.rawValue as number) || 0,
+          priorPeriod: reportData.complianceData?.priorPeriod,
+          custodianPerformance: (reportData.custodianPerformance ?? [])
+            .filter((c) => c.total >= 2)
+            .slice(0, 10)
+            .map((c) => ({
+              custodianId: c.custodianId,
+              custodianName: c.custodianName,
+              rate: c.rate,
+              onTime: c.onTime,
+              late: c.late,
+              total: c.total,
+            })),
+          rows: reportData.rows.map((row) => ({
+            bookingId: row.bookingId,
+            bookingName: row.bookingName,
+            status: row.status,
+            custodian: row.custodian,
+            assetCount: row.assetCount,
+            scheduledStart: dateFormat.format(new Date(row.scheduledStart)),
+            scheduledEnd: dateFormat.format(new Date(row.scheduledEnd)),
+            isOnTime: row.isOnTime,
+            returnStatus: formatReturnStatus(row.isOnTime, row.latenessMs),
+          })),
+        } satisfies CompliancePdfMeta;
+        break;
+      }
+
+      case "asset-inventory": {
+        const reportData = await assetInventoryReport({
+          organizationId,
+          currency: organization.currency,
+          assetFilter: reportFilters.assetFilter,
+          page: 1,
+          pageSize: 10000,
+        });
+
+        // Calculate status breakdown
+        const statusBreakdown = {
+          available: 0,
+          inCustody: 0,
+          checkedOut: 0,
+        };
+        for (const row of reportData.rows) {
+          if (row.status === "AVAILABLE") statusBreakdown.available++;
+          else if (row.status === "IN_CUSTODY") statusBreakdown.inCustody++;
+          else if (row.status === "CHECKED_OUT") statusBreakdown.checkedOut++;
+        }
+        // Per-unit valuation × workspace stock, matching the on-screen KPI.
+        const totalValuation = sumQuantityAwareValue(reportData.rows);
+
+        pdfMeta = {
+          ...monetaryMeta,
+          reportId: "asset-inventory",
+          reportTitle: reportDef.title,
+          reportDescription: reportDef.description,
+          organizationName: organization.name,
+          organizationImageId: organization.imageId,
+          organizationUpdatedAt: organization.updatedAt,
+          generatedAt: dateFormat.format(new Date()),
+          totalCount: reportData.totalRows,
+          totalValuation,
+          statusBreakdown,
+          rows: reportData.rows.map((row) => ({
+            assetId: row.assetId,
+            assetName: row.assetName,
+            status: row.status,
+            category: row.category,
+            location: row.location,
+            custodian: row.custodian,
+            valuation: row.valuation,
+            quantity: row.quantity,
+            qrId: row.qrId,
+          })),
+        } satisfies AssetInventoryPdfMeta;
+        break;
+      }
+
+      case "custody-snapshot": {
+        const reportData = await custodySnapshotReport({
+          organizationId,
+          currency: organization.currency,
+          teamMemberId: reportFilters.teamMemberId ?? undefined,
+          assetFilter: reportFilters.assetFilter,
+          page: 1,
+          pageSize: 10000,
+        });
+
+        // Calculate totals
+        const uniqueCustodians = new Set(
+          reportData.rows.map((r) => r.custodianName)
+        );
+        // Per-unit valuation × units held (`Custody.quantity`), matching
+        // the on-screen KPI.
+        const totalValuation = sumQuantityAwareValue(reportData.rows);
+
+        pdfMeta = {
+          ...monetaryMeta,
+          reportId: "custody-snapshot",
+          reportTitle: reportDef.title,
+          reportDescription: reportDef.description,
+          organizationName: organization.name,
+          organizationImageId: organization.imageId,
+          organizationUpdatedAt: organization.updatedAt,
+          generatedAt: dateFormat.format(new Date()),
+          totalCount: reportData.totalRows,
+          totalAssetsInCustody: reportData.totalRows,
+          totalCustodians: uniqueCustodians.size,
+          totalValuation,
+          rows: reportData.rows.map((row) => ({
+            assetId: row.assetId,
+            assetName: row.assetName,
+            category: row.category,
+            location: row.location,
+            custodianName: row.custodianName,
+            assignedAt: dateFormat.format(new Date(row.assignedAt)),
+            daysInCustody: row.daysInCustody,
+            valuation: row.valuation,
+            quantity: row.quantity,
+          })),
+        } satisfies CustodySnapshotPdfMeta;
+        break;
+      }
+
+      default:
+        throw new ShelfError({
+          cause: null,
+          message: `PDF export not implemented for report "${reportId}"`,
+          label: "Report",
+          status: 500,
+        });
+    }
+
+    captureServerEvent({
+      distinctId: userId,
+      event: "pdf_preview_opened",
+      properties: {
+        sheet: "report",
+        organizationId,
+        rowCount: pdfMeta.rows.length,
+        totalCount: pdfMeta.totalCount,
+        reportId,
+      },
+    });
+
+    return data(payload({ pdfMeta }));
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, reportId });
+    throw data(error(reason), { status: reason.status });
+  }
+};

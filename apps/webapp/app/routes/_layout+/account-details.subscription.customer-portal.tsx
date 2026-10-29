@@ -1,0 +1,651 @@
+import { useState } from "react";
+import type { CustomTierLimit, Prisma } from "@prisma/client";
+import type {
+  ActionFunctionArgs,
+  LoaderFunctionArgs,
+  MetaFunction,
+} from "react-router";
+import { data, redirect, Link, useLoaderData } from "react-router";
+import { z } from "zod";
+import { InfoIcon } from "~/components/icons/library";
+import { Dialog, DialogPortal } from "~/components/layout/dialog";
+import { CrispButton } from "~/components/marketing/crisp";
+import { Button } from "~/components/shared/button";
+
+import { DateS } from "~/components/shared/date";
+import { WarningBox } from "~/components/shared/warning-box";
+import { resolveBillingSectionState } from "~/components/subscription/billing-section";
+import { CustomerPortalForm } from "~/components/subscription/customer-portal-form";
+import type { PaidInvoice } from "~/components/subscription/invoice-history";
+import { InvoiceHistory } from "~/components/subscription/invoice-history";
+import { OwnPlanOptions } from "~/components/subscription/own-plan-options";
+import { PricingTable } from "~/components/subscription/pricing-table";
+import { SubscriptionsOverview } from "~/components/subscription/subscriptions-overview";
+import SuccessfulSubscriptionModal from "~/components/subscription/successful-subscription-modal";
+import { WorkspacePlansTable } from "~/components/subscription/workspace-plans-table";
+import { db } from "~/database/db.server";
+import { useUserData } from "~/hooks/use-user-data";
+import {
+  assertPriceIsForAddon,
+  assertPriceMatchesTier,
+} from "~/modules/billing/price-validation.server";
+import { PURCHASES_UNAVAILABLE_MESSAGE } from "~/modules/billing/purchase-copy";
+import {
+  assertUserMayPurchase,
+  pricesOfferedTo,
+  ssoUserMayPurchase,
+} from "~/modules/billing/sso-purchase-gate.server";
+import { getWorkspacePlansForUser } from "~/modules/billing/workspace-plans.server";
+import { getSelectedOrganization } from "~/modules/organization/context.server";
+import { getUserTierLimit } from "~/modules/tier/service.server";
+
+import { getUserByID } from "~/modules/user/service.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { ENABLE_PREMIUM_FEATURES } from "~/utils/env";
+import { ShelfError, makeShelfError } from "~/utils/error";
+import { payload, error, parseData } from "~/utils/http.server";
+import type { CustomerWithSubscriptions } from "~/utils/stripe.server";
+import {
+  getDomainUrl,
+  getStripePricesAndProducts,
+  createStripeCheckoutSession,
+  createTeamTrialSubscription,
+  generateReturnUrl,
+  getCustomerOpenInvoices,
+  getCustomerPaidInvoices,
+  getCustomerUpcomingInvoices,
+  getCustomerSubscriptionsWithProducts,
+  getStripeCustomer,
+  getOrCreateCustomerId,
+} from "~/utils/stripe.server";
+import { findPaidWorkspaceThroughOthers } from "~/utils/workspace-plans";
+
+export async function loader({ context, request }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    if (!ENABLE_PREMIUM_FEATURES) {
+      return redirect("/account-details/general");
+    }
+    /**
+     * NOTE: all users should be able to access the subscription route no matter which role they have
+     * as its their own account settings.
+     */
+    const { organizationId } = await getSelectedOrganization({
+      userId,
+      request,
+    });
+
+    const [user, tierLimit, workspacePlans] = await Promise.all([
+      getUserByID(userId, {
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          displayName: true,
+          customerId: true,
+          tierId: true,
+          usedFreeTrial: true,
+          sso: true,
+        } satisfies Prisma.UserSelect,
+      }),
+      getUserTierLimit(userId),
+      getWorkspacePlansForUser({
+        userId,
+        currentOrganizationId: organizationId,
+      }),
+    ]);
+
+    /** A paid workspace the user works in that someone else pays for. */
+    const workspaceAccessedThroughOthers =
+      findPaidWorkspaceThroughOthers(workspacePlans);
+
+    /**
+     * Whether this user may start a Team purchase from this page. SSO users
+     * may only buy for a TEAM workspace they own.
+     */
+    const canPurchase = ssoUserMayPurchase({
+      sso: user.sso,
+      ownsTeamWorkspace: workspacePlans.some(
+        (row) => row.type === "TEAM" && row.paidBy.isYou
+      ),
+      target: "team",
+    });
+
+    /** Get the Stripe customer */
+    const customer = (await getStripeCustomer(
+      await getOrCreateCustomerId(user)
+    )) as CustomerWithSubscriptions;
+
+    /* Get the prices, products, subscriptions, and invoices from Stripe */
+    const [
+      allPrices,
+      openInvoices,
+      paidInvoicesData,
+      upcomingInvoicesData,
+      subscriptionsWithProducts,
+    ] = await Promise.all([
+      getStripePricesAndProducts(),
+      getCustomerOpenInvoices(customer.id),
+      getCustomerPaidInvoices(customer.id),
+      getCustomerUpcomingInvoices(customer),
+      getCustomerSubscriptionsWithProducts(customer.id),
+    ]);
+
+    /** Plans this user could actually buy: SSO users are never offered Plus. */
+    const prices = pricesOfferedTo({ prices: allPrices, sso: user.sso });
+
+    // Transform paid invoices to simplified type for UI
+    const paidInvoices: PaidInvoice[] = paidInvoicesData.map((inv) => ({
+      id: inv.id,
+      number: inv.number,
+      amountPaid: inv.amount_paid,
+      currency: inv.currency,
+      paidAt: inv.status_transitions?.paid_at ?? null,
+      hostedInvoiceUrl: inv.hosted_invoice_url ?? null,
+    }));
+
+    // Transform upcoming invoices to simplified type for UI
+    // Get subscription name from the customer's subscriptions data
+    const upcomingInvoices = upcomingInvoicesData.map((inv) => {
+      // In Stripe API 2026-01-28, subscription moved to parent.subscription_details
+      const subscriptionId =
+        (inv.parent?.subscription_details?.subscription as string) ?? "";
+
+      // Find the subscription in customer data to get its name
+      const subscription = customer.subscriptions?.data.find(
+        (sub) => sub.id === subscriptionId
+      );
+
+      // Get the product name from the first line item description or subscription item
+      let subscriptionName = "Subscription";
+      if (inv.lines?.data?.[0]?.description) {
+        subscriptionName = inv.lines.data[0].description;
+      } else if (subscription?.items?.data?.[0]?.price?.nickname) {
+        subscriptionName = subscription.items.data[0].price.nickname;
+      }
+
+      return {
+        subscriptionId,
+        subscriptionName,
+        amountDue: inv.amount_due,
+        currency: inv.currency,
+        periodEnd: inv.period_end,
+      };
+    });
+
+    return payload({
+      title: `Subscriptions`,
+      subTitle: "The plans and add-ons you pay for.",
+      tier: user.tierId,
+      tierLimit,
+      workspacePlans,
+      workspaceAccessedThroughOthersName:
+        workspaceAccessedThroughOthers?.name ?? null,
+      // SSO users have no personal workspace to upgrade.
+      hasPersonalWorkspace: workspacePlans.some(
+        (row) => row.type === "PERSONAL"
+      ),
+      canPurchase,
+      prices,
+      customer,
+      subscriptionsWithProducts,
+      usedFreeTrial: user.usedFreeTrial,
+      openInvoices: openInvoices.map((inv) => {
+        // Get subscription name from line items description
+        let subscriptionName = "Subscription";
+        if (inv.lines?.data?.[0]?.description) {
+          subscriptionName = inv.lines.data[0].description;
+        }
+
+        return {
+          number: inv.number,
+          subscriptionName,
+          amountDue: inv.amount_due,
+          currency: inv.currency,
+          // Use due_date if available, otherwise fall back to period_end
+          dueDate: inv.due_date ?? inv.period_end,
+          hostedInvoiceUrl: inv.hosted_invoice_url,
+        };
+      }),
+      paidInvoices,
+      upcomingInvoices,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export async function action({ context, request }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId, email } = authSession;
+
+  try {
+    const { priceId, intent, shelfTier, auditPriceId, barcodePriceId } =
+      parseData(
+        await request.formData(),
+        z.object({
+          priceId: z.string(),
+          intent: z.enum(["trial", "subscribe"]),
+          shelfTier: z.enum(["tier_1", "tier_2"]),
+          auditPriceId: z.string().optional(),
+          barcodePriceId: z.string().optional(),
+        })
+      );
+
+    // Refuse before any price lookup, checkout or trial: the tier decides
+    // which workspace the purchase bills.
+    await assertUserMayPurchase({
+      userId,
+      target: shelfTier === "tier_1" ? "personal" : "team",
+    });
+
+    // `shelfTier` and every price id here come from the form. The tier is
+    // written straight to `user.tierId` below and the add-on ids become raw
+    // Stripe line items, so without resolving each price server-side a caller
+    // could pair tier_2 with any cheaper active price -- and if that price is
+    // an add-on price, `isAddonSubscription` makes the webhook early-return and
+    // the tier is never corrected. See ~/modules/billing/price-validation.server.
+    await assertPriceMatchesTier({ priceId, shelfTier });
+    if (auditPriceId) {
+      await assertPriceIsForAddon({
+        priceId: auditPriceId,
+        addonType: "audits",
+      });
+    }
+    if (barcodePriceId) {
+      await assertPriceIsForAddon({
+        priceId: barcodePriceId,
+        addonType: "barcodes",
+      });
+    }
+
+    const user = await getUserByID(userId, {
+      select: {
+        customerId: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+        usedFreeTrial: true,
+      } satisfies Prisma.UserSelect,
+    });
+
+    const customerId = await getOrCreateCustomerId({
+      id: userId,
+      email,
+      ...user,
+    });
+    const domainUrl = getDomainUrl(request);
+
+    if (intent === "trial") {
+      // Prevent duplicate trials — UI hides the button but this
+      // guards against double-submits and direct POST requests
+      if (user.usedFreeTrial) {
+        throw new ShelfError({
+          cause: null,
+          message: "You have already used your free trial.",
+          label: "Subscription",
+          shouldBeCaptured: false,
+          status: 400,
+        });
+      }
+
+      // why: These three awaits MUST run sequentially. The user's tier/trial
+      // flag must only be updated after the Stripe subscription is created
+      // successfully, and the return URL should only be generated once both
+      // upstream steps succeed. Running them in parallel would risk marking
+      // the trial as used even if Stripe creation fails.
+      // Create subscription directly via Stripe API — no checkout needed
+      await createTeamTrialSubscription({
+        customerId,
+        priceId,
+        userId,
+        auditPriceId,
+        barcodePriceId,
+      });
+
+      // Update user tier and mark trial as used
+      await db.user.update({
+        where: { id: userId },
+        data: { tierId: shelfTier, usedFreeTrial: true },
+        select: { id: true },
+      });
+
+      const returnUrl = await generateReturnUrl({
+        userId,
+        shelfTier,
+        intent,
+        domainUrl,
+        hasAuditAddon: !!auditPriceId,
+        hasBarcodeAddon: !!barcodePriceId,
+      });
+
+      return redirect(returnUrl);
+    }
+
+    // intent === "subscribe" — go through Stripe Checkout as before
+    const stripeRedirectUrl = await createStripeCheckoutSession({
+      userId,
+      priceId,
+      domainUrl,
+      customerId,
+      intent,
+      shelfTier,
+      auditPriceId,
+      barcodePriceId,
+    });
+
+    return redirect(stripeRedirectUrl);
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: data ? appendToMetaTitle(data.title) : "" },
+];
+
+export const handle = {
+  breadcrumb: () => (
+    <Link to="/account-details/subscription">Subscription</Link>
+  ),
+};
+
+export default function SubscriptionPage() {
+  const {
+    subTitle,
+    prices,
+    tier,
+    tierLimit,
+    customer,
+    subscriptionsWithProducts,
+    openInvoices,
+    paidInvoices,
+    upcomingInvoices,
+    workspacePlans,
+    workspaceAccessedThroughOthersName,
+    hasPersonalWorkspace,
+    canPurchase,
+  } = useLoaderData<typeof loader>();
+  const user = useUserData();
+  const hasUnpaidInvoice = user?.hasUnpaidInvoice ?? false;
+
+  const isCustomTier = tier === "custom" && !!tierLimit;
+  const isEnterprise =
+    isCustomTier && (tierLimit as unknown as CustomTierLimit)?.isEnterprise;
+
+  const hasNoSubscription = customer?.subscriptions.data.length === 0;
+  const [pricingOpen, setPricingOpen] = useState(false);
+
+  /** Check if user has a workspace plan (not just addon subscriptions) */
+  const hasWorkspacePlan = subscriptionsWithProducts.some((sub) =>
+    sub.items.data.some((item) => {
+      const product = item.price?.product;
+      if (product && typeof product === "object" && "metadata" in product) {
+        const tier = product.metadata?.shelf_tier;
+        return tier === "tier_1" || tier === "tier_2";
+      }
+      return false;
+    })
+  );
+
+  const billingSectionState = resolveBillingSectionState({
+    hasSubscription: !hasNoSubscription,
+    hasWorkspacePlan,
+    hasPaidAccessThroughOthers: !!workspaceAccessedThroughOthersName,
+    canPurchase,
+  });
+
+  /**
+   * Custom tier without a Stripe subscription: a handful of clients are set up
+   * this way by hand, so there is nothing to bill or manage here.
+   */
+  if (isCustomTier && hasNoSubscription) {
+    return (
+      <div className="flex flex-col gap-8">
+        <WorkspacePlansTable rows={workspacePlans} />
+        <div className="mb-2 flex items-center gap-3 rounded border border-gray-300 p-4">
+          <div className="inline-flex items-center justify-center rounded-full border-[5px] border-solid border-primary-50 bg-primary-100 p-1.5 text-primary">
+            <InfoIcon />
+          </div>
+          <p className="text-[14px] font-medium text-gray-700">
+            You’re currently using the{" "}
+            {isEnterprise ? (
+              <>
+                <span className="font-semibold">ENTERPRISE</span> version
+              </>
+            ) : (
+              <>
+                <span className="font-semibold">CUSTOM</span> plan
+              </>
+            )}{" "}
+            of Shelf.
+            <br />
+            {isEnterprise && <>That means you have a custom plan. </>}
+            To get more information about your plan, please{" "}
+            <CrispButton variant="link" className="inline w-auto">
+              contact support
+            </CrispButton>
+            .
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className=" flex flex-col">
+        {hasUnpaidInvoice ? (
+          <UnpaidInvoiceWarning invoices={openInvoices} />
+        ) : null}
+
+        <div className="mb-8 mt-3">
+          <WorkspacePlansTable
+            rows={workspacePlans}
+            onUpgradePersonal={
+              canPurchase ? () => setPricingOpen(true) : undefined
+            }
+          />
+        </div>
+
+        {/* Everything below is the user's own billing, not the workspace's */}
+        <div className="mb-8 justify-between border-b pb-5 lg:flex">
+          <div className="mb-8 lg:mb-0">
+            <h3 className="text-text-lg font-semibold">Billed to you</h3>
+            <p className="text-sm text-gray-600">{subTitle}</p>
+          </div>
+          {!hasNoSubscription && (
+            <CustomerPortalForm buttonText="Manage subscriptions" />
+          )}
+        </div>
+
+        {billingSectionState === "own-plan-options" &&
+        workspaceAccessedThroughOthersName ? (
+          <div className="mb-8">
+            <OwnPlanOptions
+              prices={prices}
+              currentWorkspaceName={workspaceAccessedThroughOthersName}
+              showPersonalUpgrade={hasPersonalWorkspace}
+              onComparePlans={() => setPricingOpen(true)}
+            />
+          </div>
+        ) : null}
+
+        {billingSectionState === "choose-plan" ? (
+          <div className="mb-8">
+            <div className="mb-4 flex items-center gap-3 rounded border border-gray-300 p-4">
+              <div className="inline-flex items-center justify-center rounded-full border-[5px] border-solid border-primary-50 bg-primary-100 p-1.5 text-primary">
+                <InfoIcon />
+              </div>
+              <p className="text-[14px] font-medium text-gray-700">
+                You don't pay for any subscriptions yet.
+              </p>
+            </div>
+            <h3 className="text-text-lg font-semibold">Choose a plan</h3>
+            <PricingTable prices={prices} />
+          </div>
+        ) : null}
+
+        {billingSectionState === "purchases-unavailable" ? (
+          <div className="mb-8 flex items-center gap-3 rounded border border-gray-300 p-4">
+            <div className="inline-flex items-center justify-center rounded-full border-[5px] border-solid border-primary-50 bg-primary-100 p-1.5 text-primary">
+              <InfoIcon />
+            </div>
+            <div>
+              <p className="text-[14px] font-medium text-gray-700">
+                Purchases are unavailable
+              </p>
+              <p className="text-[13px] text-gray-600">
+                {PURCHASES_UNAVAILABLE_MESSAGE}
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        {billingSectionState === "no-workspace-plan" ? (
+          <div className="mb-8 flex items-center justify-between gap-3 rounded border border-gray-300 p-4">
+            <div className="flex items-center gap-3">
+              <div className="inline-flex items-center justify-center rounded-full border-[5px] border-solid border-primary-50 bg-primary-100 p-1.5 text-primary">
+                <InfoIcon />
+              </div>
+              <div>
+                <p className="text-[14px] font-medium text-gray-700">
+                  You have no workspace plan
+                </p>
+                <p className="text-[13px] text-gray-500">
+                  Upgrade to a workspace plan to unlock the full potential of
+                  Shelf alongside your add-ons.
+                </p>
+              </div>
+            </div>
+            <Button
+              type="button"
+              variant="secondary"
+              className="whitespace-nowrap"
+              onClick={() => setPricingOpen(true)}
+            >
+              View workspace plans
+            </Button>
+          </div>
+        ) : null}
+
+        {!hasNoSubscription && (
+          <>
+            <SubscriptionsOverview
+              customer={customer}
+              subscriptions={subscriptionsWithProducts}
+              prices={prices}
+            />
+            <InvoiceHistory
+              paidInvoices={paidInvoices}
+              upcomingInvoices={upcomingInvoices}
+            />
+          </>
+        )}
+      </div>
+      <DialogPortal>
+        <Dialog
+          open={pricingOpen}
+          onClose={() => setPricingOpen(false)}
+          className="h-[90vh] w-[90vw]"
+          title={<h3 className="text-text-lg font-semibold">Choose a plan</h3>}
+        >
+          <div className="p-6">
+            <PricingTable prices={prices} />
+          </div>
+        </Dialog>
+      </DialogPortal>
+      <SuccessfulSubscriptionModal />
+    </>
+  );
+}
+
+type OpenInvoice = {
+  number: string | null;
+  subscriptionName: string;
+  amountDue: number;
+  currency: string;
+  dueDate: number | null;
+  hostedInvoiceUrl?: string | null;
+};
+
+function UnpaidInvoiceWarning({ invoices }: { invoices: OpenInvoice[] }) {
+  return (
+    <WarningBox className="mb-8 mt-3">
+      <div>
+        <h4 className="font-semibold">Unpaid invoice/s</h4>
+        <p className="mt-1 text-gray-800">
+          We were unable to process your latest payment. If payment is not
+          resolved, your subscription will be fully canceled. Any existing
+          pricing, discounts, or legacy plans tied to your subscription cannot
+          be recovered after cancellation — you would need to purchase a new
+          subscription at current rates.
+        </p>
+
+        {invoices.length > 0 ? (
+          <ul className="mt-4 space-y-3">
+            {invoices.map((inv) => (
+              <li
+                key={inv.number}
+                className="rounded border border-warning-200 bg-warning-50 p-3"
+              >
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0 flex-1">
+                    <p className="font-medium text-gray-900">
+                      {inv.subscriptionName}
+                    </p>
+                    <p className="mt-1 text-sm text-gray-500">
+                      Invoice {inv.number}
+                      {inv.dueDate ? (
+                        <>
+                          {" · "}Due{" "}
+                          <DateS date={new Date(inv.dueDate * 1000)} />
+                        </>
+                      ) : null}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm font-semibold text-gray-900">
+                      {new Intl.NumberFormat("en-US", {
+                        style: "currency",
+                        currency: inv.currency,
+                      }).format(inv.amountDue / 100)}
+                    </span>
+                    {inv.hostedInvoiceUrl ? (
+                      <Button
+                        href={inv.hostedInvoiceUrl}
+                        as="a"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        variant="link-gray"
+                      >
+                        View invoice
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+
+        <div className="mt-2 text-gray-800">
+          Please update your payment method through the{" "}
+          <CustomerPortalForm
+            buttonText="customer portal"
+            className="inline"
+            buttonProps={{
+              variant: "link",
+            }}
+          />
+          .
+        </div>
+      </div>
+    </WarningBox>
+  );
+}

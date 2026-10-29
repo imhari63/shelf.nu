@@ -1,0 +1,8608 @@
+import type {
+  Asset,
+  AssetIndexSettings,
+  Barcode,
+  Booking,
+  Kit,
+  Organization,
+  Prisma,
+  Qr,
+  TeamMember,
+  User,
+  UserOrganization,
+} from "@prisma/client";
+import {
+  AssetStatus,
+  AssetType,
+  BookingStatus,
+  ErrorCorrection,
+  KitStatus,
+  NoteType,
+} from "@prisma/client";
+import type { ITXClientDenyList } from "@prisma/client/runtime/library";
+import type { LoaderFunctionArgs } from "react-router";
+import { extractStoragePath } from "~/components/assets/asset-image/utils";
+import type { ExtendedPrismaClient } from "~/database/db.server";
+import { db } from "~/database/db.server";
+import { LONG_TRANSACTION_OPTIONS } from "~/database/transaction-options.server";
+import { getSupabaseAdmin } from "~/integrations/supabase/client";
+import { lockAssetsForArchiveGuard } from "~/modules/asset/archive-lock.server";
+import { getPeakReservedUnitsByAsset } from "~/modules/asset/availability-primitives.server";
+import {
+  updateBarcodes,
+  validateBarcodeUniqueness,
+} from "~/modules/barcode/service.server";
+import { normalizeBarcodeValue } from "~/modules/barcode/validation";
+import { findKitsHeldByOtherBookings } from "~/modules/booking/kit-conflicts.server";
+import {
+  assertKitsCustodyAssignable,
+  assertKitsHaveActiveAssets,
+} from "~/modules/booking/kit-holds.server";
+import { resolveSliceKitIds } from "~/modules/booking/slice-kit-attribution";
+import { lockAssetsForKitMembership } from "~/modules/custody/service.server";
+import { assetQtyMeta, formatUnitCount } from "~/utils/asset-quantity";
+import { getClientHint } from "~/utils/client-hints";
+import { ASSET_MAX_IMAGE_UPLOAD_SIZE } from "~/utils/constants";
+import { updateCookieWithPerPage } from "~/utils/cookies.server";
+import { resolveUserFormatPrefsById } from "~/utils/date-format.server";
+import { dateTimeInUnix } from "~/utils/date-time-in-unix";
+import {
+  assertBulkDeleteConfirmed,
+  assertDeleteConfirmedFor,
+} from "~/utils/delete-confirmation.server";
+import type { ErrorLabel } from "~/utils/error";
+import {
+  isLikeShelfError,
+  isNotFoundError,
+  maybeUniqueConstraintViolation,
+  rethrowIfClientError,
+  ShelfError,
+  throwIfAssetQuantityOverAllocation,
+  VALIDATION_ERROR,
+} from "~/utils/error";
+import { getRedirectUrlFromRequest } from "~/utils/http";
+import { getCurrentSearchParams } from "~/utils/http.server";
+import { id } from "~/utils/id/id.server";
+import { ALL_SELECTED_KEY, getParamsValues } from "~/utils/list";
+import { Logger } from "~/utils/logger";
+import { stripMarkdocDelimiters } from "~/utils/markdoc-sanitize";
+import {
+  wrapCustodianForNote,
+  wrapKitsWithDataForNote,
+  wrapLinkForNote,
+  wrapUserLinkForNote,
+} from "~/utils/markdoc-wrappers";
+import { oneDayFromNow, threeDaysFromNow } from "~/utils/one-week-from-now";
+import {
+  assertAssetsAreNotArchived,
+  assertAssetsBelongToOrg,
+  assertCategoryBelongsToOrg,
+  assertLocationBelongsToOrg,
+  assertTeamMemberBelongsToOrg,
+} from "~/utils/org-validation.server";
+import type { RoleAccess } from "~/utils/permissions/role-access";
+import { createSignedUrl, parseFileFormData } from "~/utils/storage.server";
+import type { UserNameFields } from "~/utils/user";
+import { resolveUserDisplayName } from "~/utils/user";
+import type { MergeInclude } from "~/utils/utils";
+import { computeKitClaimablePool } from "./picker-meta.server";
+import type { UpdateKitPayload } from "./types";
+import {
+  GET_KIT_STATIC_INCLUDES,
+  KIT_SELECT_FIELDS_FOR_LIST_ITEMS,
+  KITS_INCLUDE_FIELDS,
+} from "./types";
+import {
+  getKitAnAssetLeaves,
+  getKitsWhereInput,
+  isOwnKitImagePath,
+} from "./utils.server";
+import { recordEvent, recordEvents } from "../activity-event/service.server";
+import type { ActivityEventInput } from "../activity-event/types";
+import { resolveAssetIdsForBulkOperation } from "../asset/bulk-operations-helper.server";
+import {
+  releaseAssetsToAvailableUnlessCheckedOut,
+  setCustodyDrivenAssetStatus,
+} from "../asset/custody-status.server";
+import type { LastAuditDateAccess } from "../asset/last-audit-date-access";
+import type { BookableListScope } from "../asset/list-scope.server";
+import { getAssetListWhereForSelectAll } from "../asset/list-where.server";
+import type {
+  MoveAssetKitUnitsArgs,
+  MoveUnitsResult,
+} from "../asset/move-units.types";
+import type { CreateAssetFromContentImportPayload } from "../asset/types";
+import { getPrimaryLocation } from "../asset/utils";
+import {
+  applyArchivedFilter,
+  getKitLocationUpdateNoteContent,
+} from "../asset/utils.server";
+import type {
+  AllowedCustodianFilterIds,
+  ArchivedFilter,
+} from "../asset/utils.server";
+import { recordCheckoutSourceLocations } from "../booking/checkout-source-location.server";
+import { PLANNING_BOOKING_STATUSES } from "../booking/constants";
+import { lockBookingForStatusCheck } from "../booking/utils.server";
+import {
+  createSystemBookingNote,
+  createSystemBookingNotes,
+} from "../booking-note/service.server";
+import { lockAssetForQuantityUpdate } from "../consumption-log/quantity-lock.server";
+import { getPrimaryCustody, hasCustody } from "../custody/utils";
+import { createSystemLocationNote } from "../location-note/service.server";
+import {
+  createBulkKitChangeNotes,
+  createKitMoveNote,
+  createNote,
+} from "../note/service.server";
+import { getQr } from "../qr/service.server";
+import { scopeCustodianFilterIds } from "../team-member/service.server";
+import { USER_NAME_SELECT } from "../user/fields";
+import { getUserByID } from "../user/service.server";
+
+const label: ErrorLabel = "Kit";
+
+/**
+ * Transaction client accepted by the kit-location cascade / placement helpers.
+ *
+ * The extended client's `$transaction` callback param isn't directly
+ * assignable to the generated `Prisma.TransactionClient`, so omit the
+ * tx-denied members instead of widening to `any` — same approach as
+ * `~/modules/asset-index-settings/service.server`.
+ */
+type KitLocationTxClient = Omit<ExtendedPrismaClient, ITXClientDenyList>;
+
+/**
+ * Build per-asset Custody rows that inherit a KitCustody assignment.
+ *
+ * When a kit is in custody, every asset in the kit gets a child Custody row
+ * tagged with `kitCustodyId` so the row's origin is traceable. The rule for
+ * `quantity`:
+ * - INDIVIDUAL assets always inherit `quantity: 1`.
+ * - QUANTITY_TRACKED assets inherit only the **remaining** pool — the asset's
+ *   total `quantity` minus any already-allocated Custody rows (operator
+ *   custody and pre-existing kit-allocated custody are both subtracted; the
+ *   helper does not distinguish — what matters is "how many units are not
+ *   already spoken for"). When remaining <= 0 the asset is silently skipped
+ *   (no child row created), so the kit-custody flow degrades gracefully when
+ *   an asset is fully allocated to operators.
+ *
+ * Tagging the child rows with `kitCustodyId` is what allows us to delete only
+ * kit-allocated custody (filter by `kitCustodyId`) without disturbing
+ * operator-assigned per-unit custody on the same asset, and lets the FK
+ * cascade clean them up automatically when the parent KitCustody is deleted.
+ *
+ * @param args.tx - Transactional Prisma client (so the existing-custody read
+ *   sees rows written earlier in the same tx).
+ * @param args.kitCustodyId - The parent KitCustody row this inheritance points back to.
+ * @param args.teamMemberId - The custodian team member, copied to every child row.
+ * @param args.assetIds - Assets in the kit that should receive inherited custody.
+ * @returns A flat array suitable for `tx.custody.createMany({ data })`. Empty
+ *   when every asset is fully operator-allocated.
+ */
+/**
+ * Structural type for the only Prisma surface we need from the tx. Typed this
+ * way (rather than `Prisma.TransactionClient`) because the project uses an
+ * extended Prisma client, and the extended tx is not directly assignable to
+ * the generated `Prisma.TransactionClient`. Mirrors the `RecordEventTxClient`
+ * pattern used in `activity-event/service.server.ts`.
+ */
+type KitCustodyInheritTxClient = {
+  asset: {
+    findMany: (args: {
+      where: { id: { in: string[] }; archivedAt: null };
+      select: {
+        id: true;
+        type: true;
+        quantity: true;
+        custody: { select: { quantity: true } };
+        assetKits: {
+          where: { kitId: string };
+          select: { quantity: true };
+        };
+      };
+    }) => Promise<
+      Array<{
+        id: string;
+        type: AssetType;
+        quantity: number | null;
+        custody: Array<{ quantity: number }>;
+        assetKits: Array<{ quantity: number }>;
+      }>
+    >;
+  };
+};
+
+/**
+ * Pre-fetches the kit-driven `BookingAsset` rows that will
+ * be converted to standalone (via the DB-level `SET NULL` cascade) when
+ * the given `AssetKit` rows are deleted. Call this BEFORE the
+ * `tx.assetKit.deleteMany(...)` inside the same transaction; pair the
+ * returned array with {@link emitAssetKitDetachmentNotes} after the
+ * delete completes to log a per-booking system note.
+ *
+ * @see {@link releaseAssetsToAvailableUnlessCheckedOut} for the shared
+ *   custody-release status flip these kit flows all funnel through.
+ *
+ * Scope filter: only DRAFT / RESERVED / ONGOING / OVERDUE bookings get
+ * notes — already-completed / cancelled / archived bookings are
+ * historical and don't need notification of the cascade.
+ *
+ * @param tx Prisma transaction client (extended `any` per project pattern)
+ * @param assetKitIds AssetKit rows about to be deleted in the same tx
+ * @returns Array of `{ bookingAssetId, bookingId, bookingName, assetTitle, kitName }`
+ *   capturing the affected pre-delete state so the post-delete note can
+ *   reference the kit by name (which would otherwise be unrecoverable).
+ */
+export async function fetchAssetKitDetachmentImpact(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tx: any,
+  assetKitIds: string[]
+): Promise<
+  Array<{
+    bookingAssetId: string;
+    bookingId: string;
+    bookingName: string;
+    assetId: string;
+    assetTitle: string;
+    kitId: string;
+    kitName: string;
+  }>
+> {
+  if (assetKitIds.length === 0) return [];
+  // `BookingAsset.assetKitId` is a plain FK column with no back-relation
+  // (see schema.prisma:1603 — relation deliberately omitted), so we
+  // can't `select: { assetKit: {...} }` here. Two queries + in-memory
+  // join instead.
+  const [rows, assetKitRows] = await Promise.all([
+    tx.bookingAsset.findMany({
+      where: {
+        assetKitId: { in: assetKitIds },
+        booking: {
+          status: { in: ["DRAFT", "RESERVED", "ONGOING", "OVERDUE"] },
+        },
+      },
+      select: {
+        id: true,
+        bookingId: true,
+        assetKitId: true,
+        booking: { select: { name: true } },
+        asset: { select: { id: true, title: true } },
+      },
+    }),
+    tx.assetKit.findMany({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: `assetKitIds` derive from the org-scoped kit/assetKits fetch in this flow
+      where: { id: { in: assetKitIds } },
+      select: { id: true, kitId: true, kit: { select: { name: true } } },
+    }),
+  ]);
+  const akById = new Map<
+    string,
+    { id: string; kitId: string; kit: { name: string } }
+  >(
+    assetKitRows.map(
+      (ak: { id: string; kitId: string; kit: { name: string } }) => [ak.id, ak]
+    )
+  );
+  return rows.map(
+    (r: {
+      id: string;
+      bookingId: string;
+      assetKitId: string;
+      booking: { name: string };
+      asset: { id: string; title: string };
+    }) => {
+      const ak = akById.get(r.assetKitId);
+      return {
+        bookingAssetId: r.id,
+        bookingId: r.bookingId,
+        bookingName: r.booking.name,
+        assetId: r.asset.id,
+        assetTitle: r.asset.title,
+        kitId: ak?.kitId ?? "",
+        kitName: ak?.kit?.name ?? "",
+      };
+    }
+  );
+}
+
+/**
+ * One `BookingAsset` row deleted by
+ * {@link removeKitSlicesFromPlanningBookings}, snapshotted pre-delete so
+ * callers can report exactly what disappeared.
+ */
+export type RemovedPlanningBookingSlice = {
+  bookingAssetId: string;
+  bookingId: string;
+  bookingName: string;
+  organizationId: string;
+  assetId: string;
+  assetTitle: string;
+  assetType: AssetType;
+  unitOfMeasure: string | null;
+  quantity: number;
+  kitId: string;
+  kitName: string;
+};
+
+/**
+ * Deletes the kit-driven `BookingAsset` rows that belong to bookings still in a
+ * planning status, for the `AssetKit` rows about to be deleted.
+ *
+ * Without this the DB-level `ON DELETE SET NULL` cascade demotes those rows to
+ * standalone slices, so a draft booking silently keeps an asset its kit no
+ * longer contains. For a booking where nothing has physically left the
+ * warehouse the booking should track the kit, so the row is removed outright.
+ *
+ * Deliberately scoped to {@link PLANNING_BOOKING_STATUSES}: an ONGOING/OVERDUE
+ * slice is physically checked out (deleting it would strand custody and
+ * checkout attribution) and a COMPLETE/ARCHIVED/CANCELLED slice is history.
+ * Those keep today's cascade and are rendered under their original kit via
+ * `BookingAsset.sourceKitId`.
+ *
+ * Only the KIT-DRIVEN row dies. A booking can hold the same asset both as a kit
+ * slice and as a deliberately hand-added standalone row (the two partial unique
+ * indexes allow exactly that), so the read keys on `assetKitId` — never on
+ * `assetId` — and the delete names the ids it read back.
+ *
+ * Safe to delete: only `ConsumptionLog.bookingAssetId` (a real FK, ON DELETE
+ * SET NULL, so history survives) and `PartialBookingCheckout.bookingAssetIds`
+ * (a text array, no FK) reference these rows. Both are written only by
+ * check-in/checkout paths, which move the booking to ONGOING/OVERDUE — neither
+ * can exist for a booking still in a planning status.
+ *
+ * Emits the audit trail for what it destroyed, inside the caller's transaction:
+ * one `BOOKING_ASSETS_REMOVED` event per affected `(booking, asset)` and one
+ * booking system note per `(booking, kit)` pair.
+ *
+ * The events aggregate PER ASSET, not per row, to stay symmetric with the rest
+ * of the codebase: `removeAssets` emits one event per asset with the summed
+ * quantity. A QUANTITY_TRACKED asset can hold a slice in several kits on one
+ * booking, so counting rows would report the same removal twice.
+ *
+ * Reservation rollback is the exception and counts PER ROW. A deleted row that
+ * carries `bookingModelRequestId` discharged exactly one unit of that
+ * `BookingModelRequest`, so its removal gives exactly one unit back — and the
+ * request re-opens, `fulfilledAt` cleared, once units are outstanding again. A
+ * row without the stamp discharged nothing and leaves every reservation alone,
+ * whatever model its asset belongs to.
+ *
+ * Call BEFORE {@link fetchAssetKitDetachmentImpact} and
+ * {@link mergeStandaloneCollisionsForKitDetachment}, so neither reports on nor
+ * merges a row that is about to disappear.
+ *
+ * Org-scoped in the queries themselves, not by caller discipline: this DELETES
+ * rows, so a stray `AssetKit` id from another org would destroy another
+ * tenant's booking data. `organizationId` is a required param so the compiler
+ * forces every call site to supply it, matching its read-only sibling
+ * {@link getBookingImpactForAssetKits} (see
+ * `.claude/rules/org-scope-user-supplied-ids.md`).
+ *
+ * @param tx Active transaction — must be the one deleting the `AssetKit` rows
+ * @param assetKitIds `AssetKit` rows about to be deleted
+ * @param options.actorUserId Acting user, for the event actor + note attribution
+ * @param options.organizationId Acting org — rows outside it are never touched
+ * @param options.reason What removed the membership — picks the note wording.
+ *   `"kit-deleted"` for the kit-deletion cascade (the asset never left the kit,
+ *   the kit ceased to exist); `"units-not-returned"` when a check-in on another
+ *   booking consumed, lost or damaged the kit's last units of the asset;
+ *   `"membership-removed"` otherwise.
+ * @returns One entry per deleted row, for callers that need to report further.
+ */
+export async function removeKitSlicesFromPlanningBookings(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tx: any,
+  assetKitIds: string[],
+  {
+    actorUserId,
+    organizationId,
+    reason = "membership-removed",
+  }: {
+    actorUserId: string;
+    organizationId: string;
+    reason?: "membership-removed" | "kit-deleted" | "units-not-returned";
+  }
+): Promise<RemovedPlanningBookingSlice[]> {
+  if (assetKitIds.length === 0) return [];
+
+  // `BookingAsset.assetKitId` is a plain FK column with no back-relation (see
+  // the schema comment), so the kit's name comes from a second query + an
+  // in-memory join — same shape as `fetchAssetKitDetachmentImpact`.
+  const [rows, assetKitRows] = await Promise.all([
+    tx.bookingAsset.findMany({
+      where: {
+        assetKitId: { in: assetKitIds },
+        // Both clauses on the booking: `organizationId` is the tenancy guard
+        // (`BookingAsset` has no org column of its own), `status` the scope.
+        booking: {
+          organizationId,
+          status: { in: PLANNING_BOOKING_STATUSES },
+        },
+      },
+      // Snapshot before the delete — quantity and titles are unrecoverable
+      // afterwards, and the notes/events below need both.
+      select: {
+        id: true,
+        bookingId: true,
+        assetId: true,
+        quantity: true,
+        assetKitId: true,
+        // The row's own record of which `BookingModelRequest` it discharged.
+        // Deleting a stamped row hands that unit back to the reservation.
+        bookingModelRequestId: true,
+        booking: {
+          select: { id: true, name: true, organizationId: true, status: true },
+        },
+        asset: {
+          select: {
+            id: true,
+            title: true,
+            type: true,
+            unitOfMeasure: true,
+          },
+        },
+      },
+    }),
+    tx.assetKit.findMany({
+      where: { id: { in: assetKitIds }, organizationId },
+      select: { id: true, kitId: true, kit: { select: { name: true } } },
+    }),
+  ]);
+  if (rows.length === 0) return [];
+
+  const akById = new Map<
+    string,
+    { id: string; kitId: string; kit: { name: string } }
+  >(
+    assetKitRows.map(
+      (ak: { id: string; kitId: string; kit: { name: string } }) => [ak.id, ak]
+    )
+  );
+
+  const removed: RemovedPlanningBookingSlice[] = rows.map(
+    (row: {
+      id: string;
+      bookingId: string;
+      assetId: string;
+      quantity: number;
+      assetKitId: string;
+      booking: { id: string; name: string; organizationId: string };
+      asset: {
+        id: string;
+        title: string;
+        type: AssetType;
+        unitOfMeasure: string | null;
+      };
+    }) => {
+      const ak = akById.get(row.assetKitId);
+      return {
+        bookingAssetId: row.id,
+        bookingId: row.bookingId,
+        bookingName: row.booking.name,
+        organizationId: row.booking.organizationId,
+        assetId: row.asset.id,
+        assetTitle: row.asset.title,
+        assetType: row.asset.type,
+        unitOfMeasure: row.asset.unitOfMeasure,
+        quantity: row.quantity,
+        kitId: ak?.kitId ?? "",
+        kitName: ak?.kit?.name ?? "",
+      };
+    }
+  );
+
+  // Keyed on the exact ids read above, so a standalone row for the same
+  // (booking, asset) pair is untouched.
+  await tx.bookingAsset.deleteMany({
+    where: { id: { in: removed.map((r) => r.bookingAssetId) } },
+  });
+
+  // Collapse to one entry per (booking, asset) for the removal events below. A
+  // QUANTITY_TRACKED asset can hold a slice in several kits on the same
+  // booking, and `removeAssets` emits one event per asset carrying the summed
+  // quantity — counting rows here would report the same removal twice.
+  //
+  // The reservation rollback further down deliberately does NOT come through
+  // here: it counts stamped ROWS, which is its own correct grain.
+  type PerAsset = {
+    bookingId: string;
+    organizationId: string;
+    assetId: string;
+    assetType: AssetType;
+    unitOfMeasure: string | null;
+    /** Sum of every deleted slice's booked units for this (booking, asset). */
+    quantity: number;
+    /** Distinct kits the deleted slices came from — one means we can name it. */
+    kitIds: Set<string>;
+  };
+  const perAsset = new Map<string, PerAsset>();
+  for (const row of rows as Array<{
+    bookingId: string;
+    quantity: number;
+    assetKitId: string;
+    booking: { organizationId: string };
+    asset: {
+      id: string;
+      type: AssetType;
+      unitOfMeasure: string | null;
+    };
+  }>) {
+    const key = `${row.bookingId}::${row.asset.id}`;
+    const kitId = akById.get(row.assetKitId)?.kitId;
+    const existing = perAsset.get(key);
+    if (existing) {
+      existing.quantity += row.quantity;
+      if (kitId) existing.kitIds.add(kitId);
+      continue;
+    }
+    perAsset.set(key, {
+      bookingId: row.bookingId,
+      organizationId: row.booking.organizationId,
+      assetId: row.asset.id,
+      assetType: row.asset.type,
+      unitOfMeasure: row.asset.unitOfMeasure,
+      quantity: row.quantity,
+      kitIds: new Set(kitId ? [kitId] : []),
+    });
+  }
+
+  /**
+   * Re-open the reservations the deleted rows had discharged.
+   *
+   * Counted from `bookingModelRequestId` — each row's own record of which
+   * promise it answered — NEVER from `assetModelId`. Grouping by model counts
+   * every removed asset that merely SHARES a model with a reservation,
+   * including ones that discharged nothing:
+   *
+   *   Reserve 2 x Dell and satisfy it with two Dells. A third Dell, added as an
+   *   ordinary kit member, is detached. The reservation must stay fulfilled —
+   *   both discharging rows are still on the booking.
+   *
+   * One unit per stamped ROW, which is why this does not go through `perAsset`
+   * above: a stamp lives on a single row, so per-row already is per-discharge,
+   * while the removal events stay per-asset for the multi-kit case.
+   *
+   * Keyed per request rather than per (booking, model) because one call can
+   * span bookings, and the request id names the booking by itself.
+   */
+  const removalsByRequest = new Map<
+    string,
+    { bookingId: string; count: number }
+  >();
+  for (const row of rows as Array<{
+    bookingId: string;
+    bookingModelRequestId: string | null;
+  }>) {
+    if (!row.bookingModelRequestId) continue;
+    const existing = removalsByRequest.get(row.bookingModelRequestId);
+    if (existing) {
+      existing.count += 1;
+      continue;
+    }
+    removalsByRequest.set(row.bookingModelRequestId, {
+      bookingId: row.bookingId,
+      count: 1,
+    });
+  }
+
+  /**
+   * `fulfilledAt` reversals to report, one per request re-opened below.
+   * Batched and flushed once after the loop so N affected requests cost one
+   * insert rather than N.
+   */
+  const modelRequestReopenEvents: ActivityEventInput[] = [];
+
+  for (const [requestId, { bookingId, count }] of removalsByRequest) {
+    const request = await tx.bookingModelRequest.findUnique({
+      where: { id: requestId },
+      // `fulfilledAt`, the model id and its name are the before-state the
+      // reversal event reports; without them there is nothing to record.
+      select: {
+        quantity: true,
+        fulfilledQuantity: true,
+        bookingId: true,
+        fulfilledAt: true,
+        assetModelId: true,
+        assetModel: { select: { name: true } },
+      },
+    });
+    // Belt and braces: the FK guarantees it, but never touch a request
+    // belonging to another booking.
+    if (!request || request.bookingId !== bookingId) continue;
+    if (request.fulfilledQuantity === 0) continue;
+
+    const nextFulfilled = Math.max(0, request.fulfilledQuantity - count);
+    // Dropping below the reserved `quantity` means there is outstanding work
+    // again — clear the completion stamp so the reservations section and its
+    // CTAs come back.
+    const reopened = nextFulfilled < request.quantity;
+
+    await tx.bookingModelRequest.update({
+      where: { id: requestId },
+      data: {
+        fulfilledQuantity: nextFulfilled,
+        ...(reopened ? { fulfilledAt: null } : {}),
+      },
+    });
+
+    /**
+     * Report the reversal, but only on a genuine set → unset flip. A request
+     * that was never complete already has a null `fulfilledAt`, so gating on
+     * `reopened` alone would emit spurious null → null events on every removal
+     * from an outstanding request.
+     *
+     * This mirrors the null → timestamp events emitted in
+     * `booking-model-request/service.server.ts`. Without it the stream records
+     * reservations closing and never re-opening, and `fulfilledAt IS NULL`
+     * consumers reconstruct this one as still fulfilled.
+     */
+    if (request.fulfilledAt != null && reopened) {
+      modelRequestReopenEvents.push({
+        organizationId,
+        actorUserId,
+        action: "BOOKING_MODEL_REQUEST_CHANGED",
+        entityType: "BOOKING",
+        entityId: bookingId,
+        bookingId,
+        field: "fulfilledAt",
+        fromValue: request.fulfilledAt.toISOString(),
+        toValue: null,
+        meta: {
+          assetModelId: request.assetModelId,
+          assetModelName: request.assetModel.name,
+        },
+      });
+    }
+  }
+
+  // One event per (booking, asset) that lost booked units — the report would
+  // otherwise lose the removal entirely when it happens via kit membership
+  // instead of the booking UI. Inside the tx so it rolls back with the delete.
+  await recordEvents(
+    [...perAsset.values()].map((entry) => {
+      // Only name a kit when the deleted slices all came from one — an asset
+      // detached from two kits at once has no single source to point at.
+      const [onlyKitId] = entry.kitIds;
+      return {
+        organizationId: entry.organizationId,
+        actorUserId,
+        action: "BOOKING_ASSETS_REMOVED" as const,
+        entityType: "BOOKING" as const,
+        entityId: entry.bookingId,
+        bookingId: entry.bookingId,
+        assetId: entry.assetId,
+        ...(entry.kitIds.size === 1 && onlyKitId ? { kitId: onlyKitId } : {}),
+        meta: {
+          // Distinguishes this from an operator removing the asset by hand.
+          viaKitRemoval: true,
+          ...assetQtyMeta(
+            { type: entry.assetType, unitOfMeasure: entry.unitOfMeasure },
+            entry.quantity
+          ),
+        },
+      };
+    }),
+    tx
+  );
+
+  // Same tx as the decrement above — a rolled-back removal must not leave an
+  // event claiming a reservation re-opened.
+  await recordEvents(modelRequestReopenEvents, tx);
+
+  // Actor for the note attribution, read on the CALLER'S transaction client. It
+  // must not go through `getUserByID`, which is hardcoded to the global `db`
+  // (see `user/service.server.ts`) — that would take a second pooled connection
+  // while this interactive tx holds one, and add a round-trip to a tx budget
+  // that has already produced P2028 on large bulk operations.
+  const actor = await tx.user.findUnique({
+    // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: `actorUserId` is the authenticated caller, not request input
+    where: { id: actorUserId },
+    select: { ...USER_NAME_SELECT },
+  });
+  const actorLink = wrapUserLinkForNote({
+    ...(actor ?? { displayName: null }),
+    id: actorUserId,
+  });
+
+  // One note per (booking, kit) pair — several assets leaving the same kit in
+  // one action collapse into a single line rather than spamming the feed.
+  type Group = {
+    bookingId: string;
+    organizationId: string;
+    kitName: string;
+    assetTitles: string[];
+  };
+  const groups = new Map<string, Group>();
+  for (const row of removed) {
+    const key = `${row.bookingId}::${row.kitId}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.assetTitles.push(row.assetTitle);
+    } else {
+      groups.set(key, {
+        bookingId: row.bookingId,
+        organizationId: row.organizationId,
+        kitName: row.kitName,
+        assetTitles: [row.assetTitle],
+      });
+    }
+  }
+
+  // `createSystemBookingNotes` verifies every booking belongs to the org it is
+  // handed, so notes are batched per organization. Always a single batch now
+  // that the read filters on `organizationId`, but the grouping is kept so the
+  // helper stays correct if the read ever widens.
+  const notesByOrg = new Map<
+    string,
+    Array<{ bookingId: string; content: string }>
+  >();
+  for (const group of groups.values()) {
+    // Asset titles and the kit name are user-supplied and render as literal
+    // text in this Markdoc note.
+    const safeTitles = group.assetTitles.map(stripMarkdocDelimiters);
+    const subjects =
+      safeTitles.length === 1
+        ? `**${safeTitles[0]}**`
+        : `**${safeTitles.length} assets** (${safeTitles
+            .map((t) => `*${t}*`)
+            .join(", ")})`;
+    // `kit-deleted` names the subjects after the clause, so it takes the bare
+    // verb; the membership wording already named them and needs the pronoun.
+    const verb = safeTitles.length === 1 ? "was" : "were";
+    const pronoun = safeTitles.length === 1 ? "it" : "they";
+    const safeKitName = stripMarkdocDelimiters(group.kitName);
+    // The two paths differ in what actually happened: on `kit-deleted` the
+    // asset never left the kit — the kit stopped existing. Saying "removed X
+    // from kit Y" there would describe a membership edit that never occurred.
+    const cause =
+      reason === "kit-deleted"
+        ? `${actorLink} deleted kit **${safeKitName}**, so ${subjects} ${verb} removed from this booking`
+        : reason === "units-not-returned"
+        ? `${actorLink} checked in another booking where the last units of ${subjects} in kit **${safeKitName}** were not returned, so ${pronoun} ${verb} removed from this booking`
+        : `${actorLink} removed ${subjects} from kit **${safeKitName}**, so ${pronoun} ${verb} also removed from this booking`;
+    const content = `${cause}. Nothing has been checked out yet, so the booking follows the kit's contents.`;
+    const bucket = notesByOrg.get(group.organizationId);
+    if (bucket) {
+      bucket.push({ bookingId: group.bookingId, content });
+    } else {
+      notesByOrg.set(group.organizationId, [
+        { bookingId: group.bookingId, content },
+      ]);
+    }
+  }
+  for (const [organizationId, notes] of notesByOrg) {
+    await createSystemBookingNotes({ notes, organizationId }, tx);
+  }
+
+  return removed;
+}
+
+/**
+ * Booking statuses whose impact is worth naming before a kit removal is
+ * confirmed — the two the operator can still act on.
+ *
+ * `RESERVED`: the slice is DELETED (see {@link removeKitSlicesFromPlanningBookings}).
+ * `ONGOING` / `OVERDUE`: the slice is KEPT and relabelled "removed from kit".
+ *
+ * `DRAFT` is deliberately out even though its slice is deleted too — nobody has
+ * committed to a draft, so the warning would be noise. `COMPLETE` / `ARCHIVED` /
+ * `CANCELLED` are out because they are historical: the operator can take no
+ * action about them, and a popular kit can carry dozens, which would bury the
+ * two actionable groups.
+ */
+const KIT_REMOVAL_NOTICE_BOOKING_STATUSES: BookingStatus[] = [
+  BookingStatus.RESERVED,
+  BookingStatus.ONGOING,
+  BookingStatus.OVERDUE,
+];
+
+/** A booking named in the removal notice. */
+type BookingForRemovalImpact = { id: string; name: string };
+
+/**
+ * Per-membership removal impact, split by what actually happens to the slice.
+ *
+ * @property reserved - RESERVED bookings that LOSE the slice on removal.
+ * @property checkedOut - ONGOING/OVERDUE bookings that KEEP the slice, relabelled.
+ */
+export type AssetKitBookingImpact = {
+  reserved: BookingForRemovalImpact[];
+  checkedOut: BookingForRemovalImpact[];
+};
+
+/**
+ * Which bookings a removal from a kit would visibly affect, grouped by outcome.
+ *
+ * Removing an asset from a kit does two different things depending on the
+ * booking's status. On a planning booking the kit-driven `BookingAsset` row is
+ * DELETED (see {@link removeKitSlicesFromPlanningBookings}) — for a DRAFT that
+ * is unremarkable, but a RESERVED booking has committed dates and a custodian.
+ * On an ONGOING/OVERDUE booking the row is KEPT, still grouped under its
+ * original kit and flagged as removed from it, because those units are
+ * physically out and the booking must still record what went out.
+ *
+ * Both outcomes get named before the user confirms, in their own group — see
+ * `~/components/kits/booking-removal-notice`.
+ *
+ * Read-only and purely advisory: it takes no `tx` and nothing branches on the
+ * result server-side. The removal itself is never blocked — kit maintenance
+ * would be impossible whenever anything is reserved or out.
+ * (`moveAssetKitUnits` blocks, deliberately, for a different operation.)
+ *
+ * Org-scoped in the query itself, not by caller discipline: this renders BOOKING
+ * NAMES back to the user, so a stray `AssetKit` id from another org would leak
+ * them. `organizationId` is a required param so the compiler forces every call
+ * site to supply it (see `.claude/rules/org-scope-user-supplied-ids.md`).
+ *
+ * @param assetKitIds `AssetKit` rows the UI offers to remove
+ * @param organizationId Acting org — bookings outside it are never returned
+ * @returns `assetKitId -> { reserved, checkedOut }`, each deduped by booking id.
+ *   An absent key means that membership has no impact worth naming.
+ */
+export async function getBookingImpactForAssetKits({
+  assetKitIds,
+  organizationId,
+}: {
+  assetKitIds: string[];
+  organizationId: string;
+}): Promise<Record<string, AssetKitBookingImpact>> {
+  if (assetKitIds.length === 0) return {};
+
+  const rows = await db.bookingAsset.findMany({
+    where: {
+      assetKitId: { in: assetKitIds },
+      // Both clauses on the booking: `organizationId` is the tenancy guard,
+      // `status` the advisory scope.
+      booking: {
+        status: { in: KIT_REMOVAL_NOTICE_BOOKING_STATUSES },
+        organizationId,
+      },
+    },
+    select: {
+      assetKitId: true,
+      // `status` picks the bucket — the two outcomes read differently, so the
+      // notice can't collapse them into one list.
+      booking: { select: { id: true, name: true, status: true } },
+    },
+  });
+
+  const impact: Record<string, AssetKitBookingImpact> = {};
+  for (const row of rows) {
+    // Rows are keyed on `assetKitId` — a null one is a standalone slice the
+    // membership doesn't own, and removal never touches it.
+    if (!row.assetKitId || !row.booking) continue;
+
+    // Bucket by outcome. Anything outside the two groups is dropped rather
+    // than defaulted into one of them: the copy makes a promise about what
+    // happens to the booking, and a status this function doesn't model would
+    // make the wrong promise.
+    let bucket: BookingForRemovalImpact[];
+    const groups = (impact[row.assetKitId] ??= {
+      reserved: [],
+      checkedOut: [],
+    });
+    if (row.booking.status === BookingStatus.RESERVED) {
+      bucket = groups.reserved;
+    } else if (
+      row.booking.status === BookingStatus.ONGOING ||
+      row.booking.status === BookingStatus.OVERDUE
+    ) {
+      bucket = groups.checkedOut;
+    } else {
+      continue;
+    }
+
+    // Dedupe per bucket: the notice counts bookings, not rows, so a membership
+    // holding several slices of one booking must still read "1 booking".
+    if (bucket.some((booking) => booking.id === row.booking.id)) continue;
+    bucket.push({ id: row.booking.id, name: row.booking.name });
+  }
+
+  // A membership whose only rows were dropped above would otherwise ship an
+  // empty pair of groups and be counted as "impacted" by call sites.
+  for (const [assetKitId, groups] of Object.entries(impact)) {
+    if (groups.reserved.length === 0 && groups.checkedOut.length === 0) {
+      delete impact[assetKitId];
+    }
+  }
+  return impact;
+}
+
+/**
+ * Companion to {@link fetchAssetKitDetachmentImpact}. Writes a system
+ * note on each affected booking explaining that the kit's booked slice
+ * has been converted to a standalone reservation. The kit-driven
+ * BookingAsset row itself stays in the booking — the DB-level
+ * `ON DELETE SET NULL` cascade just clears its `assetKitId` so the
+ * booking UI groups it as standalone going forward.
+ *
+ * No activity-event emission yet — that would require a new enum value
+ * (e.g. `BOOKING_ASSET_DETACHED_FROM_KIT`) and a migration. Deferred;
+ * the system notes alone cover the user-visible audit trail.
+ */
+/**
+ * The check-out markers of a slice made by merging `parts` into one row, for
+ * {@link mergeStandaloneCollisionsForKitDetachment}.
+ *
+ * Units sent out add up and the earliest departure wins. The merged slice is
+ * checked in only when no part is still out (out and not checked in), and then
+ * at the latest part's check-in. Returns nothing when no part went out, so a
+ * merge on a booking that has not started leaves the markers alone.
+ *
+ * @param parts The survivor and every row folded into it
+ * @returns The marker fields to write on the survivor, or `{}`
+ */
+function mergeCheckoutMarkers(
+  parts: Array<{
+    checkedOutAt?: Date | null;
+    checkedOutById?: string | null;
+    checkedInAt?: Date | null;
+    checkedInById?: string | null;
+    checkedOutQuantity?: number;
+  }>
+) {
+  const sentOut = parts.filter((part) => part.checkedOutAt);
+  if (sentOut.length === 0) return {};
+
+  const byTime = (at: (part: (typeof parts)[number]) => Date) =>
+    [...sentOut].sort((a, b) => at(a).getTime() - at(b).getTime());
+  const firstOut = byTime((part) => part.checkedOutAt!)[0];
+  const stillOut = sentOut.some((part) => !part.checkedInAt);
+  const lastIn = stillOut
+    ? null
+    : byTime((part) => part.checkedInAt!)[sentOut.length - 1];
+
+  return {
+    checkedOutQuantity: parts.reduce(
+      (sum, part) => sum + (part.checkedOutQuantity ?? 0),
+      0
+    ),
+    checkedOutAt: firstOut.checkedOutAt,
+    checkedOutById: firstOut.checkedOutById ?? null,
+    checkedInAt: lastIn?.checkedInAt ?? null,
+    checkedInById: lastIn?.checkedInById ?? null,
+  };
+}
+
+/**
+ * Resolves the standalone-vs-kit-driven `BookingAsset` collision that
+ * arises when an `AssetKit` row is about to be deleted (kit removal,
+ * cross-kit move). The DB-level `ON DELETE SET NULL` cascade would clear
+ * `assetKitId` on the matching `BookingAsset` rows — but if a standalone
+ * row (`assetKitId IS NULL`) already exists for the same
+ * `(bookingId, assetId)` pair, the SET NULL violates
+ * `BookingAsset_manual_unique` and the whole tx rolls back with P2002.
+ *
+ * For each colliding pair this helper merges the kit-driven qty into the
+ * standalone row and deletes the kit-driven row, so the subsequent
+ * `tx.assetKit.deleteMany(...)` has no row to cascade onto for that pair.
+ * Non-colliding kit-driven rows are left untouched — the cascade converts
+ * them to standalone as before.
+ *
+ * Call BEFORE `tx.assetKit.deleteMany(...)`. The companion
+ * {@link fetchAssetKitDetachmentImpact} must run BEFORE this helper too,
+ * since it needs the kit-driven rows to still exist to capture their
+ * booking + asset names.
+ *
+ * INDIVIDUAL assets shouldn't collide, but that guarantee is SERVICE-layer,
+ * not a database one: the INDIVIDUAL-overlap guards in `createBooking` and
+ * `updateBookingAssets` (`~/modules/booking/service.server`) drop an
+ * INDIVIDUAL asset from the standalone bucket when the same call also books
+ * it via a kit slice, so it never ends up with both rows. QUANTITY_TRACKED is
+ * deliberately exempt there — a free-pool slice may legitimately coexist with
+ * kit slices. (The `enforce_individual_asset_single_kit` trigger is NOT the
+ * enforcement point: it caps `AssetKit` membership rows per INDIVIDUAL asset
+ * and says nothing about `BookingAsset` rows.) Since nothing at the DB level
+ * stops the collision, the merge below handles INDIVIDUAL rows the same way
+ * QUANTITY_TRACKED ones are handled.
+ *
+ * A merged-away row may carry `bookingModelRequestId` — the record of which
+ * `BookingModelRequest` unit it discharged. The units survive the merge, so the
+ * reservation stays satisfied and the survivor adopts the stamp. It can only do
+ * that while it answers no reservation itself: `BookingAsset` records one
+ * reservation per row, so a second stamped row folded into the same survivor
+ * has nowhere left to be recorded and its unit goes back to its request,
+ * `fulfilledAt` cleared once units are outstanding again. Both of those
+ * branches are defence — at most one row per `(booking, asset)` is stamped, so
+ * a collision between two stamped rows means that invariant has already
+ * slipped, and losing the unit silently would be worse than returning it.
+ *
+ * A merged-away row on a started booking also carries per-slice state, and the
+ * survivor takes all of it, or the booking's screens start answering from half
+ * a slice:
+ * - the check-out markers: units sent out add up, the earliest departure wins,
+ *   and the survivor counts as checked in only when no part of it is still out;
+ * - the `ConsumptionLog` rows tagged with the merged-away row, which would
+ *   otherwise lose their tag to `ON DELETE SET NULL`;
+ * - the `PartialBookingCheckout.bookingAssetIds` entries naming it.
+ * The markers are written only when some part of the merge went out, so a
+ * merge on a booking that has not started writes exactly what it always has.
+ *
+ * @param tx Active transaction — must be the one deleting the `AssetKit` rows
+ * @param assetKitIds `AssetKit` rows about to be deleted
+ */
+export async function mergeStandaloneCollisionsForKitDetachment(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tx: any,
+  assetKitIds: string[]
+): Promise<void> {
+  if (assetKitIds.length === 0) return;
+  /** Both reads carry the reservation stamp — the merge has to place it. */
+  const collisionRowSelect = {
+    id: true,
+    bookingId: true,
+    assetId: true,
+    quantity: true,
+    bookingModelRequestId: true,
+    checkedOutAt: true,
+    checkedOutById: true,
+    checkedInAt: true,
+    checkedInById: true,
+    checkedOutQuantity: true,
+  };
+  type CollisionRow = {
+    id: string;
+    bookingId: string;
+    assetId: string;
+    quantity: number;
+    bookingModelRequestId: string | null;
+    checkedOutAt?: Date | null;
+    checkedOutById?: string | null;
+    checkedInAt?: Date | null;
+    checkedInById?: string | null;
+    checkedOutQuantity?: number;
+  };
+
+  const kitDrivenRows: CollisionRow[] = await tx.bookingAsset.findMany({
+    where: { assetKitId: { in: assetKitIds } },
+    select: collisionRowSelect,
+  });
+  if (kitDrivenRows.length === 0) return;
+
+  const standaloneMatches: CollisionRow[] = await tx.bookingAsset.findMany({
+    where: {
+      assetKitId: null,
+      OR: kitDrivenRows.map((r) => ({
+        bookingId: r.bookingId,
+        assetId: r.assetId,
+      })),
+    },
+    select: collisionRowSelect,
+  });
+  if (standaloneMatches.length === 0) return;
+
+  const standaloneByPair = new Map<string, (typeof standaloneMatches)[number]>(
+    standaloneMatches.map((s) => [`${s.bookingId}::${s.assetId}`, s])
+  );
+
+  // Sum EVERY kit-driven row that merges into the same standalone row before
+  // writing. A QUANTITY_TRACKED asset can sit in several kits on one booking
+  // (`BookingAsset_kit_unique` is per-AssetKit), so a bulk kit deletion can
+  // collapse two kit rows into one standalone row. Writing
+  // `standalone.quantity + kdr.quantity` per row from the unchanged snapshot
+  // would let the second write overwrite the first, silently losing the first
+  // slice's units.
+  const mergedQtyByStandaloneId = new Map<string, number>();
+  /**
+   * The reservation stamp each survivor adopts, where it had none of its own.
+   * At most one per survivor: `BookingAsset.bookingModelRequestId` names the
+   * single promise that row answers, so a second stamp has nowhere to live.
+   */
+  const adoptedRequestIdByStandaloneId = new Map<string, string>();
+  /** Discharged units no surviving row can hold — one entry per lost unit. */
+  const requestIdsToDecrement: string[] = [];
+  const kitDrivenIdsToDelete: string[] = [];
+  /** Every row folded into each survivor, the survivor itself first. */
+  const partsByStandaloneId = new Map<string, CollisionRow[]>();
+  for (const kdr of kitDrivenRows) {
+    const standalone = standaloneByPair.get(`${kdr.bookingId}::${kdr.assetId}`);
+    if (!standalone) continue;
+    partsByStandaloneId.set(standalone.id, [
+      ...(partsByStandaloneId.get(standalone.id) ?? [standalone]),
+      kdr,
+    ]);
+    mergedQtyByStandaloneId.set(
+      standalone.id,
+      (mergedQtyByStandaloneId.get(standalone.id) ?? standalone.quantity) +
+        kdr.quantity
+    );
+    if (kdr.bookingModelRequestId) {
+      // The units stay on the booking, so the reservation stays satisfied —
+      // move the stamp to the row that now carries them. A survivor that
+      // already holds a stamp has no room for a second: that unit's record is
+      // gone, so the unit is owed back to its request.
+      if (
+        !standalone.bookingModelRequestId &&
+        !adoptedRequestIdByStandaloneId.has(standalone.id)
+      ) {
+        adoptedRequestIdByStandaloneId.set(
+          standalone.id,
+          kdr.bookingModelRequestId
+        );
+      } else {
+        requestIdsToDecrement.push(kdr.bookingModelRequestId);
+      }
+    }
+    kitDrivenIdsToDelete.push(kdr.id);
+  }
+
+  /** Merged-away row id → the survivor that now holds its units. */
+  const survivorIdByMergedId = new Map<string, string>();
+  for (const [standaloneId, quantity] of mergedQtyByStandaloneId) {
+    const adoptedRequestId = adoptedRequestIdByStandaloneId.get(standaloneId);
+    const parts = partsByStandaloneId.get(standaloneId) ?? [];
+    const mergedAway = parts.slice(1);
+    for (const part of mergedAway) {
+      survivorIdByMergedId.set(part.id, standaloneId);
+    }
+    await tx.bookingAsset.update({
+      where: { id: standaloneId },
+      data: {
+        quantity,
+        ...(adoptedRequestId
+          ? { bookingModelRequestId: adoptedRequestId }
+          : {}),
+        ...mergeCheckoutMarkers(parts),
+      },
+    });
+    // Keep the merged-away rows' dispositions on the slice that holds their
+    // units, before the delete below would null their tag.
+    await tx.consumptionLog.updateMany({
+      where: { bookingAssetId: { in: mergedAway.map((part) => part.id) } },
+      data: { bookingAssetId: standaloneId },
+    });
+  }
+
+  // Sessions name slices positionally. Re-point the merged-away ids, so a
+  // tagged claim keeps counting against the slice that now holds its units.
+  // Every merged-away id, not only those with a check-out marker: a row from
+  // before the marker existed can carry session claims without one.
+  const mergedAwayIds = [...survivorIdByMergedId.keys()];
+  if (mergedAwayIds.length > 0) {
+    const sessions: Array<{ id: string; bookingAssetIds: string[] }> =
+      await tx.partialBookingCheckout.findMany({
+        where: {
+          bookingId: {
+            in: [
+              ...new Set(
+                kitDrivenRows
+                  .filter((row) => survivorIdByMergedId.has(row.id))
+                  .map((row) => row.bookingId)
+              ),
+            ],
+          },
+          bookingAssetIds: { hasSome: mergedAwayIds },
+        },
+        select: { id: true, bookingAssetIds: true },
+      });
+    for (const session of sessions) {
+      await tx.partialBookingCheckout.update({
+        where: { id: session.id },
+        data: {
+          bookingAssetIds: session.bookingAssetIds.map(
+            (sliceId) => survivorIdByMergedId.get(sliceId) ?? sliceId
+          ),
+        },
+      });
+    }
+  }
+
+  if (kitDrivenIdsToDelete.length > 0) {
+    await tx.bookingAsset.deleteMany({
+      where: { id: { in: kitDrivenIdsToDelete } },
+    });
+  }
+
+  // Hand back the discharged units the merge could not keep. One unit per
+  // stamped row that was folded away without its stamp surviving, floored at 0,
+  // with the completion stamp cleared once the request owes units again.
+  const decrementByRequestId = new Map<string, number>();
+  for (const requestId of requestIdsToDecrement) {
+    decrementByRequestId.set(
+      requestId,
+      (decrementByRequestId.get(requestId) ?? 0) + 1
+    );
+  }
+  for (const [requestId, decrementBy] of decrementByRequestId) {
+    const request = await tx.bookingModelRequest.findUnique({
+      where: { id: requestId },
+      select: { quantity: true, fulfilledQuantity: true },
+    });
+    if (!request || request.fulfilledQuantity === 0) continue;
+
+    const nextFulfilled = Math.max(0, request.fulfilledQuantity - decrementBy);
+    await tx.bookingModelRequest.update({
+      where: { id: requestId },
+      data: {
+        fulfilledQuantity: nextFulfilled,
+        ...(nextFulfilled < request.quantity ? { fulfilledAt: null } : {}),
+      },
+    });
+  }
+}
+
+/**
+ * Keeps an asset at the location its kit gave it when the `AssetKit` row is
+ * about to be deleted (asset removed from kit, bulk detach, cross-kit move,
+ * kit deletion).
+ *
+ * `AssetLocation.assetKit` is `onDelete: Cascade`, so without this the
+ * kit-driven placement row would vanish with the membership and the asset
+ * would silently become unplaced. Unpacking a kit doesn't teleport its
+ * contents, so the row is converted to a manual placement instead
+ * (`assetKitId: null`).
+ *
+ * **INDIVIDUAL members only** — see the body for why converting a
+ * QUANTITY_TRACKED slice would abort the whole detach. Those rows are left to
+ * the DB cascade, which restores the pre-cascade behaviour of the units simply
+ * becoming unplaced.
+ *
+ * In practice INDIVIDUAL members hold plain rows from
+ * {@link cascadeKitLocationToAssets} and never have a kit-driven row at all;
+ * this covers rows written before that behaviour, and keeps the guarantee true
+ * if one is ever written again.
+ *
+ * Call BEFORE `tx.assetKit.delete*(...)`.
+ *
+ * Caller contract: `assetKitIds` MUST already be org-scoped — this helper
+ * rewrites the rows they point at without re-checking. Today's callers satisfy
+ * it via an explicit `organizationId` filter (`performKitDeletion`,
+ * `bulkRemoveAssetsFromKits`), an org-scoped kit (`updateKitAssets`' disconnect
+ * path, `moveAssetKitUnits`), or an org-scoped asset read
+ * (`updateKitAssets`' cross-kit-move path).
+ *
+ * @param tx Active transaction — must be the one deleting the `AssetKit` rows
+ * @param assetKitIds `AssetKit` rows about to be deleted; must be org-scoped
+ */
+export async function preserveKitDrivenPlacements(
+  tx: KitLocationTxClient,
+  assetKitIds: string[]
+): Promise<void> {
+  if (assetKitIds.length === 0) return;
+
+  // INDIVIDUAL members only, deliberately. A QUANTITY_TRACKED asset's kit
+  // slice lives on the kit axis, which the location-axis cap ignores
+  // (`enforce_asset_location_sum_within_total` counts `assetKitId IS NULL`
+  // rows only). Converting such a row to manual moves those units INTO the
+  // capped axis, so a fully-placed asset would breach
+  // `sum(manual quantity) <= Asset.quantity` and abort the whole detach —
+  // taking asset removal, bulk removal, kit deletion and full-slice moves
+  // with it. Those rows are left to the `onDelete: Cascade` instead, so the
+  // units simply go back to being unplaced.
+  //
+  // INDIVIDUAL assets have `Asset.quantity = NULL`, so that cap doesn't apply
+  // to them at all and preserving the location is always safe.
+  const kitDrivenRows = await tx.assetLocation.findMany({
+    where: {
+      assetKitId: { in: assetKitIds },
+      asset: { type: { not: AssetType.QUANTITY_TRACKED } },
+    },
+    select: { id: true, assetId: true },
+  });
+  if (kitDrivenRows.length === 0) return;
+
+  const placedAssetIds = new Set(
+    (
+      await tx.assetLocation.findMany({
+        where: {
+          assetKitId: null,
+          assetId: {
+            in: [...new Set(kitDrivenRows.map((row) => row.assetId))],
+          },
+        },
+        select: { assetId: true },
+      })
+    ).map((row) => row.assetId)
+  );
+
+  for (const row of kitDrivenRows) {
+    // `enforce_individual_asset_single_location` caps an INDIVIDUAL asset at
+    // one row. If it already holds a manual placement — or an earlier row in
+    // this loop was just converted into one — that placement wins and this
+    // kit-driven row is simply dropped.
+    if (placedAssetIds.has(row.assetId)) {
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: row.id came from the `assetKitId IN assetKitIds` read above; those ids are org-scoped per this helper's caller contract
+      await tx.assetLocation.delete({ where: { id: row.id } });
+      continue;
+    }
+
+    await tx.assetLocation.update({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: row.id came from the `assetKitId IN assetKitIds` read above; those ids are org-scoped per this helper's caller contract
+      where: { id: row.id },
+      data: { assetKitId: null },
+    });
+    placedAssetIds.add(row.assetId);
+  }
+}
+
+export async function emitAssetKitDetachmentNotes({
+  impact,
+  actor,
+  organizationId,
+}: {
+  impact: Awaited<ReturnType<typeof fetchAssetKitDetachmentImpact>>;
+  /**
+   * The acting user's row, passed through whole: the note links their id and
+   * renders whatever name they go by.
+   */
+  actor: UserNameFields & { id: string };
+  organizationId: string;
+}) {
+  if (impact.length === 0) return;
+  const actorLink = wrapUserLinkForNote(actor);
+  // One note per (booking, kit) pair. Multiple assets removed from the
+  // same kit in the same delete are collapsed to a single note per
+  // booking so we don't spam the booking activity feed.
+  type Group = {
+    bookingId: string;
+    kitName: string;
+    assetTitles: string[];
+  };
+  const groups = new Map<string, Group>();
+  for (const row of impact) {
+    const key = `${row.bookingId}::${row.kitId}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.assetTitles.push(row.assetTitle);
+    } else {
+      groups.set(key, {
+        bookingId: row.bookingId,
+        kitName: row.kitName,
+        assetTitles: [row.assetTitle],
+      });
+    }
+  }
+  for (const group of groups.values()) {
+    // Asset titles and the kit name are user-supplied and render as literal
+    // text in this Markdoc note.
+    const safeTitles = group.assetTitles.map(stripMarkdocDelimiters);
+    const subjects =
+      safeTitles.length === 1
+        ? `**${safeTitles[0]}**`
+        : `**${safeTitles.length} assets** (${safeTitles
+            .map((t) => `*${t}*`)
+            .join(", ")})`;
+    // `createSystemBookingNote` doesn't accept a tx (matches the other
+    // booking-note call sites). The note creates outside the kit-delete
+    // tx; in the unlikely event the tx rolls back, the note is
+    // orphaned. Acceptable per the existing pattern in
+    // `apps/webapp/app/modules/booking/service.server.ts`.
+    await createSystemBookingNote({
+      bookingId: group.bookingId,
+      organizationId,
+      content: `${actorLink} removed ${subjects} from kit **${stripMarkdocDelimiters(
+        group.kitName
+      )}**. The kit's booked slice has been converted to a standalone reservation in this booking.`,
+    });
+  }
+}
+
+/**
+ * Audit trail for kit slices on planning bookings that
+ * {@link removeDestroyedUnitsFromKits} capped to what the kit still holds.
+ *
+ * Mirrors {@link removeKitSlicesFromPlanningBookings}, which covers the same
+ * bookings when the membership empties: one `BOOKING_ASSETS_REMOVED` event per
+ * capped slice with the units it gave up (`meta.viaKitRemoval`), and one note
+ * per booking naming the check-in that caused it. Runs inside the caller's
+ * transaction so the trail rolls back with the cap.
+ *
+ * @param tx Active check-in transaction
+ * @param args.capped The capped slices, with the units each gave up and kept
+ * @param args.organizationId Acting org, owner of every capped booking
+ * @param args.actorUserId User checking the other booking in
+ * @param args.checkinBookingId The booking whose check-in destroyed the units
+ */
+async function recordPlanningKitSliceCaps(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tx: any,
+  {
+    capped,
+    organizationId,
+    actorUserId,
+    checkinBookingId,
+  }: {
+    capped: Array<{
+      bookingId: string;
+      membership: {
+        assetId: string;
+        kitId: string;
+        kit: { name: string };
+        asset: { title: string; type: AssetType; unitOfMeasure: string | null };
+      };
+      removed: number;
+      remaining: number;
+    }>;
+    organizationId: string;
+    actorUserId: string;
+    checkinBookingId: string;
+  }
+): Promise<void> {
+  await recordEvents(
+    capped.map(({ bookingId, membership, removed }) => ({
+      organizationId,
+      actorUserId,
+      action: "BOOKING_ASSETS_REMOVED" as const,
+      entityType: "BOOKING" as const,
+      entityId: bookingId,
+      bookingId,
+      assetId: membership.assetId,
+      kitId: membership.kitId,
+      meta: {
+        // Distinguishes this from an operator removing units by hand.
+        viaKitRemoval: true,
+        ...assetQtyMeta(membership.asset, removed),
+      },
+    })),
+    tx
+  );
+
+  // Read on the caller's transaction client, not through `getUserByID`, which
+  // is bound to the global `db` and would take a second pooled connection.
+  const actor = await tx.user.findUnique({
+    // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: `actorUserId` is the authenticated caller, not request input
+    where: { id: actorUserId },
+    select: { ...USER_NAME_SELECT },
+  });
+  const actorLink = wrapUserLinkForNote({
+    ...(actor ?? { displayName: null }),
+    id: actorUserId,
+  });
+  const checkinLink = wrapLinkForNote(
+    `/bookings/${checkinBookingId}`,
+    "another booking"
+  );
+
+  // One note per booking: several of its kit assets can shrink in the same
+  // check-in, and they collapse into a single line.
+  const cappedByBookingId = new Map<string, typeof capped>();
+  for (const entry of capped) {
+    const bucket = cappedByBookingId.get(entry.bookingId);
+    if (bucket) {
+      bucket.push(entry);
+    } else {
+      cappedByBookingId.set(entry.bookingId, [entry]);
+    }
+  }
+
+  await createSystemBookingNotes(
+    {
+      organizationId,
+      notes: [...cappedByBookingId].map(([bookingId, entries]) => {
+        const described = entries.map(({ membership, removed, remaining }) => {
+          const unitCount = (units: number) =>
+            formatUnitCount(membership.asset, units) ?? String(units);
+          return {
+            // Asset title and kit name are user-supplied literal text here.
+            title: stripMarkdocDelimiters(membership.asset.title),
+            kitName: stripMarkdocDelimiters(membership.kit.name),
+            removed: unitCount(removed),
+            remaining: unitCount(remaining),
+          };
+        });
+        const cause =
+          described.length === 1
+            ? `where **${described[0].removed}** of **${described[0].title}** in kit **${described[0].kitName}** were not returned, so this booking now holds **${described[0].remaining}** of it`
+            : `where kit units were not returned, so this booking now holds less of ${described
+                .map(
+                  (item) =>
+                    `**${item.title}** in kit **${item.kitName}** (**${item.removed}** fewer, **${item.remaining}** left)`
+                )
+                .join(", ")}`;
+        return {
+          bookingId,
+          content: `${actorLink} checked in ${checkinLink} ${cause}. Nothing has been checked out yet, so the booking follows the kit's contents.`,
+        };
+      }),
+    },
+    tx
+  );
+}
+
+/** One kit membership that {@link removeDestroyedUnitsFromKits} emptied and deleted. */
+export type EmptiedKitMembership = {
+  assetId: string;
+  assetTitle: string;
+  assetType: AssetType;
+  unitOfMeasure: string | null;
+  kitId: string;
+  kitName: string;
+  /**
+   * Units that left the kit. For an emptied membership, everything it held
+   * before they were destroyed.
+   */
+  quantity: number;
+};
+
+/** One kit membership that {@link removeDestroyedUnitsFromKits} shrank but kept. */
+export type ShrunkKitMembership = EmptiedKitMembership & {
+  /** Units the kit holds now. */
+  remainingInKit: number;
+};
+
+/** What {@link removeDestroyedUnitsFromKits} changed, for the caller's post-transaction notes. */
+export type DestroyedKitUnitsResult = {
+  /** Memberships that reached zero and were deleted. */
+  emptiedMemberships: EmptiedKitMembership[];
+  /**
+   * Memberships that lost units and kept some. `quantity` is the units that
+   * left the kit.
+   */
+  shrunkMemberships: ShrunkKitMembership[];
+  /**
+   * Live bookings whose kit slice the deletion turned into a standalone one.
+   * Pass it to {@link emitAssetKitDetachmentNotes} once the transaction has
+   * committed, minus the booking being checked in.
+   */
+  detachmentImpact: Awaited<ReturnType<typeof fetchAssetKitDetachmentImpact>>;
+};
+
+/**
+ * Takes units destroyed at booking check-in out of the kits they left through.
+ *
+ * A kit slice's units belong to the kit (`AssetKit.quantity`), so a unit that is
+ * consumed, lost or damaged while out on a kit slice leaves the kit as well as
+ * the stock total. The check-in writes the stock total; this keeps the kit axis
+ * in step inside the same transaction:
+ *
+ * - The membership shrinks by the destroyed units, and the kit-driven
+ *   `AssetLocation` row that mirrors it follows, so the kit's location stops
+ *   showing units that no longer exist. One `ASSET_KIT_CHANGED` event per
+ *   asset records the units that left the kit.
+ * - A booking still in a planning status that holds the kit is capped at what
+ *   the kit now holds. A booking that has started keeps its slice: it records
+ *   what went out.
+ * - A membership that reaches zero is removed the way the kit service removes a
+ *   member: planning slices deleted, standalone collisions merged, placements
+ *   preserved, then the delete, with one `ASSET_KIT_CHANGED` event per asset.
+ *
+ * It refuses nothing, because the units are already gone. When the asset's
+ * kits would still hold more units than the asset has left, the kit axis
+ * carries a drift this check-in did not cause, and any `AssetKit` write would
+ * trip `enforce_asset_kit_sum_within_total` at commit and roll back a check-in
+ * that physically happened. That asset's kits are left as they are and the
+ * drift is reported to Sentry, since only someone fixing the data can clear it.
+ * The same holds when the asset's hand-placed units exceed its stock and a kit
+ * of it has a location: writing the kit's location row would trip
+ * `enforce_asset_location_sum_within_total` the same way.
+ *
+ * Call it AFTER the stock decrement, in the same transaction, and after every
+ * read the check-in makes of its own booking's slices: the collision merge can
+ * fold a finished kit slice into a standalone sibling on that booking.
+ *
+ * @param tx Active check-in transaction
+ * @param args.destroyedUnitsByAssetKitId Units destroyed out of each kit slice,
+ *   keyed by `AssetKit.id`
+ * @param args.organizationId Acting org; memberships outside it are ignored
+ * @param args.actorUserId User checking the booking in
+ * @param args.bookingId Booking being checked in, cross-referenced on the events
+ * @returns What changed, for the post-transaction notes
+ */
+export async function removeDestroyedUnitsFromKits(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tx: any,
+  {
+    destroyedUnitsByAssetKitId,
+    organizationId,
+    actorUserId,
+    bookingId,
+  }: {
+    destroyedUnitsByAssetKitId: Map<string, number>;
+    organizationId: string;
+    actorUserId: string;
+    bookingId: string;
+  }
+): Promise<DestroyedKitUnitsResult> {
+  const result: DestroyedKitUnitsResult = {
+    emptiedMemberships: [],
+    shrunkMemberships: [],
+    detachmentImpact: [],
+  };
+
+  const assetKitIds = [...destroyedUnitsByAssetKitId]
+    .filter(([, units]) => units > 0)
+    .map(([assetKitId]) => assetKitId);
+  if (assetKitIds.length === 0) return result;
+
+  // Lock the memberships before reading them, in a fixed order. Every other
+  // write to these rows then waits for this transaction, and the read below
+  // sees whatever was committed before the lock.
+  await tx.$queryRaw`
+    SELECT id FROM "AssetKit"
+    WHERE id = ANY(${assetKitIds}::text[]) AND "organizationId" = ${organizationId}
+    ORDER BY id
+    FOR UPDATE
+  `;
+
+  type Membership = {
+    id: string;
+    assetId: string;
+    kitId: string;
+    quantity: number;
+    kit: { name: string };
+    asset: {
+      title: string;
+      type: AssetType;
+      unitOfMeasure: string | null;
+      quantity: number | null;
+    };
+  };
+  const memberships: Membership[] = await tx.assetKit.findMany({
+    where: { id: { in: assetKitIds }, organizationId },
+    select: {
+      id: true,
+      assetId: true,
+      kitId: true,
+      quantity: true,
+      kit: { select: { name: true } },
+      // `quantity` is read inside the check-in transaction, so it is the stock
+      // total AFTER the decrement.
+      asset: {
+        select: {
+          title: true,
+          type: true,
+          unitOfMeasure: true,
+          quantity: true,
+        },
+      },
+    },
+  });
+  if (memberships.length === 0) return result;
+
+  /** A membership as the post-transaction notes name it. */
+  const describeMembership = (membership: Membership) => ({
+    assetId: membership.assetId,
+    assetTitle: membership.asset.title,
+    assetType: membership.asset.type,
+    unitOfMeasure: membership.asset.unitOfMeasure,
+    kitId: membership.kitId,
+    kitName: membership.kit.name,
+  });
+
+  /** Units each membership gives up: never more than it holds. */
+  const unitsTaken = (membership: Membership) =>
+    Math.min(
+      destroyedUnitsByAssetKitId.get(membership.id) ?? 0,
+      membership.quantity
+    );
+
+  // The kit-axis total per asset, across every kit, to test the trigger's
+  // invariant before writing anything it would check.
+  const kitSums: Array<{
+    assetId: string;
+    _sum: { quantity: number | null };
+  }> = await tx.assetKit.groupBy({
+    by: ["assetId"],
+    where: {
+      assetId: { in: [...new Set(memberships.map((m) => m.assetId))] },
+      organizationId,
+    },
+    _sum: { quantity: true },
+  });
+  const kitSumByAssetId = new Map(
+    kitSums.map((row) => [row.assetId, row._sum.quantity ?? 0])
+  );
+  const takenByAssetId = new Map<string, number>();
+  for (const membership of memberships) {
+    takenByAssetId.set(
+      membership.assetId,
+      (takenByAssetId.get(membership.assetId) ?? 0) + unitsTaken(membership)
+    );
+  }
+
+  const driftedAssetIds = new Set<string>();
+  for (const membership of memberships) {
+    if (driftedAssetIds.has(membership.assetId)) continue;
+    const kitUnitsAfter =
+      (kitSumByAssetId.get(membership.assetId) ?? 0) -
+      (takenByAssetId.get(membership.assetId) ?? 0);
+    const stockAfter = membership.asset.quantity ?? 0;
+    if (kitUnitsAfter > stockAfter) {
+      driftedAssetIds.add(membership.assetId);
+      Logger.error(
+        new ShelfError({
+          cause: null,
+          message:
+            "Check-in destroyed units out of a kit, but the asset's kits still hold more units than it has left. Its kits were not shrunk.",
+          additionalData: {
+            assetId: membership.assetId,
+            bookingId,
+            kitUnitsAfter,
+            stockAfter,
+          },
+          label,
+        })
+      );
+    }
+  }
+
+  // The kit's own location row is an `AssetLocation` row, and writing it (the
+  // update below, or the cascade when a membership is deleted) fires the
+  // deferred `enforce_asset_location_sum_within_total`, which re-checks the
+  // hand-placed total against the stock. The check-in's placement reconcile
+  // cannot always bring that total down (it writes nothing when it cannot tell
+  // which of several locations lost the units), so a kit-row write would fail
+  // the commit and roll back a check-in that physically happened. Such an
+  // asset's kits are left alone, like a drifted one.
+  const kitPlacedAssetIds = new Set<string>(
+    (
+      (await tx.assetLocation.findMany({
+        where: {
+          assetKitId: {
+            in: memberships
+              .filter((membership) => !driftedAssetIds.has(membership.assetId))
+              .map((membership) => membership.id),
+          },
+        },
+        select: { assetId: true },
+      })) as Array<{ assetId: string }>
+    ).map((row) => row.assetId)
+  );
+  if (kitPlacedAssetIds.size > 0) {
+    const manualSums: Array<{
+      assetId: string;
+      _sum: { quantity: number | null };
+    }> = await tx.assetLocation.groupBy({
+      by: ["assetId"],
+      where: { assetId: { in: [...kitPlacedAssetIds] }, assetKitId: null },
+      _sum: { quantity: true },
+    });
+    const stockByAssetId = new Map(
+      memberships.map((membership) => [
+        membership.assetId,
+        membership.asset.quantity ?? 0,
+      ])
+    );
+    for (const row of manualSums) {
+      const placedByHand = row._sum.quantity ?? 0;
+      const stockAfter = stockByAssetId.get(row.assetId) ?? 0;
+      if (placedByHand <= stockAfter) continue;
+      driftedAssetIds.add(row.assetId);
+      Logger.error(
+        new ShelfError({
+          cause: null,
+          message:
+            "Check-in destroyed units out of a kit, but the asset's hand-placed units exceed its stock, so the kit's location could not be updated. Its kits were not shrunk.",
+          additionalData: {
+            assetId: row.assetId,
+            bookingId,
+            placedByHand,
+            stockAfter,
+          },
+          label,
+        })
+      );
+    }
+  }
+
+  const emptied: Membership[] = [];
+  /** Planning-booking slices capped below, for their events and notes. */
+  const capped: Array<{
+    bookingId: string;
+    membership: Membership;
+    /** Units the slice gave up. */
+    removed: number;
+    /** Units the slice holds now. */
+    remaining: number;
+  }> = [];
+  /** Memberships that keep some units, with what they hold now. */
+  const shrunk: Array<{ membership: Membership; taken: number }> = [];
+  for (const membership of memberships) {
+    if (driftedAssetIds.has(membership.assetId)) continue;
+    const taken = unitsTaken(membership);
+    if (taken <= 0) continue;
+
+    if (membership.quantity - taken === 0) {
+      emptied.push(membership);
+    } else {
+      shrunk.push({ membership, taken });
+    }
+  }
+
+  for (const { membership, taken } of shrunk) {
+    const remaining = membership.quantity - taken;
+    await tx.assetKit.update({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: membership.id came from the organizationId-scoped findMany above, inside this same tx
+      where: { id: membership.id },
+      data: { quantity: remaining },
+    });
+    // The kit-driven placement mirrors the membership 1:1
+    // (`AssetLocation_kit_unique`). No row exists when the kit has no location.
+    await tx.assetLocation.updateMany({
+      where: { assetKitId: membership.id },
+      data: { quantity: remaining },
+    });
+  }
+
+  // A booking that has not started tracks the kit, so it cannot keep more of
+  // the kit than the kit now holds. One read covers every shrunk membership.
+  if (shrunk.length > 0) {
+    const remainingByAssetKitId = new Map(
+      shrunk.map(({ membership, taken }) => [
+        membership.id,
+        { membership, remaining: membership.quantity - taken },
+      ])
+    );
+    const planningSlices: Array<{
+      id: string;
+      bookingId: string;
+      assetKitId: string;
+      quantity: number;
+    }> = await tx.bookingAsset.findMany({
+      where: {
+        OR: [...remainingByAssetKitId].map(([assetKitId, { remaining }]) => ({
+          assetKitId,
+          quantity: { gt: remaining },
+        })),
+        booking: { organizationId, status: { in: PLANNING_BOOKING_STATUSES } },
+      },
+      select: { id: true, bookingId: true, assetKitId: true, quantity: true },
+    });
+    // Grouped by the quantity each slice is capped to, one write per group.
+    const sliceIdsByRemaining = new Map<number, string[]>();
+    for (const slice of planningSlices) {
+      const entry = remainingByAssetKitId.get(slice.assetKitId);
+      if (!entry) continue;
+      capped.push({
+        bookingId: slice.bookingId,
+        membership: entry.membership,
+        removed: slice.quantity - entry.remaining,
+        remaining: entry.remaining,
+      });
+      sliceIdsByRemaining.set(entry.remaining, [
+        ...(sliceIdsByRemaining.get(entry.remaining) ?? []),
+        slice.id,
+      ]);
+    }
+    for (const [remaining, sliceIds] of sliceIdsByRemaining) {
+      await tx.bookingAsset.updateMany({
+        where: { id: { in: sliceIds } },
+        data: { quantity: remaining },
+      });
+    }
+
+    // The units that left each kit, in the shape `moveAssetKitUnits` records
+    // units leaving a kit: the kit as `fromValue`, the units in `meta`.
+    await recordEvents(
+      shrunk.map(({ membership, taken }) => ({
+        organizationId,
+        actorUserId,
+        action: "ASSET_KIT_CHANGED" as const,
+        entityType: "ASSET" as const,
+        entityId: membership.assetId,
+        assetId: membership.assetId,
+        kitId: membership.kitId,
+        bookingId,
+        field: "kitId",
+        fromValue: membership.kitId,
+        toValue: null,
+        meta: {
+          ...assetQtyMeta(membership.asset, taken),
+          remainingInKit: membership.quantity - taken,
+        },
+      })),
+      tx
+    );
+    result.shrunkMemberships = shrunk.map(({ membership, taken }) => ({
+      ...describeMembership(membership),
+      quantity: taken,
+      remainingInKit: membership.quantity - taken,
+    }));
+  }
+
+  if (capped.length > 0) {
+    await recordPlanningKitSliceCaps(tx, {
+      capped,
+      organizationId,
+      actorUserId,
+      checkinBookingId: bookingId,
+    });
+  }
+
+  if (emptied.length === 0) return result;
+
+  const emptiedIds = emptied.map((membership) => membership.id);
+  // Same order as the kit service's member removal: planning slices go first so
+  // neither the impact snapshot nor the collision merge sees them.
+  await removeKitSlicesFromPlanningBookings(tx, emptiedIds, {
+    actorUserId,
+    organizationId,
+    reason: "units-not-returned",
+  });
+  result.detachmentImpact = await fetchAssetKitDetachmentImpact(tx, emptiedIds);
+  await mergeStandaloneCollisionsForKitDetachment(tx, emptiedIds);
+  await preserveKitDrivenPlacements(tx, emptiedIds);
+  await tx.assetKit.deleteMany({
+    where: { id: { in: emptiedIds }, organizationId },
+  });
+
+  await recordEvents(
+    emptied.map((membership) => ({
+      organizationId,
+      actorUserId,
+      action: "ASSET_KIT_CHANGED" as const,
+      entityType: "ASSET" as const,
+      entityId: membership.assetId,
+      assetId: membership.assetId,
+      kitId: membership.kitId,
+      bookingId,
+      field: "kitId",
+      fromValue: membership.kitId,
+      toValue: null,
+      // The units the membership held before they were destroyed.
+      meta: { ...assetQtyMeta(membership.asset, membership.quantity) },
+    })),
+    tx
+  );
+
+  result.emptiedMemberships = emptied.map((membership) => ({
+    ...describeMembership(membership),
+    quantity: membership.quantity,
+  }));
+  return result;
+}
+
+export async function buildKitCustodyInheritData({
+  tx,
+  kitId,
+  kitCustodyId,
+  teamMemberId,
+  assetIds,
+}: {
+  tx: KitCustodyInheritTxClient;
+  /** The Kit whose custody is being assigned. Used to find each asset's
+   * per-kit AssetKit.quantity. */
+  kitId: string;
+  kitCustodyId: string;
+  teamMemberId: string;
+  assetIds: string[];
+}): Promise<Prisma.CustodyCreateManyInput[]> {
+  if (assetIds.length === 0) return [];
+
+  const assets = await tx.asset.findMany({
+    // Archived members never inherit kit custody (issue #382). Callers take
+    // the archive row lock on `assetIds` first, so this read also catches an
+    // archive that committed after the caller's own read.
+    // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: `assetIds` are resolved org-scoped by the caller (updateKitAssets fetches them via the org-scoped `where: { id: { in }, organizationId }` asset query) before this helper runs
+    where: { id: { in: assetIds }, archivedAt: null },
+    select: {
+      id: true,
+      type: true,
+      quantity: true,
+      // Pre-existing Custody rows (operator-allocated + any kit-allocated
+      // from previously-assigned kits) — needed for the strict cap below.
+      custody: { select: { quantity: true } },
+      // The kit's allocated slice is the primary source of truth;
+      // defensive `?.[0]` handles the case where the row is missing
+      // (shouldn't happen — caller passes assetIds that belong to this
+      // kit — but we'd rather skip than crash).
+      assetKits: {
+        where: { kitId },
+        select: { quantity: true },
+      },
+    },
+  });
+
+  const rows: Prisma.CustodyCreateManyInput[] = [];
+  for (const asset of assets) {
+    if (asset.type !== AssetType.QUANTITY_TRACKED) {
+      rows.push({
+        teamMemberId,
+        assetId: asset.id,
+        kitCustodyId,
+        quantity: 1,
+      });
+      continue;
+    }
+
+    // Read the kit's allocated slice from `AssetKit`, then cap by
+    // `Asset.quantity − sum(pre-existing Custody)` so kit-inherited
+    // custody never overlaps operator-assigned custody on the same
+    // asset. Once the picker is the only way to mutate
+    // `AssetKit.quantity`, the cap is a no-op (`AssetKit.quantity` will
+    // already be ≤ that ceiling), but it stays correct when
+    // `AssetKit.quantity` is the asset's full pool from the backfill
+    // while operator custody exists separately.
+    //
+    // Defensive `?.` on `assetKits` itself — older test fixtures don't
+    // include the relation in their mock asset shape; the production
+    // code path always pulls it via the select above.
+    const kitSlice = asset.assetKits?.[0]?.quantity ?? 0;
+    if (kitSlice <= 0) continue;
+
+    const preExistingCustody = asset.custody.reduce(
+      (sum, row) => sum + (row.quantity ?? 0),
+      0
+    );
+    const availableCeiling = (asset.quantity ?? 0) - preExistingCustody;
+    const quantity = Math.max(0, Math.min(kitSlice, availableCeiling));
+    if (quantity <= 0) continue;
+
+    rows.push({
+      teamMemberId,
+      assetId: asset.id,
+      kitCustodyId,
+      quantity,
+    });
+  }
+  return rows;
+}
+
+export async function createKit({
+  name,
+  description,
+  createdById,
+  organizationId,
+  qrId,
+  categoryId,
+  locationId,
+  barcodes,
+}: Pick<
+  Kit,
+  | "name"
+  | "description"
+  | "createdById"
+  | "organizationId"
+  | "categoryId"
+  | "locationId"
+> & {
+  qrId?: Qr["id"];
+  barcodes?: Pick<Barcode, "type" | "value">[];
+}) {
+  try {
+    /** User connection data */
+    const user = {
+      connect: {
+        id: createdById,
+      },
+    };
+
+    const organization = {
+      connect: {
+        id: organizationId as string,
+      },
+    };
+
+    /**
+     * If a qr code is passed, link to that QR
+     * Otherwise, create a new one
+     * Here we also need to double check:
+     * 1. If the qr code exists
+     * 2. If the qr code belongs to the current organization
+     * 3. If the qr code is not linked to an asset
+     */
+    const qr = qrId ? await getQr({ id: qrId }) : null;
+    const qrCodes =
+      qr &&
+      qr.organizationId === organizationId &&
+      qr.assetId === null &&
+      qr.kitId === null
+        ? { connect: { id: qrId } }
+        : {
+            create: [
+              {
+                id: id(),
+                version: 0,
+                errorCorrection: ErrorCorrection["L"],
+                user,
+                organization,
+              },
+            ],
+          };
+
+    // why: categoryId comes from form input — prove it belongs to this
+    // kit's org before connecting, else an attacker links a foreign
+    // tenant's category (cross-org IDOR)
+    if (categoryId) {
+      await assertCategoryBelongsToOrg({ categoryId, organizationId });
+    }
+
+    const data: Prisma.KitCreateInput = {
+      name,
+      description,
+      createdBy: user,
+      organization,
+      qrCodes,
+      category: categoryId ? { connect: { id: categoryId } } : undefined,
+    };
+
+    /** If barcodes are passed, create them */
+    if (barcodes && barcodes.length > 0) {
+      const barcodesToAdd = barcodes.filter(
+        (barcode) => !!barcode.value && !!barcode.type
+      );
+
+      Object.assign(data, {
+        barcodes: {
+          create: barcodesToAdd.map(({ type, value }) => ({
+            type,
+            // Normalize per type (ExternalQR keeps its case, others uppercase)
+            // so stored kit barcodes match what filters/lookups expect — same
+            // rule the asset create path uses via `normalizeBarcodeValue`.
+            value: normalizeBarcodeValue(type, value),
+            organizationId,
+          })),
+        },
+      });
+    }
+
+    if (locationId) {
+      // why: locationId comes from form input — prove it belongs to this
+      // kit's org before connecting (cross-org IDOR guard)
+      await assertLocationBelongsToOrg({ locationId, organizationId });
+      data.location = { connect: { id: locationId } };
+    }
+
+    // Use transaction to ensure kit creation and activity event are atomic
+    const kit = await db.$transaction(async (tx) => {
+      const created = await tx.kit.create({ data });
+
+      // Activity event must be inside transaction for atomicity
+      await recordEvent(
+        {
+          organizationId,
+          actorUserId: createdById,
+          action: "KIT_CREATED",
+          entityType: "KIT",
+          entityId: created.id,
+          kitId: created.id,
+        },
+        tx
+      );
+
+      return created;
+    });
+
+    return kit;
+  } catch (cause) {
+    // If it's a Prisma unique constraint violation on barcode values,
+    // use our detailed validation to provide specific field errors
+    if (cause instanceof Error && "code" in cause && cause.code === "P2002") {
+      const prismaError = cause as any;
+      const target = prismaError.meta?.target;
+
+      if (
+        target &&
+        target.includes("value") &&
+        barcodes &&
+        barcodes.length > 0
+      ) {
+        const barcodesToAdd = barcodes.filter(
+          (barcode) => !!barcode.value && !!barcode.type
+        );
+        if (barcodesToAdd.length > 0) {
+          // Use existing validation function for detailed error messages
+          await validateBarcodeUniqueness(barcodesToAdd, organizationId);
+        }
+      }
+    }
+
+    throw maybeUniqueConstraintViolation(cause, "Kit", {
+      additionalData: { userId: createdById, organizationId },
+    });
+  }
+}
+
+export async function updateKit({
+  id,
+  name,
+  description,
+  image,
+  imageExpiration,
+  status,
+  createdById,
+  organizationId,
+  categoryId,
+  barcodes,
+  locationId,
+}: UpdateKitPayload) {
+  try {
+    const data: Prisma.KitUpdateInput = {
+      name,
+      description,
+      image,
+      imageExpiration,
+      status,
+    };
+
+    /** If uncategorized is passed, disconnect the category */
+    if (categoryId === "uncategorized") {
+      Object.assign(data, {
+        category: {
+          disconnect: true,
+        },
+      });
+    }
+
+    // If category id is passed and is different than uncategorized, connect the category
+    if (categoryId && categoryId !== "uncategorized") {
+      // why: categoryId comes from form input — prove it belongs to this
+      // kit's org before connecting (cross-org IDOR guard)
+      await assertCategoryBelongsToOrg({ categoryId, organizationId });
+      Object.assign(data, {
+        category: {
+          connect: {
+            id: categoryId,
+          },
+        },
+      });
+    }
+
+    if (locationId) {
+      // Setting `Kit.locationId` here would move the kit without moving its
+      // member assets — the cascade (and its per-asset events/notes) lives in
+      // `updateKitLocation`. Routing a location change through this function
+      // is how kit members silently drifted from their kit's location, so
+      // reject it instead of writing a half-applied change.
+      throw new ShelfError({
+        cause: null,
+        message:
+          "A kit's location cannot be changed through updateKit — call updateKitLocation so the kit's assets move with it.",
+        label,
+        additionalData: { kitId: id, locationId, organizationId },
+      });
+    }
+
+    const kit = await db.kit.update({
+      where: { id, organizationId },
+      data,
+    });
+
+    /** If barcodes are passed, update existing barcodes efficiently */
+    if (barcodes !== undefined) {
+      await updateBarcodes({
+        barcodes,
+        kitId: id,
+        organizationId,
+        userId: createdById,
+      });
+    }
+
+    await recordEvent({
+      organizationId,
+      actorUserId: createdById,
+      action: "KIT_UPDATED",
+      entityType: "KIT",
+      entityId: kit.id,
+      kitId: kit.id,
+    });
+
+    return kit;
+  } catch (cause) {
+    // If it's already a ShelfError with validation errors, re-throw as is
+    if (
+      cause instanceof ShelfError &&
+      cause.additionalData?.[VALIDATION_ERROR]
+    ) {
+      throw cause;
+    }
+
+    throw maybeUniqueConstraintViolation(cause, "Kit", {
+      additionalData: { userId: createdById, id },
+    });
+  }
+}
+
+export async function updateKitImage({
+  request,
+  kitId,
+  userId,
+  organizationId,
+}: {
+  request: Request;
+  kitId: string;
+  userId: string;
+  organizationId: Kit["organizationId"];
+}) {
+  try {
+    const fileData = await parseFileFormData({
+      request,
+      bucketName: "kits",
+      newFileName: `${userId}/${kitId}/image-${dateTimeInUnix(Date.now())}`,
+      resizeOptions: {
+        width: 800,
+        withoutEnlargement: true,
+      },
+      maxFileSize: ASSET_MAX_IMAGE_UPLOAD_SIZE,
+    });
+
+    const image = fileData.get("image") as string;
+    if (!image) return;
+
+    const signedUrl = await createSignedUrl({
+      filename: image,
+      bucketName: "kits",
+    });
+
+    await updateKit({
+      id: kitId,
+      image: signedUrl,
+      imageExpiration: oneDayFromNow(),
+      createdById: userId,
+      organizationId,
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: isLikeShelfError(cause)
+        ? cause.message
+        : "Something went wrong while updating image for kit.",
+      additionalData: { kitId, userId, field: "image" },
+      label,
+    });
+  }
+}
+
+/**
+ * Re-signs expired Supabase signed image URLs for a set of kits, in place.
+ *
+ * Kit thumbnails are served via short-lived Supabase signed URLs. When a URL
+ * has expired, the `KitImage` component would otherwise fire a client-side
+ * refresh fetcher on mount — and on a multi-row report table that means one
+ * fetcher per expired row (a refresh storm). This mirrors
+ * `refreshExpiredAssetImages`: we re-sign server-side in the loader so rows
+ * carry fresh URLs and the client fetcher stays dormant.
+ *
+ * Kits are simpler than assets: a single `image` field, no separate
+ * thumbnail. Only a file inside the kit's own folder is re-signed (see
+ * `isOwnKitImagePath`). Failures are logged and skipped (the row keeps its stale URL and
+ * the client `KitImage` fallback still covers genuinely broken images), so a
+ * storage hiccup never fails the report.
+ *
+ * @param kits - Kits carrying `id`, `organizationId`, `image`, `imageExpiration`
+ * @returns The same array with fresh `image`/`imageExpiration` for any that were expired
+ */
+export async function refreshExpiredKitImages<
+  T extends {
+    id: string;
+    organizationId: string;
+    image: string | null;
+    imageExpiration: Date | null;
+  },
+>(kits: T[]): Promise<T[]> {
+  const now = new Date();
+  const expiredKits = kits.filter(
+    (k) => k.image && k.imageExpiration && new Date(k.imageExpiration) < now
+  );
+
+  if (expiredKits.length === 0) return kits;
+
+  /** Batch size keeps Supabase signed-URL calls bounded. */
+  const BATCH_SIZE = 10;
+
+  const refreshKit = async (kit: (typeof expiredKits)[number]) => {
+    try {
+      const imagePath = extractStoragePath(kit.image!, "kits");
+      // Only the kit's own file is re-signed: a stored URL naming any other
+      // path keeps its stale URL rather than gaining a fresh one.
+      if (!imagePath || !isOwnKitImagePath(imagePath, kit.id)) return null;
+
+      const newImageUrl = await createSignedUrl({
+        filename: imagePath,
+        bucketName: "kits",
+      });
+
+      // 72h expiration reduces how often the loader has to re-sign.
+      const newExpiration = threeDaysFromNow();
+
+      await db.kit.update({
+        where: { id: kit.id, organizationId: kit.organizationId },
+        data: { image: newImageUrl, imageExpiration: newExpiration },
+      });
+
+      return { id: kit.id, image: newImageUrl, imageExpiration: newExpiration };
+    } catch {
+      // Kit deleted, or file removed from storage between query and update —
+      // expected, not a bug. Log and skip; the row keeps its stale URL.
+      Logger.info(
+        `Failed to refresh image for kit ${kit.id}, proceeding with stale URL`
+      );
+      return null;
+    }
+  };
+
+  const refreshed = new Map<string, { image: string; imageExpiration: Date }>();
+  for (let i = 0; i < expiredKits.length; i += BATCH_SIZE) {
+    const batch = expiredKits.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(batch.map(refreshKit));
+    for (const result of results) {
+      if (result.status === "fulfilled" && result.value) {
+        refreshed.set(result.value.id, {
+          image: result.value.image,
+          imageExpiration: result.value.imageExpiration,
+        });
+      }
+    }
+  }
+
+  return kits.map((k) => {
+    const fresh = refreshed.get(k.id);
+    return fresh ? { ...k, ...fresh } : k;
+  });
+}
+
+/**
+ * Re-signs one kit's stored image and saves the new URL on the kit. Backs
+ * `POST /api/kit/refresh-image`, which `KitImage` calls when the URL it was
+ * rendered with has expired.
+ *
+ * The file to sign is read from the kit row, scoped to `organizationId`,
+ * never taken from the request, and only a file inside the kit's own folder
+ * is signed (see `isOwnKitImagePath`).
+ *
+ * @param args.kitId - The kit whose image to refresh
+ * @param args.organizationId - The caller's workspace; scopes the read and write
+ * @param args.userId - The caller, recorded on the update's activity event
+ * @returns The updated kit
+ * @throws {ShelfError} 404 when the kit is not in the workspace, has no image,
+ *   or stores a path outside its own folder
+ */
+export async function refreshKitImage({
+  kitId,
+  organizationId,
+  userId,
+}: {
+  kitId: Kit["id"];
+  organizationId: Kit["organizationId"];
+  userId: User["id"];
+}) {
+  const storedKit = await db.kit.findFirst({
+    where: { id: kitId, organizationId },
+    select: { image: true },
+  });
+
+  const imagePath = storedKit?.image
+    ? extractStoragePath(storedKit.image, "kits")
+    : null;
+
+  if (!imagePath || !isOwnKitImagePath(imagePath, kitId)) {
+    throw new ShelfError({
+      cause: null,
+      message: "Cannot find kit filename",
+      additionalData: { userId, kitId, organizationId },
+      label,
+      status: 404,
+      shouldBeCaptured: false,
+    });
+  }
+
+  const signedUrl = await createSignedUrl({
+    filename: imagePath,
+    bucketName: "kits",
+  });
+
+  return updateKit({
+    id: kitId,
+    image: signedUrl,
+    // Matches the 72h lifetime `createSignedUrl` signs with.
+    imageExpiration: threeDaysFromNow(),
+    createdById: userId,
+    organizationId,
+  });
+}
+
+export async function getPaginatedAndFilterableKits<
+  T extends Prisma.KitInclude,
+>({
+  request,
+  organizationId,
+  extraInclude,
+  currentBookingId,
+  canSeeAllCustody,
+  userId,
+}: {
+  request: LoaderFunctionArgs["request"];
+  organizationId: Organization["id"];
+  extraInclude?: T;
+  currentBookingId?: Booking["id"];
+  /**
+   * Resolved custody read-visibility, from `requirePermission`. Required rather
+   * than defaulted so every call site has to state which answer applies —
+   * a default would silently pick one for surfaces added later.
+   */
+  canSeeAllCustody: boolean;
+  /** The caller, whose own custody stays filterable regardless of the flag. */
+  userId: User["id"];
+}) {
+  // include. Treat either `assets` (legacy callers passing typed shapes
+  // that may still reference the old relation) or `assetKits` as the
+  // signal that the caller wants the asset list available for the
+  // hide-empty filter below.
+  function hasAssetsIncluded(
+    extraInclude?: Prisma.KitInclude
+  ): extraInclude is Prisma.KitInclude & { assetKits: boolean } {
+    return !!extraInclude?.assetKits;
+  }
+
+  const searchParams = getCurrentSearchParams(request);
+  const paramsValues = getParamsValues(searchParams);
+
+  const status =
+    searchParams.get("status") === "ALL"
+      ? null
+      : (searchParams.get("status") as KitStatus | null);
+  // `getAll`: the custodian control is a multi-select, so the URL carries one
+  // value per chosen custodian.
+  const requestedTeamMembers = searchParams.getAll("teamMember"); // custodians
+
+  const {
+    page,
+    perPageParam,
+    search,
+    hideUnavailable,
+    bookingFrom,
+    bookingTo,
+  } = paramsValues;
+
+  const cookie = await updateCookieWithPerPage(request, perPageParam);
+  const { perPage } = cookie;
+
+  /**
+   * `?teamMember=` is raw request input applied straight to a custody clause.
+   * Redacting the custodian from the response does not close this on its own:
+   * filtering by a colleague's id and reading which kits come back still
+   * reveals what that person holds. So narrow it to the caller's own id first,
+   * and refuse it outright when that leaves nothing — the shared helper returns
+   * an unmatchable id for that case rather than an empty list, which would read
+   * as "no filter" and quietly list every kit.
+   */
+  const teamMemberIds = await scopeCustodianFilterIds({
+    teamMemberIds: requestedTeamMembers,
+    canSeeAllCustody,
+    userId,
+    organizationId,
+  });
+
+  try {
+    const skip = page > 1 ? (page - 1) * perPage : 0;
+    const take = perPage >= 1 && perPage <= 100 ? perPage : 200;
+
+    const where: Prisma.KitWhereInput = { organizationId };
+
+    if (search) {
+      const searchTerm = search.toLowerCase().trim();
+      where.OR = [
+        // Search in kit name
+        { name: { contains: searchTerm, mode: "insensitive" } },
+        // Search in barcode values
+        {
+          barcodes: {
+            some: { value: { contains: searchTerm, mode: "insensitive" } },
+          },
+        },
+      ];
+    }
+
+    if (status) {
+      where.status = status;
+    }
+
+    if (teamMemberIds.length) {
+      Object.assign(where, {
+        custody: { custodianId: { in: teamMemberIds } },
+      });
+    }
+
+    if (currentBookingId && hideUnavailable) {
+      // "every asset in this kit matches X" predicate becomes
+      // "every AssetKit row's asset matches X".
+      //
+      // QUANTITY_TRACKED assets carry Custody rows for partial operator
+      // allocations on a single pooled asset (e.g. Pleb holds 4 of 80
+      // Pens). Those rows do *not* make the kit unavailable for
+      // booking — the booking system's own availability formula
+      // handles the math at checkout time. Only INDIVIDUAL custody
+      // means the physical item is unavailable. Mirrors the
+      // `getKitAvailabilityStatus` exemption + the kit picker fixes.
+      where.assetKits = {
+        every: {
+          asset: {
+            organizationId,
+            OR: [
+              { type: AssetType.QUANTITY_TRACKED },
+              { custody: { none: {} } },
+            ],
+          },
+        },
+      };
+
+      if (bookingFrom && bookingTo) {
+        /**
+         * Two questions decide whether another booking keeps a kit off this
+         * one, and each member type answers only one of them.
+         *
+         * An INDIVIDUAL member is one physical item, so any overlapping
+         * booking of that asset takes it, whichever kit or standalone row
+         * booked it (Rules 1 and 2).
+         *
+         * A QUANTITY_TRACKED member is a pool shared by several kits and the
+         * free stock. Each kit owns its own units (`AssetKit.quantity`), which
+         * no other slice draws on, so another kit's slice of the same pool says
+         * nothing about this kit. Its units are taken only when this kit's own
+         * slice is, which is the kit-level rule below. Check-out applies the
+         * same split: kit-driven slices are never measured against the pool.
+         */
+        const overlapsWindow: Prisma.BookingWhereInput["OR"] = [
+          { from: { lte: bookingTo }, to: { gte: bookingFrom } },
+          { from: { gte: bookingFrom }, to: { lte: bookingTo } },
+        ];
+
+        const kitWhere: Prisma.KitWhereInput[] = [
+          // Rule 1: an INDIVIDUAL member on an overlapping RESERVED booking
+          {
+            assetKits: {
+              none: {
+                asset: {
+                  type: AssetType.INDIVIDUAL,
+                  bookingAssets: {
+                    some: {
+                      booking: {
+                        id: { not: currentBookingId },
+                        status: BookingStatus.RESERVED,
+                        OR: overlapsWindow,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          // Rule 2: an INDIVIDUAL member on an overlapping ONGOING/OVERDUE
+          // booking, unless the kit is AVAILABLE (checked in from a partial
+          // check-in)
+          {
+            OR: [
+              { status: KitStatus.AVAILABLE },
+              {
+                assetKits: {
+                  none: {
+                    asset: {
+                      type: AssetType.INDIVIDUAL,
+                      bookingAssets: {
+                        some: {
+                          booking: {
+                            id: { not: currentBookingId },
+                            status: {
+                              in: [
+                                BookingStatus.ONGOING,
+                                BookingStatus.OVERDUE,
+                              ],
+                            },
+                            OR: overlapsWindow,
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        ];
+
+        /**
+         * The kit-level rule: another booking holds this kit through its own
+         * slices. Judged by `findKitsHeldByOtherBookings`, the same rule the
+         * booking writes refuse on and the row's availability label shows.
+         * `AssetKit` has no Prisma relation to its booking slices, so the held
+         * kits are resolved first and excluded here, keeping the page and the
+         * count on one `where`.
+         */
+        const heldKits = await findKitsHeldByOtherBookings({
+          bookingId: currentBookingId,
+          from: bookingFrom,
+          to: bookingTo,
+          organizationId,
+        });
+        if (heldKits.length > 0) {
+          kitWhere.push({ id: { notIn: heldKits.map((kit) => kit.id) } });
+        }
+
+        where.AND = kitWhere;
+      }
+    }
+
+    if (
+      currentBookingId &&
+      hideUnavailable === true &&
+      (!bookingFrom || !bookingTo)
+    ) {
+      throw new ShelfError({
+        cause: null,
+        message: "Booking dates are needed to hide unavailable kit.",
+        additionalData: { hideUnavailable, bookingFrom, bookingTo },
+        label,
+      });
+    }
+
+    const include = {
+      ...extraInclude,
+      ...KITS_INCLUDE_FIELDS,
+    } as MergeInclude<typeof KITS_INCLUDE_FIELDS, T>;
+
+    let [kits, totalKits, totalKitsWithoutAssets] = await Promise.all([
+      db.kit.findMany({
+        skip,
+        take,
+        where,
+        include,
+        // `id` breaks ties between kits created in the same instant, so a
+        // page boundary never moves between requests.
+        orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+      }),
+      db.kit.count({ where }),
+      // rows.
+      db.kit.count({
+        where: { organizationId, assetKits: { none: {} } },
+      }),
+    ]);
+
+    if (hideUnavailable && hasAssetsIncluded(extraInclude)) {
+      kits = kits.filter((kit) => {
+        // extraInclude is dynamic, so the kit shape is widened here.
+        // Cast to a minimal pivot shape rather than disabling type
+        // checks file-wide.
+        const ak = (kit as { assetKits?: unknown[] }).assetKits;
+        return Array.isArray(ak) && ak.length > 0;
+      });
+    }
+
+    const totalPages = Math.ceil(totalKits / perPage);
+
+    return {
+      page,
+      perPage,
+      kits,
+      totalKits: hideUnavailable
+        ? totalKits - totalKitsWithoutAssets
+        : totalKits,
+      totalPages,
+      search,
+    };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while fetching kits",
+      additionalData: { page, perPage, organizationId },
+      label,
+    });
+  }
+}
+
+type KitWithInclude<T extends Prisma.KitInclude | undefined> =
+  T extends Prisma.KitInclude
+    ? Prisma.KitGetPayload<{
+        include: MergeInclude<typeof GET_KIT_STATIC_INCLUDES, T>;
+      }>
+    : Prisma.KitGetPayload<{ include: typeof GET_KIT_STATIC_INCLUDES }>;
+
+// why: `const T` (TS 5.0+) preserves the literal type of the inline
+// `extraInclude` passed at the call site. Without it, T widens to
+// `Prisma.KitInclude` and consumers lose the deep shape (e.g.
+// `kit.assetKits[0].asset.status`), forcing `as unknown as {…}` casts.
+export async function getKit<const T extends Prisma.KitInclude | undefined>({
+  id,
+  organizationId,
+  extraInclude,
+  userOrganizations,
+  request,
+}: Pick<Kit, "id" | "organizationId"> & {
+  extraInclude?: T;
+  userOrganizations?: Pick<UserOrganization, "organizationId">[];
+  request?: Request;
+}) {
+  try {
+    const otherOrganizationIds = userOrganizations?.map(
+      (org) => org.organizationId
+    );
+
+    // Merge static includes with dynamic includes
+    const includes = {
+      ...GET_KIT_STATIC_INCLUDES,
+      ...extraInclude,
+    } as MergeInclude<typeof GET_KIT_STATIC_INCLUDES, T>;
+
+    const kit = await db.kit.findFirstOrThrow({
+      where: {
+        OR: [
+          { id, organizationId },
+          ...(userOrganizations?.length
+            ? [{ id, organizationId: { in: otherOrganizationIds } }]
+            : []),
+        ],
+      },
+      include: includes,
+    });
+
+    /* User is accessing the asset in the wrong organizations. In that case we need special 404 handlng. */
+    if (
+      userOrganizations?.length &&
+      kit.organizationId !== organizationId &&
+      otherOrganizationIds?.includes(kit.organizationId)
+    ) {
+      const redirectTo =
+        typeof request !== "undefined"
+          ? getRedirectUrlFromRequest(request)
+          : undefined;
+
+      throw new ShelfError({
+        cause: null,
+        title: "Kit not found",
+        message: "",
+        additionalData: {
+          model: "kit",
+          organization: userOrganizations.find(
+            (org) => org.organizationId === kit.organizationId
+          ),
+          redirectTo,
+        },
+        label,
+        status: 404,
+        shouldBeCaptured: false, // In this case we shouldnt be capturing the error
+      });
+    }
+
+    return kit as KitWithInclude<T>;
+  } catch (cause) {
+    const isShelfError = isLikeShelfError(cause);
+
+    throw new ShelfError({
+      cause,
+      title: "Kit not found",
+      message:
+        "The kit you are trying to access does not exist or you do not have permission to access it.",
+      additionalData: {
+        id,
+        ...(isShelfError ? cause.additionalData : {}),
+      },
+      label,
+      shouldBeCaptured: isShelfError
+        ? cause.shouldBeCaptured
+        : !isNotFoundError(cause),
+    });
+  }
+}
+
+export async function getAssetsForKits({
+  request,
+  organizationId,
+  extraWhere,
+  kitId,
+  ignoreFilters,
+  archivedFilter,
+}: {
+  request: LoaderFunctionArgs["request"];
+  organizationId: Organization["id"];
+  kitId: Kit["id"];
+  extraWhere?: Prisma.AssetWhereInput;
+  /** Set this to true if you don't want the search filters to be applied */
+  ignoreFilters?: boolean;
+  /**
+   * Which members to list by archive state. Resolve it with
+   * `resolveArchivedViewForMember`, so it follows the member's grant.
+   */
+  archivedFilter: ArchivedFilter;
+}) {
+  const searchParams = getCurrentSearchParams(request);
+  const paramsValues = getParamsValues(searchParams);
+  const { page, perPageParam, search, orderBy, orderDirection } = paramsValues;
+
+  const cookie = await updateCookieWithPerPage(request, perPageParam);
+  const { perPage } = cookie;
+
+  try {
+    const skip = page > 1 ? (page - 1) * perPage : 0;
+    const take = perPage >= 1 && perPage <= 100 ? perPage : 20; // min 1 and max 100 per page
+
+    // `AssetKit` pivot. Filter through the pivot instead.
+    const where: Prisma.AssetWhereInput = {
+      organizationId,
+      assetKits: { some: { kitId } },
+    };
+    applyArchivedFilter(where, archivedFilter);
+
+    if (search && !ignoreFilters) {
+      const searchTerm = search.toLowerCase().trim();
+      where.OR = [
+        // Search in asset title
+        { title: { contains: searchTerm, mode: "insensitive" } },
+        // Search in asset barcodes
+        {
+          barcodes: {
+            some: { value: { contains: searchTerm, mode: "insensitive" } },
+          },
+        },
+      ];
+    }
+
+    const finalQuery = {
+      ...where,
+      ...extraWhere,
+    };
+
+    const [items, totalItems] = await Promise.all([
+      db.asset.findMany({
+        skip,
+        take,
+        where: finalQuery,
+        select: KIT_SELECT_FIELDS_FOR_LIST_ITEMS,
+        // Stable `id` tiebreaker for deterministic skip/take paging when rows
+        // tie on the sort key (see the matching comment in
+        // asset/service.server.ts). Skipped when already sorting by id.
+        orderBy: [
+          { [orderBy]: orderDirection },
+          ...(orderBy !== "id" ? [{ id: "asc" as const }] : []),
+        ],
+      }),
+      db.asset.count({ where: finalQuery }),
+    ]);
+
+    const totalPages = Math.ceil(totalItems / perPage);
+
+    return { page, perPage, search, items, totalItems, totalPages };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Fail to fetch paginated and filterable assets",
+      additionalData: {
+        organizationId,
+        paramsValues,
+      },
+      label,
+    });
+  }
+}
+
+/**
+ * Pre-fetched kit shape consumed by `performKitDeletion`. Kept loose
+ * (just the fields the helper actually reads) so both single + bulk
+ * call sites can share the same pipeline.
+ */
+type KitForDeletion = {
+  id: Kit["id"];
+  name: Kit["name"];
+  image: Kit["image"];
+  // `type` + `unitOfMeasure` let us render the per-row unit count for
+  // QUANTITY_TRACKED assets in the release note ("custody of 50 units");
+  // the actual custody quantity is read from the inherited Custody rows
+  // below. `kitQuantity` is this kit's per-row AssetKit.quantity (NOT
+  // Asset.quantity) — surfaced in the cascade ASSET_KIT_CHANGED event meta.
+  assets: Array<{
+    id: string;
+    title: string;
+    type: AssetType;
+    unitOfMeasure: string | null;
+    kitQuantity: number;
+  }>;
+  custody: {
+    id: string;
+    custodian: {
+      id: string;
+      name: string;
+      user: {
+        id: string;
+        firstName: string | null;
+        lastName: string | null;
+        displayName: string | null;
+      } | null;
+    };
+  } | null;
+};
+
+/**
+ * Shared deletion pipeline for `deleteKit` + `bulkDeleteKits`.
+ *
+ * Whether you're deleting one kit or many, the steps are identical:
+ *   1. Pre-read inherited Custody rows (so we can emit
+ *      `CUSTODY_RELEASED` events before the FK cascade wipes them).
+ *   2. Inside a transaction:
+ *      a. Emit one `CUSTODY_RELEASED` event per inherited row, tagged
+ *         with the source kit + custodian for audit.
+ *      b. Delete the kits — FK cascades clean up
+ *         `Kit → KitCustody → Custody` and `Asset.kitId` is set null.
+ *      c. Conditional status flip: only assets with **zero** remaining
+ *         Custody rows after the cascade drop to `AVAILABLE`. Assets
+ *         with surviving operator custody (Phase 2 multi-custodian)
+ *         keep `IN_CUSTODY` so we don't lie about state.
+ *      d. Write one history line per member: the custody release line for
+ *         a member whose custody the deletion released, otherwise a line
+ *         saying the deletion removed it from the kit.
+ *   3. Outside the tx (best-effort): delete each kit's stored image (see
+ *      `deleteKitImage`).
+ *
+ * @param args.kits - Pre-fetched kits with the shape above. Caller is
+ *   responsible for org-scoping the read.
+ * @param args.organizationId - Used for status-flip scoping + event meta.
+ * @param args.userId - Actor for events + note attribution.
+ */
+async function performKitDeletion({
+  kits,
+  organizationId,
+  userId,
+}: {
+  kits: KitForDeletion[];
+  organizationId: Kit["organizationId"];
+  userId: string;
+}) {
+  if (kits.length === 0) return;
+
+  const kitIdsToDelete = kits.map((k) => k.id);
+  const inCustodyKits = kits.filter((k) => !!k.custody);
+  const allAssetIds = kits.flatMap((k) => k.assets.map((a) => a.id));
+
+  // Resolve the actor once for the member notes, written for every deleted
+  // kit that held assets.
+  let actorLink = "";
+  if (allAssetIds.length > 0) {
+    const actor = await getUserByID(userId, {
+      select: {
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      } satisfies Prisma.UserSelect,
+    });
+    actorLink = wrapUserLinkForNote({ ...actor, id: userId });
+  }
+
+  // Units released per kit custody and asset, sourced from the inherited
+  // Custody rows read inside the tx. Populated below; consumed by the
+  // release notes written after the tx (which only have `k.assets`, not the
+  // Custody rows, in scope). Keyed by kit custody too: a quantity-tracked
+  // asset in two deleted kits holds a different count in each. Empty for
+  // INDIVIDUAL-only deletes.
+  const releasedQty = new Map<string, number | null>();
+  const releasedQtyKey = (kitCustodyId: string, assetId: string) =>
+    `${kitCustodyId}:${assetId}`;
+
+  await db.$transaction(async (tx) => {
+    const kitCustodyIds = inCustodyKits
+      .map((k) => k.custody?.id)
+      .filter((id): id is string => Boolean(id));
+
+    if (kitCustodyIds.length > 0) {
+      const inheritedCustodyRows = await tx.custody.findMany({
+        where: { kitCustodyId: { in: kitCustodyIds } },
+        select: {
+          assetId: true,
+          teamMemberId: true,
+          kitCustodyId: true,
+          // The units this kit moved into custody — drives the
+          // qty-tracked unit count in both the CUSTODY_RELEASED event
+          // meta and the release note below.
+          quantity: true,
+        },
+      });
+
+      if (inheritedCustodyRows.length > 0) {
+        // Map each row's source kit so events carry the correct
+        // `kitId` + `targetUserId`.
+        const kitByKitCustodyId = new Map(
+          inCustodyKits.map((k) => [k.custody!.id, k])
+        );
+
+        // Asset shape (type / unitOfMeasure) for the qty-tracked unit count.
+        // The Custody rows only carry `assetId`, so look the asset up here.
+        const assetById = new Map(
+          kits.flatMap((k) => k.assets).map((a) => [a.id, a])
+        );
+
+        // Record the released quantity per asset so the post-tx note can
+        // name "custody of 50 units" without re-reading the Custody rows.
+        for (const row of inheritedCustodyRows) {
+          releasedQty.set(
+            releasedQtyKey(row.kitCustodyId!, row.assetId),
+            row.quantity
+          );
+        }
+
+        await recordEvents(
+          inheritedCustodyRows.map((row) => {
+            const sourceKit = kitByKitCustodyId.get(row.kitCustodyId!);
+            const asset = assetById.get(row.assetId);
+            return {
+              organizationId,
+              actorUserId: userId,
+              action: "CUSTODY_RELEASED" as const,
+              entityType: "ASSET" as const,
+              entityId: row.assetId,
+              assetId: row.assetId,
+              kitId: sourceKit?.id,
+              teamMemberId: row.teamMemberId,
+              targetUserId:
+                sourceKit?.custody?.custodian?.user?.id ?? undefined,
+              meta: {
+                viaKit: true,
+                viaKitDelete: true,
+                ...(asset ? assetQtyMeta(asset, row.quantity) : {}),
+              },
+            };
+          }),
+          tx
+        );
+      }
+    }
+
+    // Activity events: one ASSET_KIT_CHANGED per kit membership the cascade
+    // removes. A quantity-tracked asset in two deleted kits gets one event
+    // per kit, each naming that kit and its slice. Emitted before the
+    // deleteMany so the AssetKit pivot rows are still readable for context.
+    if (allAssetIds.length > 0) {
+      await recordEvents(
+        kits.flatMap((k) =>
+          k.assets.map((asset) => ({
+            organizationId,
+            actorUserId: userId,
+            action: "ASSET_KIT_CHANGED" as const,
+            entityType: "ASSET" as const,
+            entityId: asset.id,
+            assetId: asset.id,
+            kitId: k.id,
+            field: "kitId",
+            fromValue: k.id,
+            toValue: null,
+            // Qty-tracked: the per-row AssetKit.quantity held in the deleted
+            // kit (NOT Asset.quantity); {} for INDIVIDUAL.
+            meta: { ...assetQtyMeta(asset, asset.kitQuantity) },
+          }))
+        ),
+        tx
+      );
+    }
+
+    // Deleting the kit cascades Kit → AssetKit → AssetLocation, which would
+    // unplace every member. Convert the kit-driven placements to manual ones
+    // first so the assets stay where the kit left them.
+    const aksToDelete = await tx.assetKit.findMany({
+      where: { kitId: { in: kitIdsToDelete }, organizationId },
+      select: { id: true },
+    });
+    const aksToDeleteIds = aksToDelete.map((ak: { id: string }) => ak.id);
+
+    // A booking that hasn't started tracks the kit's contents, so deleting the
+    // kit takes its slices with it rather than leaving loose assets behind.
+    // Runs before the merge so that only surviving rows are merged.
+    await removeKitSlicesFromPlanningBookings(tx, aksToDeleteIds, {
+      actorUserId: userId,
+      organizationId,
+      // The asset never left the kit here — the kit stopped existing.
+      reason: "kit-deleted",
+    });
+    // The merge was missing here: an asset held BOTH standalone and via the kit
+    // on the same booking made the `SET NULL` cascade trip
+    // `BookingAsset_manual_unique`, rolling back the whole kit deletion with a
+    // P2002. Same guard the membership-removal paths already run.
+    await mergeStandaloneCollisionsForKitDetachment(tx, aksToDeleteIds);
+    await preserveKitDrivenPlacements(tx, aksToDeleteIds);
+
+    await tx.kit.deleteMany({
+      where: { id: { in: kitIdsToDelete }, organizationId },
+    });
+
+    if (allAssetIds.length > 0) {
+      const assetsWithRemainingCustody = await tx.custody.findMany({
+        where: { assetId: { in: allAssetIds } },
+        select: { assetId: true },
+      });
+      const stillCustodiedAssetIds = new Set(
+        assetsWithRemainingCustody.map((c) => c.assetId)
+      );
+      const assetsToFlipAvailable = allAssetIds.filter(
+        (assetId) => !stillCustodiedAssetIds.has(assetId)
+      );
+      await releaseAssetsToAvailableUnlessCheckedOut(
+        tx,
+        assetsToFlipAvailable,
+        organizationId
+      );
+    }
+
+    // One history line per member, per deleted kit, written with the delete
+    // so the two commit or roll back together. A member whose custody this
+    // deletion released gets the release line, naming the kit and its own
+    // released unit count ("custody of 50 units"). Every other member gets a
+    // line saying the deletion removed it from the kit: members of a kit with
+    // no custody, and members of an in-custody kit that held no inherited
+    // custody row (archived members, a quantity-tracked slice with no units
+    // in custody).
+    // why: org-scoping is implicit: `kits`/`k.assets` are derived from the
+    // org-scoped kit reads at the call sites, never request input.
+    const noteData = kits.flatMap((k) => {
+      const kitName = stripMarkdocDelimiters(k.name);
+      const kitCustody = k.custody;
+      const custodianDisplay = kitCustody?.custodian
+        ? wrapCustodianForNote({ teamMember: kitCustody.custodian })
+        : "**Unknown Custodian**";
+      return k.assets.map((asset) => {
+        const releaseKey = kitCustody
+          ? releasedQtyKey(kitCustody.id, asset.id)
+          : null;
+        if (releaseKey && releasedQty.has(releaseKey)) {
+          const count = formatUnitCount(asset, releasedQty.get(releaseKey));
+          const custodyPhrase = count ? `custody of ${count}` : "custody";
+          return {
+            content: `${actorLink} released ${custodianDisplay}'s ${custodyPhrase} when kit **${kitName}** was deleted.`,
+            type: "UPDATE" as const,
+            userId,
+            assetId: asset.id,
+          };
+        }
+        const count = formatUnitCount(asset, asset.kitQuantity);
+        return {
+          content: `${actorLink} deleted kit **${kitName}**, which removed ${
+            count ?? "this asset"
+          } from it.`,
+          type: "UPDATE" as const,
+          userId,
+          assetId: asset.id,
+        };
+      });
+    });
+    if (noteData.length > 0) {
+      await tx.note.createMany({ data: noteData });
+    }
+  });
+
+  const kitWithImages = kits.filter((k) => !!k.image);
+  await Promise.all(
+    kitWithImages.map((k) => deleteKitImage({ url: k.image!, kitId: k.id }))
+  );
+}
+
+/**
+ * Refuses a single kit delete unless the user typed its name, as the delete
+ * dialog asks. A kit that is already gone passes, so the delete itself
+ * reports it.
+ *
+ * @param params.id - The kit to delete
+ * @param params.organizationId - The caller's organization
+ * @param params.confirmation - What the user typed in the dialog
+ * @throws {ShelfError} 400 when the confirmation does not match
+ */
+export async function assertKitDeleteConfirmed({
+  id,
+  organizationId,
+  confirmation,
+}: {
+  id: string;
+  organizationId: string;
+  confirmation: string | null | undefined;
+}) {
+  await assertDeleteConfirmedFor({
+    confirmation,
+    findName: () =>
+      db.kit
+        .findFirst({ where: { id, organizationId }, select: { name: true } })
+        .then((kit) => kit?.name ?? null),
+    label,
+  });
+}
+
+export async function deleteKit({
+  id,
+  organizationId,
+  actorUserId,
+}: {
+  id: Kit["id"];
+  organizationId: Kit["organizationId"];
+  /**
+   * Actor for the activity events + system notes emitted when a
+   * **kit-in-custody** is deleted, and for the per-asset
+   * `ASSET_KIT_CHANGED` events fired for every asset that loses its
+   * kit on cascade. Renamed from `userId` to align with the rest of
+   * the activity-event call sites (see PR #2535).
+   */
+  actorUserId: string;
+}) {
+  try {
+    const kitRow = await db.kit.findUniqueOrThrow({
+      where: { id, organizationId },
+      select: {
+        id: true,
+        name: true,
+        image: true,
+        assetKits: {
+          // type + unitOfMeasure feed the qty-tracked unit count in the
+          // kit-deletion release note (see performKitDeletion); quantity is
+          // this kit's per-row AssetKit.quantity for the cascade event meta.
+          select: {
+            quantity: true,
+            asset: {
+              select: {
+                id: true,
+                title: true,
+                type: true,
+                unitOfMeasure: true,
+              },
+            },
+          },
+        },
+        custody: {
+          select: {
+            id: true,
+            custodian: {
+              select: {
+                id: true,
+                name: true,
+                // why: wrapCustodianForNote / wrapUserLinkForNote use the
+                // first/last/displayName to render the linked-text in the
+                // resulting note; without them the fallback reads
+                // "Unknown User".
+                user: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                    displayName: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    // Flatten pivot rows into the in-memory `assets` shape that
+    // `performKitDeletion` consumes. `kitQuantity` carries the per-row
+    // AssetKit.quantity (NOT Asset.quantity) for the cascade event meta.
+    const kit = {
+      ...kitRow,
+      assets: (kitRow.assetKits ?? []).map((ak) => ({
+        ...ak.asset,
+        kitQuantity: ak.quantity,
+      })),
+    };
+
+    await performKitDeletion({
+      kits: [kit],
+      organizationId,
+      userId: actorUserId,
+    });
+
+    return kit;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while deleting kit",
+      additionalData: { id, organizationId, userId: actorUserId },
+      label,
+    });
+  }
+}
+
+/**
+ * Removes a kit's image file from storage. Best-effort: a failure is logged,
+ * never thrown, so a storage problem cannot fail the kit delete around it.
+ *
+ * Kit images live at `<uploaderUserId>/<kitId>/<file>` (see `updateKitImage`),
+ * and only a file inside `kitId`'s own folder is removed (see
+ * `isOwnKitImagePath`). A URL naming any
+ * other path in the bucket is refused, so a kit can never take another kit's
+ * file (or another workspace's) with it.
+ *
+ * @param args.url - The kit's stored `image` URL, read from the kit row
+ * @param args.kitId - The kit whose image this is
+ * @param args.bucketName - Storage bucket holding kit images
+ * @returns `true` once removed, `undefined` when refused or failed
+ */
+export async function deleteKitImage({
+  url,
+  kitId,
+  bucketName = "kits",
+}: {
+  url: string;
+  kitId: Kit["id"];
+  bucketName?: string;
+}) {
+  try {
+    const path = extractStoragePath(url, bucketName);
+    if (!path) {
+      throw new ShelfError({
+        cause: null,
+        message: "Cannot extract the image path from the URL",
+        additionalData: { url, kitId, bucketName },
+        label,
+      });
+    }
+
+    if (!isOwnKitImagePath(path, kitId)) {
+      throw new ShelfError({
+        cause: null,
+        message: "Refused to delete a kit image outside the kit's own folder",
+        additionalData: { kitId, path, bucketName },
+        label,
+      });
+    }
+
+    const { error } = await getSupabaseAdmin()
+      .storage.from(bucketName)
+      .remove([path]);
+
+    if (error) {
+      throw error;
+    }
+
+    return true;
+  } catch (cause) {
+    Logger.error(
+      new ShelfError({
+        cause,
+        message: "Failed to delete kit image",
+        additionalData: { url, kitId, bucketName },
+        label,
+      })
+    );
+  }
+}
+
+export async function releaseCustody({
+  kitId,
+  userId,
+  organizationId,
+}: {
+  kitId: Kit["id"];
+  userId: string;
+  organizationId: Kit["organizationId"];
+}) {
+  try {
+    const [kitRow, actor] = await Promise.all([
+      db.kit.findUniqueOrThrow({
+        where: { id: kitId, organizationId },
+        select: {
+          id: true,
+          name: true,
+          assetKits: {
+            // Archived members are left out of kit custody (issue #382), so
+            // the release has nothing to say or write about them.
+            where: { asset: { archivedAt: null } },
+            // type + unitOfMeasure power the qty-tracked unit count in the
+            // release note ("custody of 50 units"); the count itself comes
+            // from the inherited Custody rows captured inside the tx.
+            select: {
+              asset: {
+                select: {
+                  id: true,
+                  title: true,
+                  type: true,
+                  unitOfMeasure: true,
+                },
+              },
+            },
+          },
+          createdBy: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              displayName: true,
+            },
+          },
+          custody: {
+            select: {
+              id: true,
+              custodian: { include: { user: true } },
+            },
+          },
+        },
+      }),
+      getUserByID(userId, {
+        select: {
+          firstName: true,
+          lastName: true,
+          displayName: true,
+        } satisfies Prisma.UserSelect,
+      }),
+    ]);
+
+    // Flatten pivot rows so downstream code reads the same shape it
+    // did pre-pivot. Optional chaining tolerates fixtures / payloads
+    // that omit the pivot relation entirely.
+    const kit = {
+      ...kitRow,
+      assets: (kitRow.assetKits ?? []).map((ak) => ak.asset),
+    };
+
+    const actorLink = wrapUserLinkForNote({ ...actor, id: userId });
+    const custodianDisplay = kit.custody?.custodian
+      ? wrapCustodianForNote({ teamMember: kit.custody.custodian })
+      : "**Unknown Custodian**";
+    const kitLink = wrapLinkForNote(`/kits/${kit.id}`, kit.name.trim());
+
+    // Per-asset units released, populated inside the tx from the inherited
+    // Custody rows; consumed by the post-tx note (which has only `kit.assets`,
+    // not the Custody rows, in scope). Empty for INDIVIDUAL-only kits.
+    const releasedQtyByAssetId = new Map<string, number | null>();
+
+    // Use transaction for atomicity - prevents orphaned custody records on partial failure
+    // Activity events must be inside to ensure audit trail consistency
+    await db.$transaction(async (tx) => {
+      // Capture the kit-allocated Custody rows BEFORE the cascade so we can
+      // emit `CUSTODY_RELEASED` events for them. Filtering by `kitCustodyId`
+      // means operator-assigned custody on the same assets is left untouched
+      // when the FK cascade fires.
+      const kitCustodyId = kit.custody?.id;
+      const inheritedCustodyRows = kitCustodyId
+        ? await tx.custody.findMany({
+            where: { kitCustodyId },
+            select: {
+              assetId: true,
+              teamMemberId: true,
+              kitCustodyId: true,
+              // Units this kit released — drives the qty-tracked count in the
+              // CUSTODY_RELEASED event meta + the release note below.
+              quantity: true,
+            },
+          })
+        : [];
+
+      // Asset shape (type / unitOfMeasure) keyed by id, for the unit count.
+      const assetById = new Map(kit.assets.map((a) => [a.id, a]));
+
+      // Activity events emitted FIRST — recordEvents runs inside the tx so
+      // they roll back atomically if the kit-update below fails.
+      if (inheritedCustodyRows.length > 0) {
+        // Record released units per asset so the post-tx note can name them.
+        for (const row of inheritedCustodyRows) {
+          releasedQtyByAssetId.set(row.assetId, row.quantity);
+        }
+        await recordEvents(
+          inheritedCustodyRows.map((row) => {
+            const asset = assetById.get(row.assetId);
+            return {
+              organizationId,
+              actorUserId: userId,
+              action: "CUSTODY_RELEASED" as const,
+              entityType: "ASSET" as const,
+              entityId: row.assetId,
+              assetId: row.assetId,
+              kitId: kit.id,
+              teamMemberId: row.teamMemberId,
+              targetUserId: kit.custody?.custodian?.user?.id ?? undefined,
+              meta: {
+                viaKit: true,
+                ...(asset ? assetQtyMeta(asset, row.quantity) : {}),
+              },
+            };
+          }),
+          tx
+        );
+      }
+
+      // Delete kit custody and update kit status. Deleting the KitCustody
+      // row cascades to its child Custody rows (kitCustodyId FK) — no
+      // explicit `tx.custody.deleteMany` is needed any more.
+      await tx.kit.update({
+        where: { id: kitId, organizationId },
+        data: {
+          status: KitStatus.AVAILABLE,
+          custody: { delete: true },
+        },
+      });
+
+      // Only mark assets AVAILABLE if no operator-assigned custody remains.
+      // If an asset still has direct (non-kit) custody, it keeps IN_CUSTODY.
+      const assetIds = kit.assets.map((a) => a.id);
+      const assetsWithRemainingCustody = await tx.custody.findMany({
+        where: { assetId: { in: assetIds } },
+        select: { assetId: true },
+      });
+      const stillCustodiedAssetIds = new Set(
+        assetsWithRemainingCustody.map((c) => c.assetId)
+      );
+      const assetsToFlipAvailable = assetIds.filter(
+        (id) => !stillCustodiedAssetIds.has(id)
+      );
+      await releaseAssetsToAvailableUnlessCheckedOut(
+        tx,
+        assetsToFlipAvailable,
+        organizationId
+      );
+    });
+
+    // Notes can be created outside transaction (not critical for consistency).
+    // One note per asset (not a shared string): qty-tracked assets each name
+    // their own released unit count ("custody of 50 units"); INDIVIDUAL assets
+    // keep the exact prior wording.
+    // why: notes target this kit's org-scoped assets — same-tenant by
+    // construction (kit was loaded with `organizationId` above).
+    const releaseNoteData = kit.assets.map((asset) => {
+      const count = formatUnitCount(asset, releasedQtyByAssetId.get(asset.id));
+      const custodyPhrase = count ? `custody of ${count}` : "custody";
+      return {
+        content: `${actorLink} released ${custodianDisplay}'s ${custodyPhrase} via kit: ${kitLink}.`,
+        type: "UPDATE" as const,
+        userId,
+        assetId: asset.id,
+      };
+    });
+    if (releaseNoteData.length > 0) {
+      await db.note.createMany({ data: releaseNoteData });
+    }
+
+    return kit;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while releasing the custody. Please try again or contact support.",
+      additionalData: { kitId },
+      label: "Custody",
+    });
+  }
+}
+
+/**
+ * Whether a booked slice is out right now.
+ *
+ * Read from the slice's own markers rather than `Asset.status`, which says the
+ * asset is out SOMEWHERE — true of a `QUANTITY_TRACKED` asset whichever kit
+ * took it. A live booking is not enough either: one stays ONGOING while other
+ * assets are away, long after this slice came back.
+ *
+ * A returning slice is the only thing that clears it, so absence of
+ * `checkedOutAt` is not evidence of absence: rows written before the markers
+ * existed carry neither, and read as out — which is what they are, on a booking
+ * still ONGOING. When the departure IS recorded, the check-in has to be no
+ * older than the departure it answers: a slice that came back and then went out
+ * again carries both, and the refreshed `checkedOutAt` is what says it is out
+ * now.
+ */
+function isSliceStillOut(slice: {
+  checkedOutAt: Date | null;
+  checkedInAt: Date | null;
+}): boolean {
+  if (!slice.checkedInAt) return true;
+  return slice.checkedOutAt !== null && slice.checkedInAt < slice.checkedOutAt;
+}
+
+/** The custodian of a booking, projected for a kit row's custody cell. */
+type KitBookingCustodian = {
+  custodianUser: Pick<
+    User,
+    "firstName" | "lastName" | "displayName" | "profilePicture"
+  > | null;
+  custodianTeamMember: { name: string } | null;
+};
+
+/**
+ * Resolves, for each of `kitIds`, the booking that currently holds THAT kit.
+ *
+ * Which slices hold which kit is decided by `resolveSliceKitIds`, the same
+ * rule that marks a kit checked out and releases it, so a kit this lookup
+ * reads as unheld is one nothing holds. A slice booked under one of the kit's
+ * membership rows (`assetKitId`) or under the kit itself (`sourceKitId`, which
+ * survives a detach) holds that kit and no other. A standalone slice holds the
+ * kits of its asset only when the asset is INDIVIDUAL: one physical unit out
+ * on its own leaves the kit incomplete. A standalone `QUANTITY_TRACKED` slice
+ * draws on the free pool and holds no kit, since one asset may sit in several
+ * kits at once.
+ *
+ * Costs two round-trips whatever the number of kits — the membership ids, then
+ * the slices — so a page of checked-out kits does not fan out per row.
+ *
+ * @param kitIds - The kits to resolve, typically one page's checked-out rows
+ * @returns Kit id → the holding booking's custodian, for kits that have one
+ */
+async function getBookingCustodiansHoldingKits(
+  kitIds: Kit["id"][],
+  organizationIds: Kit["organizationId"][]
+): Promise<Map<Kit["id"], KitBookingCustodian>> {
+  const membershipRows = await db.assetKit.findMany({
+    where: { kitId: { in: kitIds }, organizationId: { in: organizationIds } },
+    select: { id: true, kitId: true },
+  });
+  const kitIdByAssetKitId = new Map(
+    membershipRows.map((row) => [row.id, row.kitId])
+  );
+
+  const bookedSlices = await db.bookingAsset.findMany({
+    where: {
+      booking: {
+        status: { in: [BookingStatus.ONGOING, BookingStatus.OVERDUE] },
+        organizationId: { in: organizationIds },
+      },
+      OR: [
+        { sourceKitId: { in: kitIds } },
+        { assetKitId: { in: [...kitIdByAssetKitId.keys()] } },
+        {
+          sourceKitId: null,
+          assetKitId: null,
+          asset: {
+            type: AssetType.INDIVIDUAL,
+            assetKits: { some: { kitId: { in: kitIds } } },
+          },
+        },
+      ],
+    },
+    // Several live bookings can list one kit at once, and the first slice per
+    // kit names the custodian. Newest departure first makes that the booking
+    // the kit most recently left on, with ties broken on the booking id — the
+    // same order `getKitCurrentBooking` ranks by, so the index and the kit page
+    // name the same booking. Postgres sorts NULLs first on a descending sort,
+    // so a slice that never left is pushed to the end. The slice `id` only
+    // fixes row order within one booking, whose custodian is the same.
+    orderBy: [
+      { checkedOutAt: { sort: "desc", nulls: "last" } },
+      { bookingId: "asc" },
+      { id: "asc" },
+    ],
+    select: {
+      assetKitId: true,
+      sourceKitId: true,
+      // Departure markers. A booking stays ONGOING while other assets are
+      // away, so its status alone does not say this kit's units are still out.
+      // The comparison between the two is a column-to-column one that a Prisma
+      // `where` cannot express, so it is applied below.
+      checkedOutAt: true,
+      checkedInAt: true,
+      // What a standalone slice needs to name the kits it holds.
+      asset: { select: { type: true, assetKits: { select: { kitId: true } } } },
+      booking: {
+        select: {
+          custodianTeamMember: { select: { name: true } },
+          custodianUser: {
+            select: {
+              firstName: true,
+              lastName: true,
+              displayName: true,
+              profilePicture: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  const requestedKitIds = new Set(kitIds);
+  const custodianByKitId = new Map<Kit["id"], KitBookingCustodian>();
+
+  for (const slice of bookedSlices) {
+    if (!isSliceStillOut(slice)) continue;
+
+    const heldKitIds = resolveSliceKitIds(
+      {
+        assetKitId: slice.assetKitId,
+        sourceKitId: slice.sourceKitId,
+        assetType: slice.asset.type,
+        assetKits: slice.asset.assetKits,
+      },
+      kitIdByAssetKitId
+    );
+
+    for (const kitId of heldKitIds) {
+      if (!requestedKitIds.has(kitId) || custodianByKitId.has(kitId)) continue;
+      custodianByKitId.set(kitId, slice.booking);
+    }
+  }
+
+  return custodianByKitId;
+}
+
+/**
+ * Whether a kit row's projection already names a custodian of its own.
+ *
+ * `Kit` declares no `custody` field — it arrives through whatever `include` the
+ * caller asked for, so its presence is a fact about the projection rather than
+ * the model. Probing structurally reads it without widening the generic that
+ * every call site is bound to.
+ */
+function kitCarriesOwnCustodian(kit: Kit): boolean {
+  const custody = (kit as { custody?: { custodian?: unknown } | null }).custody;
+  return Boolean(custody?.custodian);
+}
+
+/**
+ * Fills a CHECKED_OUT kit's custody cell with the custodian of the booking
+ * holding it.
+ *
+ * A kit has no direct relation to a booking: it goes out through the slices its
+ * member assets contribute, so the custodian is read back from the booking
+ * those slices belong to — and only slices booked under this kit count, see
+ * {@link getBookingCustodiansHoldingKits}. A kit no booking holds keeps
+ * whatever custodian its own `custody` row names.
+ *
+ * Kits in any other status are returned untouched, by reference.
+ *
+ * @param kits - Kit rows to annotate; every other field is preserved as-is
+ * @returns The same rows, with booking custody filled in where one applies
+ * @throws {ShelfError} If the custodian lookup fails
+ */
+export async function updateKitsWithBookingCustodians<T extends Kit>(
+  kits: T[]
+): Promise<T[]> {
+  try {
+    /** When kits are checked out, we have to display the custodian from that booking */
+    const checkedOutKitIds = kits
+      .filter((kit) => kit.status === KitStatus.CHECKED_OUT)
+      .map((kit) => kit.id);
+
+    if (checkedOutKitIds.length === 0) {
+      return kits;
+    }
+
+    // Org scope comes off the rows themselves — every `Kit` carries it — so the
+    // lookup cannot reach another workspace without widening the signature
+    // every call site is bound to.
+    const organizationIds = [...new Set(kits.map((kit) => kit.organizationId))];
+    const custodianByKitId = await getBookingCustodiansHoldingKits(
+      checkedOutKitIds,
+      organizationIds
+    );
+    const checkedOutKitIdSet = new Set(checkedOutKitIds);
+
+    return kits.map((kit): T => {
+      if (!checkedOutKitIdSet.has(kit.id)) {
+        return kit;
+      }
+
+      const holdingCustodian = custodianByKitId.get(kit.id);
+      const custodianUser = holdingCustodian?.custodianUser;
+      const custodianTeamMember = holdingCustodian?.custodianTeamMember;
+
+      if (custodianUser) {
+        return {
+          ...kit,
+          custody: {
+            custodian: {
+              // `user` goes through whole: a registered member is named from
+              // their user row, and a re-projection that drops `displayName`
+              // renames them everywhere this custodian is rendered.
+              name: resolveUserDisplayName(custodianUser),
+              user: custodianUser,
+            },
+          },
+        };
+      }
+
+      if (custodianTeamMember) {
+        return {
+          ...kit,
+          custody: { custodian: { name: custodianTeamMember.name } },
+        };
+      }
+
+      // A booking always names a custodian, so reaching here means no live
+      // booking holds this kit by any slice. The kit's own custody row is then
+      // the only holder there is. When that is empty too, the kit is stuck as
+      // CHECKED_OUT with nothing holding it, which needs a data repair.
+      if (!kitCarriesOwnCustodian(kit)) {
+        Logger.error(
+          new ShelfError({
+            cause: null,
+            message: "Could not find custodian for kit",
+            additionalData: { kit },
+            label,
+          })
+        );
+      }
+
+      return kit;
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to update kits with booking custodian",
+      additionalData: { kits },
+      label,
+    });
+  }
+}
+
+type CurrentBookingType = {
+  id: string;
+  name: string;
+  custodianUser: Pick<
+    User,
+    "id" | "firstName" | "lastName" | "displayName" | "profilePicture"
+  > | null;
+  custodianTeamMember: Pick<TeamMember, "name" | "userId"> | null;
+  status: BookingStatus;
+  from: Booking["from"];
+};
+
+/**
+ * The ongoing or overdue booking that currently holds a kit, if any.
+ *
+ * A kit goes out through the booking slices its member assets contribute. A
+ * slice counts when `resolveSliceKitIds` says it holds THIS kit: it was booked
+ * under one of the kit's live membership rows (`assetKitId`) or under the kit
+ * itself (`sourceKitId`, which survives a detach), or it is a standalone slice
+ * of an INDIVIDUAL member, whose absence leaves the kit incomplete. A
+ * standalone `QUANTITY_TRACKED` slice draws on the free pool and does not count.
+ *
+ * The slice must also still be out — see {@link isSliceStillOut}.
+ *
+ * Several live bookings can list the kit at once (an overdue booking it is
+ * still out on, and a later one that has started), so every qualifying slice is
+ * ranked rather than taking the first one found: the newest departure wins, a
+ * slice that never left ranks below any that did, and the booking id breaks
+ * ties. The slices arrive in no particular order, and the answer must not
+ * depend on it.
+ *
+ * @param kit - The kit with its membership rows and their assets' active slices
+ * @returns The booking holding a slice of this kit that is still out, or
+ *   `undefined`
+ */
+export function getKitCurrentBooking(kit: {
+  id: string;
+  assetKits: {
+    id: string;
+    asset: {
+      /** Decides whether a standalone slice of this member holds the kit. */
+      type: AssetType;
+      bookingAssets: {
+        assetKitId: string | null;
+        sourceKitId: string | null;
+        checkedOutAt: Date | null;
+        checkedInAt: Date | null;
+        booking: CurrentBookingType;
+      }[];
+    };
+  }[];
+}): CurrentBookingType | undefined {
+  const kitIdByAssetKitId = new Map(
+    kit.assetKits.map((membership) => [membership.id, kit.id])
+  );
+
+  const holdingSlices = kit.assetKits.flatMap((membership) =>
+    membership.asset.bookingAssets.filter(
+      (slice) =>
+        (slice.booking.status === BookingStatus.ONGOING ||
+          slice.booking.status === BookingStatus.OVERDUE) &&
+        resolveSliceKitIds(
+          {
+            assetKitId: slice.assetKitId,
+            sourceKitId: slice.sourceKitId,
+            assetType: membership.asset.type,
+            // The slice's asset is this membership's asset, so this kit is
+            // the membership a standalone slice would answer from.
+            assetKits: [{ kitId: kit.id }],
+          },
+          kitIdByAssetKitId
+        ).has(kit.id) &&
+        isSliceStillOut(slice)
+    )
+  );
+
+  const [newest] = holdingSlices.sort((a, b) => {
+    const aOut = a.checkedOutAt?.getTime() ?? null;
+    const bOut = b.checkedOutAt?.getTime() ?? null;
+    if (aOut !== bOut) {
+      if (aOut === null) return 1;
+      if (bOut === null) return -1;
+      return bOut - aOut;
+    }
+    // Plain code-unit order, as the database sorts these ids, never the
+    // runtime locale's.
+    if (a.booking.id === b.booking.id) return 0;
+    return a.booking.id < b.booking.id ? -1 : 1;
+  });
+
+  return newest?.booking;
+}
+
+export async function bulkDeleteKits({
+  kitIds,
+  organizationId,
+  userId,
+  currentSearchParams,
+  confirmation,
+}: {
+  kitIds: Kit["id"][];
+  organizationId: Kit["organizationId"];
+  userId: User["id"];
+  currentSearchParams?: string | null;
+  /**
+   * The number the user typed in the delete dialog. Must equal the number of
+   * kits this call removes, see {@link assertBulkDeleteConfirmed}.
+   */
+  confirmation: string | null | undefined;
+}) {
+  try {
+    /**
+     * If we are selecting all kits in the list then we have to consider filters too
+     */
+    const where: Prisma.KitWhereInput = kitIds.includes(ALL_SELECTED_KEY)
+      ? getKitsWhereInput({
+          organizationId,
+          currentSearchParams,
+          // `kit: delete` is ADMIN/OWNER-only (SELF_SERVICE holds only
+          // `kit: [read, custody]`), so no restricted viewer can supply
+          // this filter.
+          allowedTeamMemberIds: "all",
+        })
+      : { id: { in: kitIds }, organizationId };
+
+    const kitRows = await db.kit.findMany({
+      where,
+      select: {
+        id: true,
+        name: true,
+        image: true,
+        assetKits: {
+          // type + unitOfMeasure feed the qty-tracked unit count in the
+          // kit-deletion release note (see performKitDeletion); quantity is
+          // this kit's per-row AssetKit.quantity for the cascade event meta.
+          select: {
+            quantity: true,
+            asset: {
+              select: {
+                id: true,
+                title: true,
+                type: true,
+                unitOfMeasure: true,
+              },
+            },
+          },
+        },
+        custody: {
+          select: {
+            id: true,
+            custodian: {
+              select: {
+                id: true,
+                name: true,
+                // why: wrapCustodianForNote / wrapUserLinkForNote use the
+                // first/last/displayName to render the linked-text in the
+                // resulting note; without them the fallback reads
+                // "Unknown User".
+                user: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                    displayName: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    // Before any write: the typed count must be the number about to go.
+    assertBulkDeleteConfirmed({
+      selectedIds: kitIds,
+      confirmation,
+      matchedCount: kitRows.length,
+      noun: { one: "kit", many: "kits" },
+      label,
+    });
+
+    // Flatten pivot rows into the in-memory `assets` shape that
+    // `performKitDeletion` consumes. Main's PR #2535 added per-asset
+    // ASSET_KIT_CHANGED emission for the cascade unkit inside
+    // `bulkDeleteKits` — on our branch the equivalent emission lives in
+    // `performKitDeletion` so single + bulk paths share one
+    // implementation (see the recordEvents call there). `kitQuantity`
+    // carries the per-row AssetKit.quantity (NOT Asset.quantity) for the
+    // cascade event meta.
+    const kits = kitRows.map((k) => ({
+      ...k,
+      assets: (k.assetKits ?? []).map((ak) => ({
+        ...ak.asset,
+        kitQuantity: ak.quantity,
+      })),
+    }));
+
+    await performKitDeletion({
+      kits,
+      organizationId,
+      userId,
+    });
+  } catch (cause) {
+    // A refused confirmation carries the count to type in its additionalData.
+    rethrowIfClientError(cause);
+
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while bulk deleting kits.",
+      additionalData: { kitIds, organizationId, userId },
+      label,
+    });
+  }
+}
+
+export async function bulkAssignKitCustody({
+  kitIds,
+  organizationId,
+  custodianId,
+  custodianName,
+  userId,
+  currentSearchParams,
+  allowedTeamMemberIds,
+}: {
+  kitIds: Kit["id"][];
+  organizationId: Kit["organizationId"];
+  custodianId: TeamMember["id"];
+  custodianName: TeamMember["name"];
+  userId: User["id"];
+  currentSearchParams?: string | null;
+  /**
+   * Custodian ids the caller may filter a "select all" by.
+   *
+   * NOT `"all"`: this is reached through `kits.bulk-actions` with
+   * `PermissionAction.custody`, which SELF_SERVICE holds. An unscoped filter
+   * turns the "some kits are not available" rejection into an oracle for
+   * "does <teamMemberId> hold any kit".
+   */
+  allowedTeamMemberIds: AllowedCustodianFilterIds;
+}) {
+  try {
+    /**
+     * If we are selecting all assets in list then we have to consider filters
+     */
+    const where: Prisma.KitWhereInput = kitIds.includes(ALL_SELECTED_KEY)
+      ? getKitsWhereInput({
+          organizationId,
+          currentSearchParams,
+          allowedTeamMemberIds,
+        })
+      : { id: { in: kitIds }, organizationId };
+
+    /**
+     * We have to make notes and assign custody to all assets of a kit so we have to make this query.
+     * `type` and `quantity` are needed so qty-tracked assets get the asset's
+     * full tracked quantity on the inherited Custody row (Site 3 of the kit
+     * custody correctness fixes).
+     */
+    const [kits, user, custodianTeamMember] = await Promise.all([
+      db.kit.findMany({
+        where,
+        select: {
+          id: true,
+          name: true,
+          status: true,
+          // We include the kit's id/name on each asset row by
+          // re-projecting the parent kit, since the helper needs a
+          // {kit: {id, name}} shape downstream to render the note link.
+          // Archived members are out of service (issue #382): they take no
+          // custody, no status change, no note and no event.
+          assetKits: {
+            where: { asset: { archivedAt: null } },
+            select: {
+              asset: {
+                select: {
+                  id: true,
+                  title: true,
+                  status: true,
+                  type: true,
+                  quantity: true,
+                  unitOfMeasure: true,
+                },
+              },
+            },
+          },
+        },
+      }),
+      getUserByID(userId, {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          displayName: true,
+        } satisfies Prisma.UserSelect,
+      }),
+      db.teamMember.findFirst({
+        where: { id: custodianId, organizationId },
+        select: {
+          id: true,
+          name: true,
+          user: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              displayName: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    const someKitsNotAvailable = kits.some((kit) => kit.status !== "AVAILABLE");
+    if (someKitsNotAvailable) {
+      // User-input validation against a freshly-queried, real-time availability
+      // guard — not a server fault. A 400 keeps it out of the Sentry error
+      // pipeline (the outer catch inherits status/shouldBeCaptured from this
+      // cause). See SHELF-WEBAPP-226.
+      throw new ShelfError({
+        cause: null,
+        message:
+          "There are some unavailable kits. Please make sure you are selecting only available kits.",
+        label,
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    // Flatten the pivot rows into {asset, kit} pairs so downstream code
+    // (notes, activity events) can read both sides without changing
+    // shape.
+    const allAssetsOfAllKits = kits.flatMap((kit) =>
+      (kit.assetKits ?? []).map((ak) => ({
+        ...ak.asset,
+        kit: { id: kit.id, name: kit.name },
+      }))
+    );
+
+    // INDIVIDUAL assets block the assign; QUANTITY_TRACKED don't.
+    // `buildKitCustodyInheritData` writes the *remaining* pool per asset,
+    // so a qty-tracked asset whose row-level status is IN_CUSTODY (some
+    // units operator-held) still assigns the leftover quantity, and
+    // fully-allocated assets are silently skipped — neither needs to
+    // block here.
+    const someAssetsUnavailable = allAssetsOfAllKits.some(
+      (asset) =>
+        asset.type !== "QUANTITY_TRACKED" && asset.status !== "AVAILABLE"
+    );
+    if (someAssetsUnavailable) {
+      // Same handled-validation class as the unavailable-kits guard above:
+      // a 400, not a captured 500. See SHELF-WEBAPP-226.
+      throw new ShelfError({
+        cause: null,
+        message:
+          "There are some unavailable assets in some kits. Please make sure you have all available assets in kits.",
+        label,
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    /**
+     * updateMany does not allow to create nested relationship rows so we have
+     * to make two queries to assign custody over
+     * 1. Create custodies for kit
+     * 2. Update status of all kits to IN_CUSTODY
+     */
+    return await db.$transaction(async (tx) => {
+      // SECURITY (cross-org IDOR): custodianId comes from request input. The
+      // org-scoped lookup above is only used for the note text — the writes
+      // below connect the raw id, so prove it belongs to this org first or an
+      // attacker could assign a foreign-org team member as kit/asset custodian.
+      await assertTeamMemberBelongsToOrg(
+        { teamMemberId: custodianId, organizationId },
+        tx
+      );
+
+      // A kit a booking has out is with its borrower. `Kit.status` above
+      // cannot tell when only some of its units are out, so re-check the
+      // booking slices here, under the kit row lock, on the resolved ids.
+      await assertKitsCustodyAssignable(tx, {
+        kitIds: kits.map((kit) => kit.id),
+        organizationId,
+      });
+
+      // The archive row lock on every member, taken once and in sorted order,
+      // after the kit rows (above) and before any write, so an archive cannot
+      // commit between the members read above and the custody written below
+      // and leave an archived asset in custody (issue #382). The checks and
+      // the re-read below then see the truth.
+      await lockAssetsForArchiveGuard(
+        tx,
+        allAssetsOfAllKits.map((asset) => asset.id),
+        organizationId
+      );
+
+      // A kit whose members are all archived (or that has none) would go into
+      // custody while nothing in it does. Read under the lock above, so an
+      // archive cannot empty the kit after this check.
+      await assertKitsHaveActiveAssets(tx, {
+        kitIds: kits.map((kit) => kit.id),
+        organizationId,
+        action: "custody",
+      });
+
+      /** Creating custodies over kits */
+      await tx.kitCustody.createMany({
+        data: kits.map((kit) => ({
+          custodianId,
+          kitId: kit.id,
+        })),
+      });
+
+      /** Updating status of all kits */
+      await tx.kit.updateMany({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: `kits` ids come from the org-scoped findMany above (where includes organizationId via getKitsWhereInput / line 1189)
+        where: { id: { in: kits.map((kit) => kit.id) } },
+        data: { status: KitStatus.IN_CUSTODY },
+      });
+
+      /**
+       * `createMany` doesn't return rows, so re-query the just-created
+       * KitCustody rows to get their IDs. Each child Custody row is tagged
+       * with its parent's `kitCustodyId` so the kit→assets relationship is
+       * traceable and FK cascade can clean up on release.
+       */
+      const kitCustodyRows = await tx.kitCustody.findMany({
+        where: { kitId: { in: kits.map((kit) => kit.id) } },
+        select: { id: true, kitId: true },
+      });
+      const kitCustodyByKitId = new Map(
+        kitCustodyRows.map((kc) => [kc.kitId, kc.id])
+      );
+
+      /** If a kit is going to be in custody, then all it's assets should also inherit the same status */
+
+      /** Creating custodies over assets of kits — one row per (asset, kit-custody) */
+      const inheritDataPerKit = await Promise.all(
+        kits.map(async (kit) => {
+          const kitCustodyId = kitCustodyByKitId.get(kit.id);
+          if (!kitCustodyId) return [];
+          return buildKitCustodyInheritData({
+            tx,
+            kitId: kit.id,
+            kitCustodyId,
+            teamMemberId: custodianId,
+            assetIds: (kit.assetKits ?? []).map((ak) => ak.asset.id),
+          });
+        })
+      );
+      const inheritData = inheritDataPerKit.flat();
+      if (inheritData.length > 0) {
+        await tx.custody.createMany({ data: inheritData });
+      }
+
+      /**
+       * The members read before this transaction may have been archived since.
+       * Their archive lock is held (above), so this re-read is authoritative:
+       * only active members take the status, note and event.
+       */
+      const activeMemberIds = new Set(
+        (
+          await tx.asset.findMany({
+            where: {
+              id: { in: allAssetsOfAllKits.map((asset) => asset.id) },
+              organizationId,
+              archivedAt: null,
+            },
+            select: { id: true },
+          })
+        ).map((asset) => asset.id)
+      );
+      const custodyMembers = allAssetsOfAllKits.filter((asset) =>
+        activeMemberIds.has(asset.id)
+      );
+
+      // Per-(kit-custody, asset) inherited quantity — the units this kit
+      // actually moved into custody (kit slice capped by free pool), NOT the
+      // asset's total. Drives the qty-tracked unit count in the note + event.
+      const inheritedQtyByKey = new Map(
+        inheritData.map((row) => [
+          `${row.kitCustodyId}:${row.assetId}`,
+          row.quantity ?? 0,
+        ])
+      );
+      const inheritedQtyFor = (asset: { id: string; kit?: { id: string } }) => {
+        const kitCustodyId = asset.kit
+          ? kitCustodyByKitId.get(asset.kit.id)
+          : undefined;
+        return kitCustodyId
+          ? inheritedQtyByKey.get(`${kitCustodyId}:${asset.id}`)
+          : undefined;
+      };
+
+      // Guarded, and org-scoped by the helper.
+      // @see {@link file://./../asset/custody-status.server.ts}
+      await setCustodyDrivenAssetStatus(
+        tx,
+        custodyMembers.map((asset) => asset.id),
+        organizationId,
+        AssetStatus.IN_CUSTODY
+      );
+
+      /** Creating notes for all the assets of the kit */
+      const actor = wrapUserLinkForNote({ ...user, id: userId });
+      const custodianDisplay = custodianTeamMember
+        ? wrapCustodianForNote({ teamMember: custodianTeamMember })
+        : // Free-form fallback name, rendered as literal bold text.
+          `**${stripMarkdocDelimiters(custodianName)}**`;
+      await tx.note.createMany({
+        data: custodyMembers.map((asset) => {
+          const kitLink = asset.kit
+            ? wrapLinkForNote(`/kits/${asset.kit.id}`, asset.kit.name.trim())
+            : "**Unknown Kit**";
+          // For qty-tracked assets, name the unit count actually moved into
+          // custody ("custody of 50 units"); INDIVIDUAL phrasing is unchanged.
+          const count = formatUnitCount(asset, inheritedQtyFor(asset));
+          const custodyPhrase = count ? `custody of ${count}` : "custody";
+          return {
+            content: `${actor} granted ${custodianDisplay} ${custodyPhrase} via kit assignment ${kitLink}.`,
+            type: "UPDATE",
+            userId,
+            assetId: asset.id,
+          };
+        }),
+      });
+
+      // Activity events — one CUSTODY_ASSIGNED per asset, inside the tx.
+      // `meta.quantity` mirrors the quantity persisted on the child Custody
+      // row so reports can aggregate by units, not just rows.
+      await recordEvents(
+        custodyMembers.map((asset) => ({
+          organizationId,
+          actorUserId: userId,
+          action: "CUSTODY_ASSIGNED",
+          entityType: "ASSET",
+          entityId: asset.id,
+          assetId: asset.id,
+          kitId: asset.kit?.id ?? undefined,
+          teamMemberId: custodianId,
+          targetUserId: custodianTeamMember?.user?.id ?? undefined,
+          meta: {
+            viaKit: true,
+            ...assetQtyMeta(asset, inheritedQtyFor(asset)),
+          },
+        })),
+        tx
+      );
+    }, LONG_TRANSACTION_OPTIONS);
+  } catch (cause) {
+    const message =
+      cause instanceof ShelfError
+        ? cause.message
+        : "Something went wrong while bulk checking out kits.";
+
+    throw new ShelfError({
+      cause,
+      message,
+      additionalData: {
+        kitIds,
+        organizationId,
+        userId,
+        custodianId,
+        custodianName,
+      },
+      label,
+    });
+  }
+}
+
+export async function bulkReleaseKitCustody({
+  kitIds,
+  organizationId,
+  userId,
+  custodyAssign,
+  currentSearchParams,
+  allowedTeamMemberIds,
+}: {
+  kitIds: Kit["id"][];
+  organizationId: Kit["organizationId"];
+  userId: User["id"];
+  /**
+   * The caller's custody-assignment scope (`access.custody.assign`). With
+   * `"self"` the service refuses to touch custody of anyone but the caller,
+   * for every caller (web and mobile). Checked here against the RESOLVED
+   * kits: on a select-all the raw `kitIds` is `["all-selected"]`, which
+   * matches no custody row.
+   */
+  custodyAssign: RoleAccess["custody"]["assign"];
+  currentSearchParams?: string | null;
+  /** See the twin parameter on `bulkAssignKitCustody`. */
+  allowedTeamMemberIds: AllowedCustodianFilterIds;
+}) {
+  try {
+    /** If we are selecting all, then we have to consider filters */
+    const where: Prisma.KitWhereInput = kitIds.includes(ALL_SELECTED_KEY)
+      ? getKitsWhereInput({
+          organizationId,
+          currentSearchParams,
+          allowedTeamMemberIds,
+        })
+      : { id: { in: kitIds }, organizationId };
+
+    /**
+     * To make notes and release assets of kits we have to make this query.
+     *
+     * Kit assets come through the `AssetKit` pivot; we pull each asset
+     * row via `assetKits.asset` and re-attach the parent kit's
+     * `{ id, name }` to it so the downstream note creation can render
+     * a kit link without changing shape.
+     */
+    const [kitRows, user] = await Promise.all([
+      db.kit.findMany({
+        where,
+        select: {
+          id: true,
+          name: true,
+          status: true,
+          custody: {
+            select: { id: true, custodian: { include: { user: true } } },
+          },
+          // Archived members are left out of kit custody (issue #382), so the
+          // release writes no note, event or status for them.
+          assetKits: {
+            where: { asset: { archivedAt: null } },
+            select: {
+              asset: {
+                select: {
+                  id: true,
+                  status: true,
+                  title: true,
+                  // type + unitOfMeasure power the qty-tracked unit count in
+                  // the release note ("custody of 50 units"); the count comes
+                  // from the released Custody rows captured in the tx below.
+                  type: true,
+                  unitOfMeasure: true,
+                  custody: { select: { id: true } },
+                },
+              },
+            },
+          },
+        },
+      }),
+      getUserByID(userId, {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          displayName: true,
+        } satisfies Prisma.UserSelect,
+      }),
+    ]);
+
+    // Flatten pivot rows back into kit-shaped {..., assets: [...]} so the
+    // existing code path reads the same. Each asset carries a
+    // synthetic `kit` field used for the note-link rendering below.
+    const kits = kitRows.map((kit) => ({
+      ...kit,
+      assets: (kit.assetKits ?? []).map((ak) => ({
+        ...ak.asset,
+        kit: { id: kit.id, name: kit.name },
+      })),
+    }));
+
+    /**
+     * A caller whose scope is `self` may release only custody they hold.
+     *
+     * Runs on the RESOLVED kits: a check against the raw `kitIds` would see
+     * `["all-selected"]` on a select-all, match no custody row and let every
+     * matched kit through.
+     */
+    if (custodyAssign === "self") {
+      const someoneElsesCustody = kits.some(
+        (kit) => kit.custody?.custodian?.userId !== userId
+      );
+
+      if (someoneElsesCustody) {
+        throw new ShelfError({
+          cause: null,
+          title: "Action not allowed",
+          message: "Self user can release custody of themselves only.",
+          additionalData: { userId, kitIds },
+          label,
+          status: 403,
+          shouldBeCaptured: false,
+        });
+      }
+    }
+
+    /**
+     * Nothing matched — a refused custodian filter, or a selection that no
+     * longer exists. Both refuse with the same generic 400: a release that
+     * quietly succeeded on zero kits, or that failed differently depending on
+     * why the match was empty, would hand the caller a binary oracle for
+     * "does this custodian hold any kit".
+     */
+    if (kits.length === 0) {
+      throw new ShelfError({
+        cause: null,
+        message:
+          "None of the selected kits are available to release. Please refresh and try again.",
+        label,
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    /**
+     * Custodian per kit, not per call: a bulk selection may span kits held by
+     * different people, and both the audit events and the asset notes below
+     * name the custodian whose custody actually ended. One custodian taken
+     * from the selection would be right only when the selection is uniform.
+     */
+    const custodianByKitId = new Map(
+      kits.map((kit) => [kit.id, kit.custody?.custodian])
+    );
+
+    /** Kits will be released only if all the selected kits are IN_CUSTODY */
+    const allKitsInCustody = kits.every((kit) => kit.status === "IN_CUSTODY");
+    if (!allKitsInCustody) {
+      throw new ShelfError({
+        cause: null,
+        message:
+          "There are some kits which are not in custody. Please make sure you are only selecting kits in custody to release them.",
+        label,
+      });
+    }
+
+    const allAssetsOfAllKits = kits.flatMap((kit) => kit.assets);
+
+    return await db.$transaction(async (tx) => {
+      /**
+       * Capture the kit-allocated Custody rows BEFORE the cascade fires so we
+       * can emit one `CUSTODY_RELEASED` event per row. Filtering by the
+       * KitCustody IDs (rather than just `assetId`) keeps operator-assigned
+       * custody on the same assets safe — it has `kitCustodyId IS NULL` and
+       * is not affected by the cascade.
+       */
+      const kitCustodyRows = await tx.kitCustody.findMany({
+        where: { kitId: { in: kits.map((kit) => kit.id) } },
+        select: { id: true, kitId: true, custodianId: true },
+      });
+      const releasedCustodyRows =
+        kitCustodyRows.length > 0
+          ? await tx.custody.findMany({
+              where: {
+                kitCustodyId: { in: kitCustodyRows.map((kc) => kc.id) },
+              },
+              select: {
+                assetId: true,
+                teamMemberId: true,
+                kitCustodyId: true,
+                // Units this kit released — drives the qty-tracked count in
+                // the CUSTODY_RELEASED event meta + the release note below.
+                quantity: true,
+              },
+            })
+          : [];
+
+      // Map each released asset back to its kit (for the kitId field on the
+      // event). This is one tiny lookup map; we already have everything in
+      // memory.
+      const kitIdByKitCustodyId = new Map(
+        kitCustodyRows.map((kc) => [kc.id, kc.kitId])
+      );
+
+      // Asset shape (type / unitOfMeasure) and released-quantity per asset,
+      // keyed by id, for the qty-tracked unit count in the event + note.
+      const assetById = new Map(allAssetsOfAllKits.map((a) => [a.id, a]));
+      const releasedQtyByAssetId = new Map(
+        releasedCustodyRows.map((row) => [row.assetId, row.quantity])
+      );
+
+      // Activity events emitted FIRST so they roll back atomically with the
+      // mutation if anything below fails. Cascade-driven deletes happen
+      // after this point.
+      if (releasedCustodyRows.length > 0) {
+        await recordEvents(
+          releasedCustodyRows.map((row) => {
+            const asset = assetById.get(row.assetId);
+            const kitId = row.kitCustodyId
+              ? kitIdByKitCustodyId.get(row.kitCustodyId)
+              : undefined;
+            return {
+              organizationId,
+              actorUserId: userId,
+              action: "CUSTODY_RELEASED" as const,
+              entityType: "ASSET" as const,
+              entityId: row.assetId,
+              assetId: row.assetId,
+              kitId,
+              teamMemberId: row.teamMemberId,
+              targetUserId: kitId
+                ? custodianByKitId.get(kitId)?.user?.id ?? undefined
+                : undefined,
+              meta: {
+                viaKit: true,
+                ...(asset ? assetQtyMeta(asset, row.quantity) : {}),
+              },
+            };
+          }),
+          tx
+        );
+      }
+
+      /**
+       * Deleting all custodies of kits — FK cascade (kitCustodyId on Custody)
+       * removes the child Custody rows automatically, so no explicit
+       * `tx.custody.deleteMany` is needed any more.
+       */
+      await tx.kitCustody.deleteMany({
+        where: {
+          kitId: { in: kits.map((kit) => kit.id) },
+        },
+      });
+
+      /** Updating status of all kits to AVAILABLE */
+      await tx.kit.updateMany({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: `kits` ids come from the org-scoped findMany above (where includes organizationId via getKitsWhereInput / line 1376)
+        where: { id: { in: kits.map((kit) => kit.id) } },
+        data: { status: KitStatus.AVAILABLE },
+      });
+
+      /**
+       * Only flip assets to AVAILABLE if no operator-assigned custody
+       * remains. Direct per-unit custody (kitCustodyId IS NULL) keeps the
+       * asset IN_CUSTODY for that custodian.
+       */
+      const allAssetIds = allAssetsOfAllKits.map((asset) => asset.id);
+      const stillCustodied = await tx.custody.findMany({
+        where: { assetId: { in: allAssetIds } },
+        select: { assetId: true },
+      });
+      const stillCustodiedIds = new Set(stillCustodied.map((c) => c.assetId));
+      const assetsToFlipAvailable = allAssetIds.filter(
+        (id) => !stillCustodiedIds.has(id)
+      );
+      // The helper org-scopes the write itself, so the previous
+      // `require-org-scope-on-id-queries` suppression is no longer needed.
+      await releaseAssetsToAvailableUnlessCheckedOut(
+        tx,
+        assetsToFlipAvailable,
+        organizationId
+      );
+
+      /** Creating notes for all the assets */
+      const actor = wrapUserLinkForNote({ ...user, id: userId });
+      await tx.note.createMany({
+        data: allAssetsOfAllKits.map((asset) => {
+          const kitLink = asset.kit
+            ? wrapLinkForNote(`/kits/${asset.kit.id}`, asset.kit.name.trim())
+            : "**Unknown Kit**";
+          // The custodian of the kit this asset came through — the note says
+          // whose custody ended, and a bulk selection may span several.
+          const custodian = asset.kit
+            ? custodianByKitId.get(asset.kit.id)
+            : undefined;
+          const custodianDisplay = custodian
+            ? wrapCustodianForNote({ teamMember: custodian })
+            : "**Unknown Custodian**";
+          // qty-tracked assets name the units released ("custody of 50
+          // units"); INDIVIDUAL phrasing is unchanged.
+          const count = formatUnitCount(
+            asset,
+            releasedQtyByAssetId.get(asset.id)
+          );
+          const custodyPhrase = count ? `custody of ${count}` : "custody";
+          return {
+            content: `${actor} released ${custodianDisplay}'s ${custodyPhrase} via kit assignment ${kitLink}.`,
+            type: "UPDATE",
+            userId,
+            assetId: asset.id,
+          };
+        }),
+      });
+    });
+  } catch (cause) {
+    const message =
+      cause instanceof ShelfError
+        ? cause.message
+        : "Something went wrong while bulk releasing kits.";
+
+    throw new ShelfError({
+      cause,
+      message,
+      additionalData: { kitIds, organizationId, userId },
+      label,
+    });
+  }
+}
+
+export async function createKitsIfNotExists({
+  data,
+  userId,
+  organizationId,
+}: {
+  data: CreateAssetFromContentImportPayload[];
+  userId: User["id"];
+  organizationId: Organization["id"];
+}): Promise<Record<string, Kit>> {
+  try {
+    // first we get all the kits from the assets and make then into an object where the category is the key and the value is an empty string
+    // Normalize kit names so whitespace-only or padded values don't create phantom keys.
+    const kitNames = Array.from(
+      new Set(
+        data
+          .map((asset) => asset.kit?.trim())
+          .filter((kit): kit is string => !!kit)
+      )
+    );
+
+    // Handle the case where there are no kits
+    if (kitNames.length === 0) {
+      return {};
+    }
+
+    // now we loop through the kits and check if they exist
+    const kits = new Map<string, Kit>();
+    for (const kit of kitNames) {
+      const existingKit = await db.kit.findFirst({
+        where: {
+          name: { equals: kit, mode: "insensitive" },
+          organizationId,
+        },
+      });
+
+      if (!existingKit) {
+        // if the location doesn't exist, we create a new one
+        const newKit = await db.kit.create({
+          data: {
+            name: kit.trim(),
+            createdBy: {
+              connect: {
+                id: userId,
+              },
+            },
+            organization: {
+              connect: {
+                id: organizationId,
+              },
+            },
+          },
+        });
+        kits.set(kit, newKit);
+      } else {
+        // if the location exists, we just update the id
+        kits.set(kit, existingKit);
+      }
+    }
+
+    return Object.fromEntries(Array.from(kits));
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while creating kits. Seems like some of the location data in your import file is invalid. Please check and try again.",
+      additionalData: { userId, organizationId },
+      label,
+      /** No need to capture those. They are mostly related to malformed CSV data */
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/**
+ * Minimal Prisma surface `updateKitQrCode` needs when run inside a
+ * transaction. Typed structurally because the extended transaction client is
+ * not directly assignable to the generated `Prisma.TransactionClient` (same
+ * approach as `NotesTxClient` / `OrgValidationTxClient`).
+ */
+export type KitQrCodeTxClient = {
+  kit: {
+    update: (args: {
+      where: { id: string; organizationId: string };
+      data: { qrCodes: { set?: { id: string }[]; connect?: { id: string } } };
+    }) => Promise<Kit>;
+  };
+};
+
+export async function updateKitQrCode(
+  {
+    kitId,
+    newQrId,
+    organizationId,
+  }: {
+    organizationId: string;
+    kitId: string;
+    newQrId: string;
+  },
+  tx?: KitQrCodeTxClient
+) {
+  try {
+    const client = tx ?? db;
+
+    // Disconnect all existing QR codes
+    await client.kit
+      .update({
+        where: { id: kitId, organizationId },
+        data: {
+          qrCodes: {
+            set: [],
+          },
+        },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Couldn't disconnect existing codes",
+          label,
+          additionalData: { kitId, organizationId, newQrId },
+        });
+      });
+
+    // Connect the new QR code
+    return await client.kit
+      .update({
+        where: { id: kitId, organizationId },
+        data: {
+          qrCodes: {
+            connect: { id: newQrId },
+          },
+        },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Couldn't connect the new QR code",
+          label,
+          additionalData: { kitId, organizationId, newQrId },
+        });
+      });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while updating kit QR code",
+      label,
+      additionalData: { kitId, organizationId, newQrId },
+    });
+  }
+}
+
+/**
+ * Relinks a kit to a different QR code, unlinking any previous code.
+ * Throws when the QR belongs to another org or is already linked to an asset/kit.
+ */
+export async function relinkKitQrCode({
+  qrId,
+  kitId,
+  organizationId,
+  userId,
+}: {
+  qrId: Qr["id"];
+  kitId: Kit["id"];
+  organizationId: Organization["id"];
+  userId: User["id"];
+}) {
+  const [qr, kit] = await Promise.all([
+    getQr({ id: qrId }),
+    db.kit.findFirst({
+      where: { id: kitId, organizationId },
+      select: { qrCodes: { select: { id: true } } },
+    }),
+  ]);
+
+  if (!kit) {
+    throw new ShelfError({
+      cause: null,
+      message: "Kit not found.",
+      label,
+      additionalData: { kitId, organizationId, qrId },
+      // why: without an explicit status this resolves to 500 — `cause: null` is
+      // not a P2025, so the ShelfError constructor falls through to
+      // `status || 500`. A missing/cross-org kit is a 404, not a server fault.
+      status: 404,
+      shouldBeCaptured: false,
+    });
+  }
+
+  if (qr.organizationId && qr.organizationId !== organizationId) {
+    throw new ShelfError({
+      cause: null,
+      title: "QR not valid.",
+      message: "This QR code does not belong to your organization",
+      label,
+      status: 403,
+      shouldBeCaptured: false,
+    });
+  }
+
+  if (qr.assetId) {
+    throw new ShelfError({
+      cause: null,
+      title: "QR already linked.",
+      message:
+        "You cannot link to this code because its already linked to another asset. Delete the other asset to free up the code and try again.",
+      label,
+      status: 403,
+      shouldBeCaptured: false,
+    });
+  }
+
+  if (qr.kitId && qr.kitId !== kitId) {
+    throw new ShelfError({
+      cause: null,
+      title: "QR already linked.",
+      message:
+        "You cannot link to this code because its already linked to another kit. Delete the other kit to free up the code and try again.",
+      label,
+      status: 403,
+      shouldBeCaptured: false,
+    });
+  }
+
+  const oldQrCode = kit.qrCodes[0];
+
+  /**
+   * why: mirrors `relinkAssetQrCode` — the guards above are check-then-act, so
+   * the QR write re-asserts the state they observed and a concurrent writer
+   * makes it match zero rows (P2025). Running it first, inside a transaction,
+   * stops a loser from still disconnecting the kit's existing code.
+   */
+  await db.$transaction(async (tx) => {
+    try {
+      await tx.qr.update({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: qr.organizationId checked against caller's organizationId above (guard at the `qr.organizationId && qr.organizationId !== organizationId` throw); null-org QR is a claimable code being assigned here. The WHERE additionally pins that observed state so a concurrent claim cannot interleave.
+        where: {
+          id: qr.id,
+          organizationId: qr.organizationId,
+          assetId: null,
+          kitId: qr.kitId,
+        },
+        data: { organizationId, userId },
+      });
+    } catch (updateCause) {
+      if (isNotFoundError(updateCause)) {
+        throw new ShelfError({
+          // why: cause deliberately null — makeShelfError collapses any P2025
+          // anywhere in the cause chain to a 404, which would misreport this
+          // lost race as not-found.
+          cause: null,
+          title: "QR already linked.",
+          message:
+            "This QR code was claimed or linked by someone else while you were linking it. Refresh and try again.",
+          additionalData: { qrId, kitId, organizationId },
+          label,
+          status: 403,
+          shouldBeCaptured: false,
+        });
+      }
+      throw updateCause;
+    }
+
+    await updateKitQrCode(
+      {
+        kitId,
+        newQrId: qr.id,
+        organizationId,
+      },
+      tx
+    );
+  });
+
+  return {
+    oldQrCodeId: oldQrCode?.id,
+    newQrId: qr.id,
+  };
+}
+
+/**
+ * Resolves the asset IDs contained in the given kits, for adding to a booking.
+ *
+ * `organizationId` is required and scopes the kit lookup so a caller cannot
+ * pull assets out of kits belonging to another tenant (cross-org IDOR). Kits
+ * not in the org simply yield no assets.
+ *
+ * @param kitIds - Kit IDs sourced from request input
+ * @param organizationId - Caller's validated organization ID
+ * @returns Asset IDs belonging to the in-org kits
+ * @throws {ShelfError} on DB failure
+ */
+export async function getAvailableKitAssetForBooking(
+  kitIds: Kit["id"][],
+  organizationId: string
+): Promise<string[]> {
+  try {
+    const selectedKits = await db.kit.findMany({
+      // why: organizationId scoping prevents cross-org IDOR — without it a
+      // caller in Org A could resolve assets from Org B's kits.
+      where: { id: { in: kitIds }, organizationId },
+      select: {
+        assetKits: {
+          select: { asset: { select: { id: true, status: true } } },
+        },
+      },
+    });
+
+    const allAssets = selectedKits.flatMap((kit) =>
+      (kit.assetKits ?? []).map((ak) => ak.asset)
+    );
+
+    return allAssets.map((asset) => asset.id);
+  } catch (cause: any) {
+    throw new ShelfError({
+      cause: cause,
+      message:
+        cause?.message ||
+        "Something went wrong while getting available assets.",
+      label: "Assets",
+    });
+  }
+}
+
+/**
+ * Moves every member asset of the given kits to `newLocationId`, writing the
+ * `AssetLocation` pivot rows that make the kit's placement visible on the
+ * assets themselves.
+ *
+ * The two asset types carry different invariants (see the triggers in
+ * `packages/database/prisma/migrations/20260519143054_add_asset_location_pivot/migration.sql`),
+ * so placement is type-aware:
+ *
+ * - **INDIVIDUAL** — capped at ONE row by
+ *   `enforce_individual_asset_single_location`. The kit owns the asset's
+ *   whereabouts, so the asset's existing row is replaced by a **plain**
+ *   (`assetKitId: null`) row at the kit's location. A plain row rather than a
+ *   kit-driven one keeps the trigger satisfied and means the asset keeps this
+ *   location when it later leaves the kit.
+ * - **QUANTITY_TRACKED** — may span several locations at distinct slices, so
+ *   only the kit's own slice moves: a **kit-driven** (`assetKitId` set) row of
+ *   `AssetKit.quantity` units. The discriminator is what lets a later kit move
+ *   find and relocate that same slice.
+ *
+ * The asset's MANUAL placements are never touched for QUANTITY_TRACKED members.
+ * The two axes are orthogonal and additive: since
+ * `20260602100000_assetlocation_sum_exclude_kit_driven`,
+ * `enforce_asset_location_sum_within_total` sums only rows with
+ * `assetKitId IS NULL`, and the kit axis is bounded separately by
+ * `enforce_asset_kit_sum_within_total`. So 100 manually-placed units plus a
+ * 50-unit kit slice is a valid state, and reclaiming from manual rows to "make
+ * room" would destroy real placement data.
+ *
+ * Callers MUST have proven `newLocationId` belongs to `organizationId` (via
+ * `assertLocationBelongsToOrg`) first — this connects assets to it without
+ * re-checking.
+ *
+ * @param args.kitIds Kits whose members move; must already be org-scoped
+ * @param args.newLocationId Target location, proven org-owned by the caller
+ * @param args.organizationId Owning workspace, stamped onto the new pivot rows
+ * @param args.assetIds Optional subset — when provided only these members are
+ *   moved, leaving the kit's other members untouched. Used by the join cascade
+ *   so adding an asset doesn't re-place assets that were already in the kit.
+ * @param tx Active transaction, so the cascade commits with its audit trail
+ * @returns Ids of the assets that actually got a new placement, so callers
+ *   emit events/notes matching the persisted state
+ */
+async function cascadeKitLocationToAssets(
+  {
+    kitIds,
+    newLocationId,
+    organizationId,
+    assetIds,
+  }: {
+    kitIds: Array<Kit["id"]>;
+    newLocationId: string;
+    organizationId: Organization["id"];
+    assetIds?: Array<Asset["id"]>;
+  },
+  tx: KitLocationTxClient
+): Promise<Set<string>> {
+  if (kitIds.length === 0 || assetIds?.length === 0) return new Set();
+
+  const memberScope = {
+    kitId: { in: kitIds },
+    ...(assetIds ? { assetId: { in: assetIds } } : {}),
+  };
+
+  // Drop these kits' existing kit-driven rows first so a repeated move
+  // relocates the slice instead of stacking a second one. Manual rows are
+  // handled per-type below.
+  await tx.assetLocation.deleteMany({
+    where: { assetKit: memberScope },
+  });
+
+  // Archived members are frozen (issue #382): their placement stays where it
+  // was. Only quantity-tracked rows are kit-driven, and those cannot be
+  // archived, so the delete above never touches an archived member's row.
+  const assetKits = await tx.assetKit.findMany({
+    where: { ...memberScope, asset: { archivedAt: null } },
+    select: {
+      id: true,
+      assetId: true,
+      quantity: true,
+      asset: { select: { type: true } },
+    },
+  });
+  if (assetKits.length === 0) return new Set();
+
+  const qtyTracked = assetKits.filter(
+    (ak) => ak.asset.type === AssetType.QUANTITY_TRACKED
+  );
+  // `enforce_individual_asset_single_kit` already stops an INDIVIDUAL asset
+  // from sitting in two slices, but dedupe anyway — two rows for one asset
+  // would breach both the single-location trigger and
+  // `AssetLocation_manual_unique`.
+  const individualAssetIds = [
+    ...new Set(
+      assetKits
+        .filter((ak) => ak.asset.type !== AssetType.QUANTITY_TRACKED)
+        .map((ak) => ak.assetId)
+    ),
+  ];
+
+  if (individualAssetIds.length > 0) {
+    // Replace the asset's single placement. Mirrors the manual-row replace
+    // in `bulkUpdateAssetLocation` (~/modules/asset/service.server).
+    await tx.assetLocation.deleteMany({
+      where: { assetId: { in: individualAssetIds }, assetKitId: null },
+    });
+    await tx.assetLocation.createMany({
+      data: individualAssetIds.map((assetId) => ({
+        assetId,
+        locationId: newLocationId,
+        organizationId,
+        quantity: 1,
+        assetKitId: null,
+      })),
+    });
+  }
+
+  if (qtyTracked.length > 0) {
+    // Additive, by design — the asset's manual placements are left alone.
+    // The location-axis sum counts only `assetKitId IS NULL` rows, so a
+    // kit slice can never push a manual placement over `Asset.quantity`.
+    await tx.assetLocation.createMany({
+      data: qtyTracked.map((ak) => ({
+        assetId: ak.assetId,
+        locationId: newLocationId,
+        organizationId,
+        quantity: ak.quantity,
+        assetKitId: ak.id,
+      })),
+    });
+  }
+
+  return new Set(assetKits.map((ak) => ak.assetId));
+}
+
+export async function updateKitLocation({
+  id,
+  organizationId,
+  currentLocationId,
+  newLocationId,
+  userId,
+}: {
+  id: Kit["id"];
+  organizationId: Kit["organizationId"];
+  currentLocationId: Kit["locationId"];
+  newLocationId: Kit["locationId"];
+  userId?: User["id"];
+}) {
+  try {
+    // Get kit with its assets first. Read each asset's placement from
+    // the AssetLocation pivot; pull `type` and `quantity` so the cascade
+    // can write a type-aware quantity into the new pivot row. Also pull
+    // `unitOfMeasure` (qty-tracked unit label) and the per-row
+    // `AssetKit.quantity` (the slice this kit holds — copied into the
+    // kit-driven AssetLocation row) so the cascade note/event can name the
+    // affected unit count.
+    const kitRow = await db.kit.findUnique({
+      where: { id, organizationId },
+      select: {
+        id: true,
+        name: true,
+        assetKits: {
+          select: {
+            quantity: true,
+            asset: {
+              select: {
+                id: true,
+                title: true,
+                type: true,
+                quantity: true,
+                unitOfMeasure: true,
+                assetLocations: {
+                  select: { location: { select: { id: true, name: true } } },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!kitRow) {
+      throw new ShelfError({
+        cause: null,
+        message: "Kit not found",
+        label,
+        shouldBeCaptured: false,
+        status: 404,
+      });
+    }
+
+    // Flatten pivot rows into the in-memory `assets` shape used below.
+    // `kitQuantity` is this kit's per-row `AssetKit.quantity` (NOT the
+    // asset's full pool) — the slice cascaded into the kit-driven location
+    // row, surfaced in the per-asset cascade note/event count.
+    const kit = {
+      ...kitRow,
+      assets: (kitRow.assetKits ?? []).map((ak) => ({
+        ...ak.asset,
+        kitQuantity: ak.quantity,
+      })),
+    };
+
+    const assetIds = kit.assets.map((asset) => asset.id);
+
+    if (newLocationId) {
+      // Only emit events for assets whose location actually changes.
+      const assetsWithLocationChange = kit.assets.filter(
+        (asset) => (getPrimaryLocation(asset)?.id ?? null) !== newLocationId
+      );
+
+      // Lifted out of the tx so the post-tx note loop can also use it
+      // (without re-running the manual-row probe). Populated inside the tx
+      // once the filtered `dataToCreate` is built.
+      let cascadedAssetIds = new Set<string>();
+
+      // Connect kit to the new location AND cascade per-asset placement via
+      // the AssetLocation pivot, atomically with the per-asset
+      // ASSET_LOCATION_CHANGED events. The DEFERRED
+      // `enforce_asset_location_sum_within_total` trigger re-checks at COMMIT.
+      await db.$transaction(async (tx) => {
+        // newLocationId comes from request input — prove it belongs to the
+        // caller's org before connecting kit/assets to it (cross-org IDOR).
+        await assertLocationBelongsToOrg(
+          { locationId: newLocationId, organizationId },
+          tx
+        );
+        await tx.location.update({
+          // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: newLocationId proven org-owned by assertLocationBelongsToOrg above (same tx)
+          where: { id: newLocationId },
+          data: {
+            kits: {
+              connect: { id },
+            },
+          },
+        });
+
+        if (assetIds.length > 0) {
+          // Move the kit's members with it — INDIVIDUAL assets get their
+          // single placement replaced, QUANTITY_TRACKED assets get their
+          // kit slice relocated. Track which assets actually moved so the
+          // audit trail below matches the persisted state.
+          cascadedAssetIds = await cascadeKitLocationToAssets(
+            { kitIds: [id], newLocationId, organizationId },
+            tx
+          );
+        }
+
+        const cascadedAssetsForEvents = assetsWithLocationChange.filter(
+          (asset) => cascadedAssetIds.has(asset.id)
+        );
+
+        if (userId && cascadedAssetsForEvents.length > 0) {
+          await recordEvents(
+            cascadedAssetsForEvents.map((asset) => ({
+              organizationId,
+              actorUserId: userId,
+              action: "ASSET_LOCATION_CHANGED" as const,
+              entityType: "ASSET" as const,
+              entityId: asset.id,
+              assetId: asset.id,
+              kitId: id,
+              locationId: newLocationId,
+              field: "locationId",
+              fromValue: getPrimaryLocation(asset)?.id ?? null,
+              toValue: newLocationId,
+              // `meta.quantity` (qty-tracked only) = the per-row
+              // `AssetKit.quantity` cascaded into the kit-driven location row.
+              meta: { viaKit: true, ...assetQtyMeta(asset, asset.kitQuantity) },
+            })),
+            tx
+          );
+        }
+      });
+
+      // Add notes to assets about location update via parent kit. Same filter
+      // as the events above — `cascadedAssetIds` includes members that were
+      // already at the target, and they must not get a "moved to X" note with
+      // no matching event.
+      const cascadedAssetsForNotes = assetsWithLocationChange.filter((asset) =>
+        cascadedAssetIds.has(asset.id)
+      );
+      if (userId && cascadedAssetsForNotes.length > 0) {
+        const user = await getUserByID(userId, {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            displayName: true,
+          } satisfies Prisma.UserSelect,
+        });
+        const location = await db.location.findFirst({
+          where: { id: newLocationId, organizationId },
+          select: { name: true, id: true },
+        });
+
+        // Create individual notes for each asset
+        await Promise.all(
+          cascadedAssetsForNotes.map((asset) =>
+            createNote({
+              content: getKitLocationUpdateNoteContent({
+                currentLocation: getPrimaryLocation(asset), // Use the asset's current location
+                newLocation: location,
+                userId,
+                firstName: user?.firstName ?? "",
+                lastName: user?.lastName ?? "",
+                isRemoving: false,
+                // Qty-tracked cascade names the kit's per-row slice
+                // ("placed 50 units … via parent kit assignment").
+                type: asset.type,
+                unitOfMeasure: asset.unitOfMeasure,
+                quantity: asset.kitQuantity,
+              }),
+              type: "UPDATE",
+              userId,
+              assetId: asset.id,
+              // why: asset belongs to this kit (loaded scoped to
+              // organizationId) — pass the kit's org so the note is
+              // validated against the asset's true org
+              organizationId,
+            })
+          )
+        );
+      }
+    } else if (!newLocationId && currentLocationId) {
+      // Only emit events for assets that actually had this kit's location.
+      const assetsWithLocationChange = kit.assets.filter(
+        (asset) => getPrimaryLocation(asset)?.id === currentLocationId
+      );
+
+      // Assets whose placement is actually dropped below — populated inside
+      // the tx, and reused by the post-tx note loop. INDIVIDUAL members keep
+      // the location the kit gave them (their row is plain, not kit-driven),
+      // so only the kit's QUANTITY_TRACKED slices land in here.
+      let unplacedAssetIds = new Set<string>();
+
+      // Disconnect kit from the old location AND drop per-asset placement
+      // via the AssetLocation pivot, atomically with the per-asset
+      // ASSET_LOCATION_CHANGED events.
+      await db.$transaction(async (tx) => {
+        // currentLocationId is supplied by the caller — prove it belongs to
+        // the caller's org before disconnecting kit/assets (cross-org IDOR).
+        await assertLocationBelongsToOrg(
+          { locationId: currentLocationId, organizationId },
+          tx
+        );
+        await tx.location.update({
+          // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: currentLocationId proven org-owned by assertLocationBelongsToOrg above (same tx)
+          where: { id: currentLocationId },
+          data: {
+            kits: {
+              disconnect: { id },
+            },
+          },
+        });
+
+        if (assetIds.length > 0) {
+          // Only delete kit-driven rows for THIS kit. Manual rows survive
+          // (the user's own placements aren't unset just because the kit
+          // lost its location) — which now includes the plain rows the
+          // cascade wrote for INDIVIDUAL members, so they stay where the
+          // kit left them. Capture the affected asset ids first: the
+          // audit trail must only claim a removal for rows we really drop.
+          unplacedAssetIds = new Set(
+            (
+              await tx.assetLocation.findMany({
+                where: { assetKit: { kitId: id } },
+                select: { assetId: true },
+              })
+            ).map((row) => row.assetId)
+          );
+          await tx.assetLocation.deleteMany({
+            where: { assetKit: { kitId: id } },
+          });
+        }
+
+        const unplacedAssetsForEvents = assetsWithLocationChange.filter(
+          (asset) => unplacedAssetIds.has(asset.id)
+        );
+
+        if (userId && unplacedAssetsForEvents.length > 0) {
+          await recordEvents(
+            unplacedAssetsForEvents.map((asset) => ({
+              organizationId,
+              actorUserId: userId,
+              action: "ASSET_LOCATION_CHANGED" as const,
+              entityType: "ASSET" as const,
+              entityId: asset.id,
+              assetId: asset.id,
+              kitId: id,
+              field: "locationId",
+              fromValue: currentLocationId,
+              toValue: null,
+              // `meta.quantity` (qty-tracked only) = the per-row
+              // `AssetKit.quantity` removed with the kit-driven location row.
+              meta: { viaKit: true, ...assetQtyMeta(asset, asset.kitQuantity) },
+            })),
+            tx
+          );
+        }
+      });
+
+      // Add notes to assets about location removal via parent kit — only the
+      // assets that actually lost their placement above.
+      const unplacedAssetsForNotes = kit.assets.filter((asset) =>
+        unplacedAssetIds.has(asset.id)
+      );
+      if (userId && unplacedAssetsForNotes.length > 0) {
+        const user = await getUserByID(userId, {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            displayName: true,
+          } satisfies Prisma.UserSelect,
+        });
+        const currentLocation = await db.location.findFirst({
+          where: { id: currentLocationId, organizationId },
+          select: { name: true, id: true },
+        });
+
+        // Create individual notes for each asset
+        await Promise.all(
+          unplacedAssetsForNotes.map((asset) =>
+            createNote({
+              content: getKitLocationUpdateNoteContent({
+                // Prefer the asset's own pivot row (covers cases where the
+                // asset was unplaced or at a different location than the
+                // kit's `currentLocationId` — defensive consistency).
+                currentLocation: getPrimaryLocation(asset) ?? currentLocation,
+                newLocation: null,
+                userId,
+                firstName: user?.firstName ?? "",
+                lastName: user?.lastName ?? "",
+                isRemoving: true,
+                // Qty-tracked cascade names the kit's per-row slice
+                // ("removed 50 units … via parent kit removal").
+                type: asset.type,
+                unitOfMeasure: asset.unitOfMeasure,
+                quantity: asset.kitQuantity,
+              }),
+              type: "UPDATE",
+              userId,
+              assetId: asset.id,
+              // why: asset belongs to this kit (loaded scoped to
+              // organizationId) — pass the kit's org so the note is
+              // validated against the asset's true org
+              organizationId,
+            })
+          )
+        );
+      }
+    }
+
+    // Return the updated kit
+    return await db.kit.findUnique({
+      where: { id, organizationId },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while updating kit location",
+      label,
+    });
+  }
+}
+
+export async function bulkUpdateKitLocation({
+  kitIds,
+  organizationId,
+  newLocationId,
+  currentSearchParams,
+  userId,
+}: {
+  kitIds: Array<Kit["id"]>;
+  organizationId: Kit["organizationId"];
+  newLocationId: Kit["locationId"];
+  currentSearchParams?: string | null;
+  userId: User["id"];
+}) {
+  try {
+    const where: Prisma.KitWhereInput = kitIds.includes(ALL_SELECTED_KEY)
+      ? getKitsWhereInput({
+          organizationId,
+          currentSearchParams,
+          // `kit: update` is ADMIN/OWNER-only (SELF_SERVICE holds only
+          // `kit: [read, custody]`), so no restricted viewer can supply
+          // this filter.
+          allowedTeamMemberIds: "all",
+        })
+      : { id: { in: kitIds }, organizationId };
+
+    // Get kits with their assets before updating. Read each asset's
+    // placement from the AssetLocation pivot and pull `type` + `quantity`
+    // so the cascade writes type-aware rows; flatten back into a
+    // `.assets` shape downstream. `unitOfMeasure` + the per-row
+    // `AssetKit.quantity` let the cascade note/event surface the affected
+    // unit count for qty-tracked assets.
+    const kitsWithAssetsRows = await db.kit.findMany({
+      where,
+      select: {
+        id: true,
+        name: true,
+        locationId: true,
+        location: { select: { id: true, name: true } },
+        assetKits: {
+          select: {
+            quantity: true,
+            asset: {
+              select: {
+                id: true,
+                title: true,
+                type: true,
+                quantity: true,
+                unitOfMeasure: true,
+                assetLocations: {
+                  select: { location: { select: { id: true, name: true } } },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    // Flatten pivot rows back into a kit-shaped `.assets` array so the
+    // rest of this function reads as it did pre-pivot. `kitQuantity` is the
+    // per-row `AssetKit.quantity` (this kit's slice, copied into the
+    // kit-driven location row) — NOT the asset's full pool.
+    const kitsWithAssets = kitsWithAssetsRows.map((kit) => ({
+      ...kit,
+      assets: (kit.assetKits ?? []).map((ak) => ({
+        ...ak.asset,
+        kitQuantity: ak.quantity,
+      })),
+    }));
+
+    const actualKitIds = kitsWithAssets.map((kit) => kit.id);
+    const allAssets = kitsWithAssets.flatMap((kit) => kit.assets);
+    // Map asset.id → owning kit.id so we can attach `kitId` to each cascade event.
+    const kitIdByAssetId = new Map<string, string>();
+    for (const kit of kitsWithAssets) {
+      for (const asset of kit.assets) {
+        kitIdByAssetId.set(asset.id, kit.id);
+      }
+    }
+
+    if (
+      newLocationId &&
+      newLocationId.trim() !== "" &&
+      actualKitIds.length > 0
+    ) {
+      // Only emit events for assets whose location actually changes.
+      const assetsWithLocationChange = allAssets.filter(
+        (asset) => (getPrimaryLocation(asset)?.id ?? null) !== newLocationId
+      );
+
+      // Lifted out of the tx so the post-tx per-asset note loop can also use it
+      // (without re-running the manual-row probe). Populated inside the tx
+      // once the filtered `dataToCreate` is built.
+      let cascadedAssetIds = new Set<string>();
+
+      // Connect kits to the new location AND cascade per-asset placement via
+      // the AssetLocation pivot, atomically with the per-asset
+      // ASSET_LOCATION_CHANGED events. The DEFERRED
+      // `enforce_asset_location_sum_within_total` trigger re-checks at COMMIT.
+      await db.$transaction(async (tx) => {
+        // newLocationId comes from request input — prove it belongs to the
+        // caller's org before connecting kits/assets to it (cross-org IDOR).
+        await assertLocationBelongsToOrg(
+          { locationId: newLocationId, organizationId },
+          tx
+        );
+        await tx.location.update({
+          // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: newLocationId proven org-owned by assertLocationBelongsToOrg above (same tx)
+          where: { id: newLocationId },
+          data: {
+            kits: {
+              connect: actualKitIds.map((id) => ({ id })),
+            },
+          },
+        });
+
+        if (allAssets.length > 0) {
+          // Move every selected kit's members with it — INDIVIDUAL assets
+          // get their single placement replaced, QUANTITY_TRACKED assets
+          // get their kit slice relocated. Track which assets actually
+          // moved so the audit trail below matches the persisted state.
+          cascadedAssetIds = await cascadeKitLocationToAssets(
+            { kitIds: actualKitIds, newLocationId, organizationId },
+            tx
+          );
+        }
+
+        const cascadedAssetsForEvents = assetsWithLocationChange.filter(
+          (asset) => cascadedAssetIds.has(asset.id)
+        );
+
+        if (cascadedAssetsForEvents.length > 0) {
+          await recordEvents(
+            cascadedAssetsForEvents.map((asset) => ({
+              organizationId,
+              actorUserId: userId,
+              action: "ASSET_LOCATION_CHANGED" as const,
+              entityType: "ASSET" as const,
+              entityId: asset.id,
+              assetId: asset.id,
+              kitId: kitIdByAssetId.get(asset.id),
+              locationId: newLocationId,
+              field: "locationId",
+              fromValue: getPrimaryLocation(asset)?.id ?? null,
+              toValue: newLocationId,
+              // `meta.quantity` (qty-tracked only) = the per-row
+              // `AssetKit.quantity` cascaded into the kit-driven location row.
+              meta: { viaKit: true, ...assetQtyMeta(asset, asset.kitQuantity) },
+            })),
+            tx
+          );
+        }
+      });
+
+      // Create notes for affected assets. Same filter as the events above —
+      // `cascadedAssetIds` includes members already at the target, which must
+      // not get a "moved to X" note with no matching event.
+      // (Kit-level system notes below are emitted per-kit and remain
+      // unfiltered — they describe the kit-level movement, not asset rows.)
+      const cascadedAssetsForNotes = assetsWithLocationChange.filter((asset) =>
+        cascadedAssetIds.has(asset.id)
+      );
+      if (cascadedAssetsForNotes.length > 0) {
+        const user = await getUserByID(userId, {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            displayName: true,
+          } satisfies Prisma.UserSelect,
+        });
+        const location = await db.location.findFirst({
+          where: { id: newLocationId, organizationId },
+          select: { name: true, id: true },
+        });
+
+        // Create individual notes for each asset
+        await Promise.all(
+          cascadedAssetsForNotes.map((asset) =>
+            createNote({
+              content: getKitLocationUpdateNoteContent({
+                currentLocation: getPrimaryLocation(asset),
+                newLocation: location,
+                userId,
+                firstName: user?.firstName ?? "",
+                lastName: user?.lastName ?? "",
+                isRemoving: false,
+                // Qty-tracked cascade names the kit's per-row slice.
+                type: asset.type,
+                unitOfMeasure: asset.unitOfMeasure,
+                quantity: asset.kitQuantity,
+              }),
+              type: "UPDATE",
+              userId,
+              assetId: asset.id,
+              // why: asset belongs to a kit loaded scoped to
+              // organizationId — pass the org so the note is validated
+              // against the asset's true org
+              organizationId,
+            })
+          )
+        );
+      }
+    } else {
+      // Only assets that currently have a location actually change.
+      const assetsWithLocationChange = allAssets.filter(
+        (asset) => getPrimaryLocation(asset)?.id
+      );
+
+      // Assets whose placement is actually dropped below — populated inside
+      // the tx, and reused by the post-tx note loop. INDIVIDUAL members keep
+      // the location their kit gave them (their row is plain, not
+      // kit-driven), so only kit-driven QUANTITY_TRACKED slices land here.
+      let unplacedAssetIds = new Set<string>();
+
+      // Removing location - clear the kit FK and the per-asset pivot rows,
+      // atomically with the per-asset ASSET_LOCATION_CHANGED events.
+      await db.$transaction(async (tx) => {
+        await tx.kit.updateMany({
+          where,
+          data: { locationId: null },
+        });
+
+        if (allAssets.length > 0) {
+          // Only drop kit-driven rows for THIS batch of kits. Manual rows
+          // survive — clearing the kits' location doesn't undo the user's
+          // own placements, nor the plain rows the cascade wrote for
+          // INDIVIDUAL members. Capture the affected asset ids first so the
+          // audit trail only claims a removal for rows we really drop.
+          unplacedAssetIds = new Set(
+            (
+              await tx.assetLocation.findMany({
+                where: { assetKit: { kitId: { in: actualKitIds } } },
+                select: { assetId: true },
+              })
+            ).map((row) => row.assetId)
+          );
+          await tx.assetLocation.deleteMany({
+            where: { assetKit: { kitId: { in: actualKitIds } } },
+          });
+        }
+
+        const unplacedAssetsForEvents = assetsWithLocationChange.filter(
+          (asset) => unplacedAssetIds.has(asset.id)
+        );
+
+        if (unplacedAssetsForEvents.length > 0) {
+          await recordEvents(
+            unplacedAssetsForEvents.map((asset) => ({
+              organizationId,
+              actorUserId: userId,
+              action: "ASSET_LOCATION_CHANGED" as const,
+              entityType: "ASSET" as const,
+              entityId: asset.id,
+              assetId: asset.id,
+              kitId: kitIdByAssetId.get(asset.id),
+              field: "locationId",
+              fromValue: getPrimaryLocation(asset)!.id,
+              toValue: null,
+              // `meta.quantity` (qty-tracked only) = the per-row
+              // `AssetKit.quantity` removed with the kit-driven location row.
+              meta: { viaKit: true, ...assetQtyMeta(asset, asset.kitQuantity) },
+            })),
+            tx
+          );
+        }
+      });
+
+      // Create individual notes for each asset that actually lost its
+      // placement (cleared atomically in the transaction above).
+      const unplacedAssetsForNotes = allAssets.filter((asset) =>
+        unplacedAssetIds.has(asset.id)
+      );
+      if (unplacedAssetsForNotes.length > 0) {
+        const user = await getUserByID(userId, {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            displayName: true,
+          } satisfies Prisma.UserSelect,
+        });
+
+        await Promise.all(
+          unplacedAssetsForNotes.map((asset) =>
+            createNote({
+              content: getKitLocationUpdateNoteContent({
+                currentLocation: getPrimaryLocation(asset),
+                newLocation: null,
+                userId,
+                firstName: user?.firstName ?? "",
+                lastName: user?.lastName ?? "",
+                isRemoving: true,
+                // Qty-tracked cascade names the kit's per-row slice.
+                type: asset.type,
+                unitOfMeasure: asset.unitOfMeasure,
+                quantity: asset.kitQuantity,
+              }),
+              type: "UPDATE",
+              userId,
+              assetId: asset.id,
+              // why: asset belongs to a kit loaded scoped to
+              // organizationId — pass the org so the note is validated
+              // against the asset's true org
+              organizationId,
+            })
+          )
+        );
+      }
+    }
+
+    // Create location activity notes
+    const userForNote = await getUserByID(userId, {
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      } satisfies Prisma.UserSelect,
+    });
+    const userLink = wrapUserLinkForNote({ ...userForNote, id: userId });
+
+    if (newLocationId && newLocationId.trim() !== "") {
+      const location = await db.location.findFirst({
+        where: { id: newLocationId, organizationId },
+        select: { id: true, name: true },
+      });
+
+      if (location) {
+        const locLink = wrapLinkForNote(
+          `/locations/${location.id}`,
+          location.name
+        );
+
+        // Only count kits not already at the target location
+        const actuallyMovedKits = kitsWithAssets.filter(
+          (k) => k.locationId !== newLocationId
+        );
+
+        if (actuallyMovedKits.length > 0) {
+          const kitData = actuallyMovedKits.map((k) => ({
+            id: k.id,
+            name: k.name,
+          }));
+          const kitMarkup = wrapKitsWithDataForNote(kitData, "added");
+          await createSystemLocationNote({
+            locationId: location.id,
+            content: `${userLink} added ${kitMarkup} to ${locLink}.`,
+            userId,
+          });
+        }
+
+        // Removal notes on previous locations
+        const byPrevLoc = new Map<
+          string,
+          { name: string; kits: Array<{ id: string; name: string }> }
+        >();
+        for (const kit of actuallyMovedKits) {
+          if (!kit.locationId || kit.locationId === newLocationId) continue;
+          const prevLocName = kit.location?.name ?? "Unknown location";
+          const prevLocId = kit.locationId;
+          const existing = byPrevLoc.get(prevLocId);
+          if (existing) {
+            existing.kits.push({ id: kit.id, name: kit.name });
+          } else {
+            byPrevLoc.set(prevLocId, {
+              name: prevLocName,
+              kits: [{ id: kit.id, name: kit.name }],
+            });
+          }
+        }
+        for (const [locId, { name, kits }] of byPrevLoc) {
+          const prevLocLink = wrapLinkForNote(`/locations/${locId}`, name);
+          const kitMarkup = wrapKitsWithDataForNote(kits, "removed");
+          const movedTo = ` Moved to ${locLink}.`;
+          await createSystemLocationNote({
+            locationId: locId,
+            content: `${userLink} removed ${kitMarkup} from ${prevLocLink}.${movedTo}`,
+            userId,
+          });
+        }
+      }
+    } else {
+      // Kits removed from location — create removal notes
+      const byPrevLoc = new Map<
+        string,
+        { name: string; kits: Array<{ id: string; name: string }> }
+      >();
+      for (const kit of kitsWithAssets) {
+        if (!kit.locationId) continue;
+        const prevLocName = kit.location?.name ?? "Unknown location";
+        const existing = byPrevLoc.get(kit.locationId);
+        if (existing) {
+          existing.kits.push({ id: kit.id, name: kit.name });
+        } else {
+          byPrevLoc.set(kit.locationId, {
+            name: prevLocName,
+            kits: [{ id: kit.id, name: kit.name }],
+          });
+        }
+      }
+      for (const [locId, { name, kits }] of byPrevLoc) {
+        const prevLocLink = wrapLinkForNote(`/locations/${locId}`, name);
+        const kitMarkup = wrapKitsWithDataForNote(kits, "removed");
+        await createSystemLocationNote({
+          locationId: locId,
+          content: `${userLink} removed ${kitMarkup} from ${prevLocLink}.`,
+          userId,
+        });
+      }
+    }
+
+    return { count: actualKitIds.length };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while updating kit location",
+      label,
+    });
+  }
+}
+
+export async function updateKitAssets({
+  kitId,
+  organizationId,
+  userId,
+  assetIds,
+  assetQuantities = {},
+  request,
+  addOnly = false,
+}: {
+  kitId: Kit["id"];
+  organizationId: Organization["id"];
+  userId: User["id"];
+  assetIds: Asset["id"][];
+  /**
+   * Per-asset quantity for QUANTITY_TRACKED rows in the picker. Missing
+   * entries default to the asset's full pool (today's "kit owns the
+   * whole asset" semantics). INDIVIDUAL assets always write quantity = 1
+   * regardless of this map.
+   */
+  assetQuantities?: Record<Asset["id"], number>;
+  request: Request;
+  addOnly?: boolean; // If true, only add assets, don't remove existing ones
+}) {
+  try {
+    const user = await getUserByID(userId, {
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      } satisfies Prisma.UserSelect,
+    });
+    const actor = wrapUserLinkForNote({ ...user, id: userId });
+
+    const kitWithRelations = await db.kit
+      .findUniqueOrThrow({
+        where: { id: kitId, organizationId },
+        include: {
+          location: { select: { id: true, name: true } },
+          // Each pivot row carries the kitId (denormalised) so the
+          // `asset.kit?.id` checks downstream can map to
+          // `asset.assetKits[0]?.kitId`.
+          assetKits: {
+            select: {
+              // This kit's OWN membership ids. `BookingAsset.assetKitId` points
+              // at one of these exactly when a booking holds a slice of THIS
+              // kit, which is how the `kitBookings` derivation below scopes the
+              // new-member propagation.
+              id: true,
+              kitId: true,
+              // This kit's per-row slice — surfaced in the membership-remove
+              // note + ASSET_KIT_CHANGED event ("removed 50 units from ...").
+              // This is AssetKit.quantity, NOT Asset.quantity.
+              quantity: true,
+              asset: {
+                select: {
+                  id: true,
+                  title: true,
+                  // type + unitOfMeasure label the qty-tracked unit count in
+                  // the membership-remove custody-release note.
+                  type: true,
+                  unitOfMeasure: true,
+                  // An archived member holds no kit custody, so removing it
+                  // from a kit in custody releases nothing.
+                  archivedAt: true,
+                  assetKits: { select: { kitId: true } },
+                  bookingAssets: {
+                    include: {
+                      booking: { select: { id: true, status: true } },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          custody: {
+            select: {
+              id: true,
+              custodian: {
+                select: {
+                  id: true,
+                  name: true,
+                  user: {
+                    select: {
+                      id: true,
+                      email: true,
+                      firstName: true,
+                      lastName: true,
+                      displayName: true,
+                      profilePicture: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Kit not found",
+          additionalData: { kitId, userId, organizationId },
+          status: 404,
+          label: "Kit",
+          shouldBeCaptured: !isNotFoundError(cause),
+        });
+      });
+
+    // Flatten the AssetKit pivot rows back into a list of assets so the
+    // rest of this function reads the same way it did pre-pivot. We carry
+    // each row's `AssetKit.quantity` as `kitQuantity` onto the asset so the
+    // remove note + event can name the slice held in THIS kit (NOT the
+    // asset's full pool).
+    const kit = {
+      ...kitWithRelations,
+      assets: (kitWithRelations.assetKits ?? []).map((ak) => ({
+        ...ak.asset,
+        kitQuantity: ak.quantity,
+      })),
+    };
+
+    const kitCustodianDisplay = kit.custody?.custodian
+      ? wrapCustodianForNote({ teamMember: kit.custody.custodian })
+      : undefined;
+
+    const removedAssets = kit.assets.filter(
+      (asset) => !assetIds.includes(asset.id)
+    );
+
+    /**
+     * If user has selected all assets, then we have to get ids of all those assets
+     * with respect to the filters applied.
+     * */
+    const hasSelectedAll = assetIds.includes(ALL_SELECTED_KEY);
+    if (hasSelectedAll) {
+      const searchParams = getCurrentSearchParams(request);
+      /**
+       * Re-runs the picker list's own query, with the options its loader
+       * (`kits.$kitId.assets.manage-assets.tsx`) passes to
+       * `getPaginatedAndFilterableAssets`, so select-all adds exactly the
+       * assets the picker showed. That list refuses every custodian filter
+       * (`canSeeAllCustody: false` with no user), hence `[]`; it is not
+       * scoped to a role and shows active assets, ignoring low stock.
+       */
+      const assetsWhere = await getAssetListWhereForSelectAll({
+        organizationId,
+        currentSearchParams: searchParams.toString(),
+        allowedTeamMemberIds: [],
+        bookableScope: null,
+        locationIdsOverride: undefined,
+        honorArchivedView: false,
+        honorLowStockFilter: false,
+      });
+
+      const allAssets = await db.asset.findMany({
+        where: assetsWhere,
+        select: { id: true },
+      });
+      const kitAssets = kit.assets.map((asset) => asset.id);
+      const removedAssetsIds = removedAssets.map((asset) => asset.id);
+
+      /**
+       * New assets that needs to be added are
+       * - Previously added assets
+       * - All assets with applied filters
+       */
+      assetIds = [
+        ...new Set([
+          ...allAssets.map((asset) => asset.id),
+          ...kitAssets.filter((asset) => !removedAssetsIds.includes(asset)),
+        ]),
+      ];
+    }
+
+    // Get all assets that should be in the kit (based on assetIds) with organization scoping.
+    // `type` and `quantity` are required so that inheriting kit-custody on
+    // qty-tracked assets writes the asset's full tracked quantity into the
+    // child Custody row instead of defaulting to 1.
+    const allAssetsForKit = await db.asset
+      .findMany({
+        // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: the picker submits the kit's whole membership; archived members may be kept or removed (the guard below refuses only adds and quantity changes)
+        where: { id: { in: assetIds }, organizationId },
+        select: {
+          id: true,
+          title: true,
+          type: true,
+          quantity: true,
+          // unitOfMeasure labels the qty-tracked unit count in the custody
+          // grant/release notes ("custody of 50 boxes").
+          unitOfMeasure: true,
+          // All of the asset's AssetKit rows: an INDIVIDUAL asset has at
+          // most one, a QUANTITY_TRACKED asset can be in several kits. We need:
+          //   - kitId (cross-kit detection)
+          //   - quantity (this kit's slice for qty-change diff)
+          //   - kit name (the kit an INDIVIDUAL asset leaves, named in its
+          //     activity note)
+          assetKits: {
+            select: {
+              kitId: true,
+              quantity: true,
+              kit: { select: { id: true, name: true } },
+            },
+          },
+          custody: true,
+          assetLocations: {
+            select: { location: { select: { id: true, name: true } } },
+          },
+        },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message:
+            "Something went wrong while fetching the assets. Please try again or contact support.",
+          additionalData: { assetIds, userId, kitId },
+          label: "Kit",
+        });
+      });
+
+    // Identify which assets are actually new (not already in this kit)
+    const newlyAddedAssets = allAssetsForKit.filter(
+      (asset) =>
+        !kit.assets.some((existingAsset) => existingAsset.id === asset.id)
+    );
+
+    /**
+     * The kit each newly-added asset leaves by joining this one, by asset id.
+     * Absent for a plain add. Named in the move note and the event `fromValue`.
+     */
+    const sourceKitByAssetId = new Map(
+      newlyAddedAssets.flatMap((asset) => {
+        const sourceKit = getKitAnAssetLeaves(asset, kit.id);
+        return sourceKit ? [[asset.id, sourceKit] as const] : [];
+      })
+    );
+
+    /**
+     * The `AssetKit.quantity` each newly-added asset will hold IN THIS KIT
+     * once its pivot row is created. Same derivation as the `createMany`
+     * below (submitted picker qty for QUANTITY_TRACKED, falling back to the
+     * asset's full pool; always 1 for INDIVIDUAL) — extracted so the add
+     * note + ASSET_KIT_CHANGED event surface the same per-kit count without
+     * re-reading the pivot. This is the per-row AssetKit.quantity, NOT
+     * Asset.quantity.
+     */
+    const addedAssetKitQuantity = (asset: {
+      id: string;
+      type: AssetType;
+      quantity: number | null;
+    }): number =>
+      asset.type === AssetType.QUANTITY_TRACKED
+        ? Math.max(1, assetQuantities[asset.id] ?? asset.quantity ?? 1)
+        : 1;
+
+    /**
+     * Existing-in-kit assets whose submitted quantity differs from the current
+     * `AssetKit.quantity`. Each triggers an `assetKit.update` and, when the kit
+     * is in custody, a cascade to the kit-allocated `Custody` row with a paired
+     * `CUSTODY_ASSIGNED` (increase) or `CUSTODY_RELEASED` (decrease) event.
+     *
+     * Empty under `addOnly`, which means create what is missing and change
+     * nothing that exists. Callers in that mode submit a set they believe the
+     * kit does NOT already contain — the scanner decides that from the
+     * membership its page loaded with — so a row that turns out to exist is one
+     * they did not know about, and its quantity belongs to whoever set it.
+     */
+    type QtyChangedAsset = {
+      id: string;
+      title: string;
+      previousQuantity: number;
+      newQuantity: number;
+    };
+    const qtyChangedAssets: QtyChangedAsset[] = (
+      addOnly ? [] : allAssetsForKit
+    ).flatMap((asset) => {
+      // Only consider assets that are already in this kit AND have a
+      // submitted quantity that differs from the current pivot value.
+      const currentPivot = asset.assetKits.find((ak) => ak.kitId === kit.id);
+      if (!currentPivot) return [];
+
+      const submitted = assetQuantities[asset.id];
+      if (submitted == null) return [];
+
+      // INDIVIDUAL is always 1 — picker shouldn't submit anything else,
+      // but defensively coerce.
+      const newQty =
+        asset.type === AssetType.INDIVIDUAL ? 1 : Math.max(0, submitted);
+      if (newQty === currentPivot.quantity) return [];
+
+      // Submitting qty=0 for an existing-in-kit asset is treated as a
+      // no-op here. The picker contract is: to remove an asset from the
+      // kit, omit its id from `assetIds` — that routes through
+      // `removedAssets` (which deletes the pivot row + cascades to
+      // kit-allocated Custody).
+      if (newQty <= 0) return [];
+
+      return [
+        {
+          id: asset.id,
+          title: asset.title,
+          previousQuantity: currentPivot.quantity,
+          newQuantity: newQty,
+        },
+      ];
+    });
+
+    /**
+     * Archived assets are frozen (issue #382): none can join this kit or change
+     * its quantity in it. Checked against the rows this call WRITES, not the
+     * submitted `assetIds`: the picker submits the kit's whole membership, and
+     * an archived member that is merely kept must not lock the kit against
+     * every other edit. Removing an archived member stays allowed. Runs after
+     * the select-all expansion, so the real ids are checked, not the sentinel.
+     */
+    const archiveGuardAssetIds = [
+      ...newlyAddedAssets.map((asset) => asset.id),
+      ...qtyChangedAssets.map((asset) => asset.id),
+    ];
+    await assertAssetsAreNotArchived({
+      assetIds: archiveGuardAssetIds,
+      organizationId,
+      actorUserId: userId,
+    });
+
+    /**
+     * Server-side strict-available validation. The picker enforces this
+     * client-side and the DEFERRED constraint trigger catches
+     * over-allocation at COMMIT, but a tampered request would otherwise
+     * surface as a generic 500. Re-check the strict-available pool here
+     * for any qty-tracked submission and return a clean 400.
+     *
+     * The formula itself lives in `computeKitClaimablePool`, shared with the
+     * picker: a guard that computed the pool differently would refuse what
+     * the picker offered, or accept what it did not.
+     *
+     * `operator-only` filters by `kitCustodyId IS NULL` — kit-allocated
+     * Custody rows mirror the source kit's AssetKit slice and would
+     * otherwise double-count against the multi-kit + in-custody case.
+     */
+    const oversubscribed: Array<{
+      assetId: string;
+      title: string;
+      submitted: number;
+      max: number;
+    }> = [];
+
+    // Same booking term the picker uses: peak concurrent standalone demand
+    // across the whole timeline, because a kit slice has no dates of its own.
+    const peakReservedByAsset = await getPeakReservedUnitsByAsset({
+      assetIds: allAssetsForKit
+        .filter((asset) => asset.type === AssetType.QUANTITY_TRACKED)
+        .map((asset) => asset.id),
+      organizationId,
+      tx: db,
+    });
+
+    /**
+     * Whose submitted quantity is worth measuring against the pool: only the
+     * rows this call will actually write.
+     *
+     * Under `addOnly` an existing membership's submitted quantity is ignored, so
+     * measuring it can only raise a 400 about a row that is not changing — and
+     * that 400 refuses the genuinely new assets in the same request. Derived
+     * from `newlyAddedAssets`, which is computed from the membership read inside
+     * this function, so an asset added concurrently counts as existing here
+     * even though the caller believed it was new.
+     */
+    const assetsToMeasure = addOnly ? newlyAddedAssets : allAssetsForKit;
+
+    for (const asset of assetsToMeasure) {
+      if (asset.type !== AssetType.QUANTITY_TRACKED) continue;
+      const submitted = assetQuantities[asset.id];
+      if (submitted == null) continue;
+
+      const totalQty = asset.quantity ?? 0;
+      const currentInThisKit =
+        asset.assetKits.find((ak) => ak.kitId === kit.id)?.quantity ?? 0;
+      const otherKitsQty = asset.assetKits
+        .filter((ak) => ak.kitId !== kit.id)
+        .reduce((sum, ak) => sum + (ak.quantity ?? 0), 0);
+      const operatorOnlyCustody = (asset.custody ?? [])
+        .filter((c) => c.kitCustodyId == null)
+        .reduce((sum, c) => sum + (c.quantity ?? 0), 0);
+      const occupyingBooked = peakReservedByAsset.get(asset.id) ?? 0;
+
+      const { maxAllowedForThisKit: max } = computeKitClaimablePool({
+        totalQuantity: totalQty,
+        currentInThisKit,
+        otherKitsQuantity: otherKitsQty,
+        operatorCustodyQuantity: operatorOnlyCustody,
+        occupyingBookedQuantity: occupyingBooked,
+      });
+
+      if (submitted > max) {
+        oversubscribed.push({
+          assetId: asset.id,
+          title: asset.title,
+          submitted,
+          max,
+        });
+      }
+    }
+    if (oversubscribed.length > 0) {
+      const detail = oversubscribed
+        .map((o) => `${o.title} (requested ${o.submitted}, max ${o.max})`)
+        .join("; ");
+      throw new ShelfError({
+        cause: null,
+        title: "Quantity exceeds available pool",
+        message: `Submitted quantity exceeds the strict-available pool for: ${detail}.`,
+        additionalData: {
+          kitId,
+          userId,
+          organizationId,
+          oversubscribed,
+        },
+        label: "Kit",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    /**
+     * An INDIVIDUAL asset already in custody cannot be added to a kit.
+     * QUANTITY_TRACKED assets are exempt: their `custody` array can carry
+     * operator-allocated rows for *some* units while the rest of the pool
+     * is free. Option B math in `buildKitCustodyInheritData` allocates
+     * only the remaining pool when the kit is later put in custody, and
+     * silently skips fully-allocated assets. Mirrors the client-side
+     * picker exemption + the kit-custody assign-button exemption.
+     */
+    const isSomeAssetInCustody = newlyAddedAssets.some(
+      (asset) =>
+        asset.type !== AssetType.QUANTITY_TRACKED &&
+        hasCustody(asset.custody) &&
+        asset.assetKits[0]?.kitId !== kit.id
+    );
+    /** The refusal for an INDIVIDUAL asset that is already in custody. */
+    const assetsInCustodyError = () =>
+      new ShelfError({
+        cause: null,
+        message:
+          "Cannot add assets that are already in custody to a kit. Please release custody of assets to allow them to be added to a kit.",
+        additionalData: { userId, kitId },
+        label: "Kit",
+        shouldBeCaptured: false,
+        status: 400,
+      });
+    if (isSomeAssetInCustody) {
+      throw assetsInCustodyError();
+    }
+
+    /**
+     * Bookings that hold a slice of THIS kit.
+     *
+     * A booking carries this kit exactly when it has a `BookingAsset` whose
+     * `assetKitId` is one of this kit's own `AssetKit` ids. Anything else on a
+     * member asset — a standalone row, or a slice belonging to another kit the
+     * asset also happens to be in — is a different booking's business.
+     *
+     * This used to be `kit.assets.find((a) => a.bookingAssets.length > 0)`,
+     * taking one arbitrary member's ENTIRE booking list (the `bookingAssets`
+     * include carries no `where`). That was wrong in both directions, and a
+     * QUANTITY_TRACKED asset shared between kits triggered both at once:
+     *
+     *  - false positive: the member's row belonged to ANOTHER kit's booking, so
+     *    a newly-added member was written into a booking that never contained
+     *    this kit — surfacing a whole extra kit nobody added, and creating
+     *    reservation conflicts that silently disabled that booking's Reserve
+     *    button;
+     *  - false negative: once `.find()` locked onto that member, bookings which
+     *    genuinely DO hold this kit were skipped, so the kit drifted out of
+     *    sync with its own bookings.
+     *
+     * Deduped by booking id: several members of this kit normally sit in the
+     * same booking, and each would otherwise contribute a duplicate insert.
+     */
+    const thisKitAssetKitIds = new Set(
+      kitWithRelations.assetKits.map((ak) => ak.id)
+    );
+    const kitBookings = [
+      ...new Map(
+        kit.assets
+          .flatMap((asset) => asset.bookingAssets)
+          .filter(
+            (ba) =>
+              ba.assetKitId != null && thisKitAssetKitIds.has(ba.assetKitId)
+          )
+          .map((ba) => [ba.booking.id, ba.booking] as const)
+      ).values(),
+    ];
+
+    // The old kit.update({ data: { assets: { connect, disconnect } } })
+    // block becomes direct pivot writes inside a single $transaction so
+    // remove + add + qty-edit are atomic.
+    // Collect AssetKit ids being deleted across both disconnect branches
+    // so we can pre-fetch the kit-driven BookingAsset rows that will be
+    // SET-NULL'd before the delete fires. The corresponding
+    // `emitAssetKitDetachmentNotes` call runs at the end of the tx body
+    // so bookings get a system note explaining the
+    // conversion-to-standalone for their kit-driven slices.
+    let detachmentImpact: Awaited<
+      ReturnType<typeof fetchAssetKitDetachmentImpact>
+    > = [];
+
+    // Newly added assets that were moved to the kit's location — populated
+    // inside the tx, consumed by the post-tx note loop.
+    let locationCascadedAssetIds = new Set<string>();
+
+    await db.$transaction(async (tx) => {
+      // The archived check above is a read; an archive committing before this
+      // write would still join the kit. Re-checked under the row lock the
+      // archive paths take, so the two serialize (issue #382).
+      await lockAssetsForArchiveGuard(tx, archiveGuardAssetIds, organizationId);
+      await assertAssetsAreNotArchived(
+        { assetIds: archiveGuardAssetIds, organizationId, actorUserId: userId },
+        tx
+      );
+
+      // Disconnect: drop the pivot rows for removed assets (only when not
+      // in addOnly mode).
+      if (!addOnly && removedAssets.length > 0) {
+        const aksToDelete = await tx.assetKit.findMany({
+          where: {
+            kitId: kit.id,
+            assetId: { in: removedAssets.map(({ id }) => id) },
+          },
+          select: { id: true },
+        });
+        const aksToDeleteIds = aksToDelete.map((ak: { id: string }) => ak.id);
+        // Runs FIRST: rows on a booking that hasn't started are deleted
+        // outright, so neither the impact snapshot nor the collision merge
+        // below sees a row that is about to disappear.
+        await removeKitSlicesFromPlanningBookings(tx, aksToDeleteIds, {
+          actorUserId: userId,
+          organizationId,
+        });
+        detachmentImpact = detachmentImpact.concat(
+          await fetchAssetKitDetachmentImpact(tx, aksToDeleteIds)
+        );
+        await mergeStandaloneCollisionsForKitDetachment(tx, aksToDeleteIds);
+        await preserveKitDrivenPlacements(tx, aksToDeleteIds);
+        await tx.assetKit.deleteMany({
+          where: {
+            kitId: kit.id,
+            assetId: { in: removedAssets.map(({ id }) => id) },
+          },
+        });
+      }
+
+      // Cross-kit move (INDIVIDUAL only): an INDIVIDUAL asset can only
+      // belong to one kit at a time. If the user selects an INDIVIDUAL
+      // asset that already lives in another kit, drop that pivot row
+      // first so the createMany below succeeds (the
+      // `enforce_individual_asset_single_kit` trigger would otherwise
+      // reject the insert with check_violation).
+      //
+      // QUANTITY_TRACKED assets can co-exist in multiple kits — their
+      // pivot rows in OTHER kits stay intact, and the picker will have
+      // set this kit's quantity in `assetQuantities[id]`.
+      const movedFromOtherKitIds = newlyAddedAssets
+        .filter(
+          (asset) =>
+            asset.type === AssetType.INDIVIDUAL &&
+            (asset.assetKits?.length ?? 0) > 0
+        )
+        .map((asset) => asset.id);
+      if (movedFromOtherKitIds.length > 0) {
+        // Same pre-fetch as above so cross-kit-move INDIVIDUALS get the
+        // detachment notes for any active booking that held the asset
+        // via the OTHER kit. (Edge case but worth covering.)
+        // Org-scoped on both the read and the delete below. `movedFromOtherKitIds`
+        // is already org-derived, so this narrows nothing today — but the read
+        // that feeds the notes/events is org-filtered, and an unfiltered delete
+        // beside it could remove a row the audit trail never mentions.
+        const aksToDelete = await tx.assetKit.findMany({
+          where: { assetId: { in: movedFromOtherKitIds }, organizationId },
+          select: { id: true },
+        });
+        const aksToDeleteIds = aksToDelete.map((ak: { id: string }) => ak.id);
+        // Same ordering rationale as the disconnect branch above.
+        await removeKitSlicesFromPlanningBookings(tx, aksToDeleteIds, {
+          actorUserId: userId,
+          organizationId,
+        });
+        detachmentImpact = detachmentImpact.concat(
+          await fetchAssetKitDetachmentImpact(tx, aksToDeleteIds)
+        );
+        await mergeStandaloneCollisionsForKitDetachment(tx, aksToDeleteIds);
+        await preserveKitDrivenPlacements(tx, aksToDeleteIds);
+        await tx.assetKit.deleteMany({
+          where: { assetId: { in: movedFromOtherKitIds }, organizationId },
+        });
+      }
+
+      // Connect: create one pivot row per newly added asset. Quantity
+      // comes from the submitted `assetQuantities` map for QTY_TRACKED;
+      // INDIVIDUAL is always 1. Missing map entries (today's behaviour
+      // before the picker UI ships in T5) default QTY_TRACKED to the
+      // asset's full pool — matches the backfill so there's no
+      // observable change until the picker is wired up.
+      if (newlyAddedAssets.length > 0) {
+        // Same lock order as a custody assignment, so the two queue instead
+        // of deadlocking. See `lockAssetsForKitMembership`.
+        await lockAssetsForKitMembership(
+          tx,
+          newlyAddedAssets.map((asset) => asset.id),
+          organizationId
+        );
+        await tx.assetKit.createMany({
+          data: newlyAddedAssets.map((asset) => ({
+            assetId: asset.id,
+            kitId: kit.id,
+            organizationId,
+            quantity: addedAssetKitQuantity(asset),
+          })),
+        });
+
+        /**
+         * Re-check custody for the INDIVIDUAL assets just added, now that the
+         * insert holds them.
+         *
+         * The in-custody check above read the assets before this transaction.
+         * A custody assignment can commit in between, so the insert's own
+         * foreign-key lock (`FOR KEY SHARE` on each asset) is what orders the
+         * two: it waits for an assignment's `FOR UPDATE` lock
+         * (`assertNotKitMembers`), and this read, a new statement under READ
+         * COMMITTED, then sees the custody row it committed. Kit-derived rows
+         * are excluded: those come from a kit and are refused above already.
+         */
+        const addedIndividualIds = newlyAddedAssets
+          .filter((asset) => asset.type !== AssetType.QUANTITY_TRACKED)
+          .map((asset) => asset.id);
+        if (addedIndividualIds.length > 0) {
+          const heldMember = await tx.custody.findFirst({
+            where: {
+              assetId: { in: addedIndividualIds },
+              asset: { organizationId },
+              kitCustodyId: null,
+            },
+            select: { id: true },
+          });
+          if (heldMember) {
+            throw assetsInCustodyError();
+          }
+        }
+      }
+
+      // Update: existing-in-kit assets whose submitted quantity differs
+      // from the current pivot value. Each row needs its own update
+      // because Prisma's updateMany doesn't support per-row data.
+      if (qtyChangedAssets.length > 0) {
+        for (const change of qtyChangedAssets) {
+          await tx.assetKit.update({
+            where: {
+              assetId_kitId: { assetId: change.id, kitId: kit.id },
+            },
+            data: { quantity: change.newQuantity },
+          });
+          // Keep the kit-driven placement row in step with the slice it
+          // mirrors (1:1 via `AssetLocation_kit_unique`) — otherwise a kit
+          // resized from 20 to 30 keeps advertising 20 units at its location
+          // until someone moves it. No-op when the kit has no location, since
+          // then no kit-driven row exists.
+          await tx.assetLocation.updateMany({
+            where: { assetKit: { kitId: kit.id, assetId: change.id } },
+            data: { quantity: change.newQuantity },
+          });
+        }
+      }
+
+      // A kit's location owns its members' whereabouts, so joining a kit that
+      // sits somewhere moves the asset there — otherwise a newly added asset
+      // would keep its old location until the next kit-location change, and
+      // the kit would claim members that aren't with it. Scoped to the newly
+      // added assets so existing members aren't re-placed by an "add" op.
+      // Local const so the `string | null` narrowing survives into the
+      // `.map()` callbacks below.
+      const kitLocationId = kit.locationId;
+      if (kitLocationId && newlyAddedAssets.length > 0) {
+        locationCascadedAssetIds = await cascadeKitLocationToAssets(
+          {
+            kitIds: [kit.id],
+            newLocationId: kitLocationId,
+            organizationId,
+            assetIds: newlyAddedAssets.map((asset) => asset.id),
+          },
+          tx
+        );
+
+        const movedAssets = newlyAddedAssets.filter(
+          (asset) =>
+            locationCascadedAssetIds.has(asset.id) &&
+            (getPrimaryLocation(asset)?.id ?? null) !== kitLocationId
+        );
+        if (movedAssets.length > 0) {
+          await recordEvents(
+            movedAssets.map((asset) => ({
+              organizationId,
+              actorUserId: userId,
+              action: "ASSET_LOCATION_CHANGED" as const,
+              entityType: "ASSET" as const,
+              entityId: asset.id,
+              assetId: asset.id,
+              kitId: kit.id,
+              locationId: kitLocationId,
+              field: "locationId",
+              fromValue: getPrimaryLocation(asset)?.id ?? null,
+              toValue: kitLocationId,
+              // `meta.quantity` (qty-tracked only) = the slice this kit now
+              // holds, matching the kit-driven AssetLocation row written above.
+              meta: {
+                viaKit: true,
+                ...assetQtyMeta(asset, addedAssetKitQuantity(asset)),
+              },
+            })),
+            tx
+          );
+        }
+      }
+
+      if (qtyChangedAssets.length > 0) {
+        // Live link: every kit-driven BookingAsset row pointing at the
+        // updated AssetKit gets its quantity synced. The reverse path
+        // (BookingAsset → kit slice update) is *not* live; users edit
+        // the booking through its own picker. This is one-way: the kit
+        // is the source of truth for its slice.
+        //
+        // `BookingAsset` has no Prisma relation accessor on `assetKit`
+        // (intentional — see the schema comment); resolve the AssetKit
+        // id first, then update BookingAsset rows by `assetKitId`.
+        const aksToSync = await tx.assetKit.findMany({
+          where: {
+            kitId: kit.id,
+            assetId: { in: qtyChangedAssets.map((c) => c.id) },
+          },
+          select: { id: true, assetId: true, quantity: true },
+        });
+        const newQtyByAk = new Map(
+          aksToSync.map((ak: { id: string; assetId: string }) => {
+            const change = qtyChangedAssets.find((c) => c.id === ak.assetId);
+            return [ak.id, change?.newQuantity ?? null] as const;
+          })
+        );
+
+        // Check-in floor guard (Polish-7b): the kit's slice quantity is
+        // the source of truth for its kit-driven BookingAsset rows, but it
+        // must NOT be shrunk below units already checked in against that
+        // exact slice. `ConsumptionLog` now carries `bookingAssetId`, so we
+        // can sum per-row check-ins and refuse the shrink with a clear
+        // error. (Legacy `bookingAssetId IS NULL` logs pre-date per-row
+        // attribution and aren't counted here — same as the pre-guard
+        // behaviour for those rows, so no regression.)
+        const akIdsWithNewQty = [...newQtyByAk.entries()]
+          .filter(([, q]) => q != null)
+          .map(([id]) => id);
+        if (akIdsWithNewQty.length > 0) {
+          const drivenRows = await tx.bookingAsset.findMany({
+            where: { assetKitId: { in: akIdsWithNewQty } },
+            select: {
+              id: true,
+              assetKitId: true,
+              asset: { select: { title: true } },
+              booking: { select: { name: true } },
+            },
+          });
+          if (drivenRows.length > 0) {
+            const checkedInByRow = new Map<string, number>();
+            const logSums = await tx.consumptionLog.groupBy({
+              by: ["bookingAssetId"],
+              where: {
+                bookingAssetId: {
+                  in: drivenRows.map((r: { id: string }) => r.id),
+                },
+                // The four check-in disposition categories — units that
+                // have flowed back against this slice.
+                category: { in: ["RETURN", "CONSUME", "LOSS", "DAMAGE"] },
+              },
+              _sum: { quantity: true },
+            });
+            for (const g of logSums as Array<{
+              bookingAssetId: string | null;
+              _sum: { quantity: number | null };
+            }>) {
+              if (g.bookingAssetId) {
+                checkedInByRow.set(g.bookingAssetId, g._sum.quantity ?? 0);
+              }
+            }
+            const violations = drivenRows.flatMap(
+              (row: {
+                id: string;
+                assetKitId: string | null;
+                asset: { title: string };
+                booking: { name: string };
+              }) => {
+                const newQty = row.assetKitId
+                  ? newQtyByAk.get(row.assetKitId)
+                  : null;
+                const checkedIn = checkedInByRow.get(row.id) ?? 0;
+                return newQty != null && newQty < checkedIn
+                  ? [
+                      `"${row.asset.title}" on booking "${row.booking.name}" (${checkedIn} already checked in)`,
+                    ]
+                  : [];
+              }
+            );
+            if (violations.length > 0) {
+              throw new ShelfError({
+                cause: null,
+                status: 400,
+                label,
+                message: `Cannot reduce kit quantity below units already checked in: ${violations.join(
+                  "; "
+                )}. Check in fewer units or choose a higher quantity.`,
+                shouldBeCaptured: false,
+              });
+            }
+          }
+        }
+
+        for (const [akId, newQty] of newQtyByAk) {
+          if (newQty == null) continue;
+          await tx.bookingAsset.updateMany({
+            where: { assetKitId: akId },
+            data: { quantity: newQty },
+          });
+        }
+
+        // No mirrored `AssetLocation` update — kit slice quantity lives on
+        // `AssetKit` alone (and propagates to kit-driven `BookingAsset` rows
+        // above). The `AssetLocation` axis is orthogonal and isn't touched
+        // by kit-membership writes.
+      }
+    });
+
+    // Notify each affected booking that its kit-driven BookingAsset
+    // slice has been converted to standalone (via the DB-level
+    // `SET NULL` cascade that ran inside the tx above). Outside the tx
+    // so the notes only land if the cascade actually committed.
+    await emitAssetKitDetachmentNotes({
+      impact: detachmentImpact,
+      actor: { ...user, id: userId },
+      organizationId,
+    });
+
+    // We synthesise the `{ kit }` field the note helper consumes from
+    // each asset's current `assetKits` pivot rows.
+    const newlyAddedAssetsForNotes = newlyAddedAssets.map((asset) => ({
+      id: asset.id,
+      title: asset.title,
+      // Qty-tracked add note count. `quantity` is the per-row
+      // AssetKit.quantity this asset will hold in THIS kit (same value the
+      // pivot createMany wrote), not Asset.quantity.
+      type: asset.type,
+      unitOfMeasure: asset.unitOfMeasure,
+      quantity: addedAssetKitQuantity(asset),
+      // The kit it leaves, so a move reads "changed kit from A to B".
+      kit: sourceKitByAssetId.get(asset.id) ?? null,
+    }));
+    const removedAssetsForNotes = (addOnly ? [] : removedAssets).map(
+      (asset) => ({
+        id: asset.id,
+        title: asset.title,
+        // Qty-tracked remove note count. `kitQuantity` is the per-row
+        // AssetKit.quantity this asset held in THIS kit (captured at fetch
+        // time, before the pivot row was deleted), not Asset.quantity.
+        type: asset.type,
+        unitOfMeasure: asset.unitOfMeasure,
+        quantity: asset.kitQuantity,
+        // Removed assets came from `kit.assets`, which itself was
+        // flattened off `assetKits` for this kit — so the source kit
+        // is the parent kit we're editing.
+        kit: { id: kit.id, name: kit.name },
+      })
+    );
+
+    await createBulkKitChangeNotes({
+      kit,
+      organizationId,
+      newlyAddedAssets: newlyAddedAssetsForNotes,
+      removedAssets: removedAssetsForNotes,
+      userId,
+    });
+
+    // Per-asset note for members the kit's location moved on join — same
+    // wording as the cascade note written by `updateKitLocation`.
+    const locationMovedAssets = newlyAddedAssets.filter(
+      (asset) =>
+        locationCascadedAssetIds.has(asset.id) &&
+        (getPrimaryLocation(asset)?.id ?? null) !== kit.locationId
+    );
+    if (locationMovedAssets.length > 0 && kit.location) {
+      await Promise.all(
+        locationMovedAssets.map((asset) =>
+          createNote({
+            content: getKitLocationUpdateNoteContent({
+              currentLocation: getPrimaryLocation(asset),
+              newLocation: kit.location,
+              userId,
+              firstName: user?.firstName ?? "",
+              lastName: user?.lastName ?? "",
+              isRemoving: false,
+              // Qty-tracked cascade names the slice this kit now holds.
+              type: asset.type,
+              unitOfMeasure: asset.unitOfMeasure,
+              quantity: addedAssetKitQuantity(asset),
+            }),
+            type: "UPDATE",
+            userId,
+            assetId: asset.id,
+            // why: asset was loaded scoped to organizationId — pass the org
+            // so the note is validated against the asset's true org
+            organizationId,
+          })
+        )
+      );
+    }
+
+    // Activity events — one ASSET_KIT_CHANGED per asset added or removed.
+    const kitChangeEvents: Parameters<typeof recordEvents>[0] = [
+      ...newlyAddedAssets.map((asset) => ({
+        organizationId,
+        actorUserId: userId,
+        action: "ASSET_KIT_CHANGED" as const,
+        entityType: "ASSET" as const,
+        entityId: asset.id,
+        assetId: asset.id,
+        kitId: kit.id,
+        field: "kitId",
+        // The kit an INDIVIDUAL asset leaves; null for a plain add.
+        fromValue: sourceKitByAssetId.get(asset.id)?.id ?? null,
+        toValue: kit.id,
+        // Qty-tracked: record the per-row AssetKit.quantity this asset now
+        // holds in the kit (same value the pivot createMany wrote).
+        meta: { ...assetQtyMeta(asset, addedAssetKitQuantity(asset)) },
+      })),
+      ...(addOnly ? [] : removedAssets).map((asset) => ({
+        organizationId,
+        actorUserId: userId,
+        action: "ASSET_KIT_CHANGED" as const,
+        entityType: "ASSET" as const,
+        entityId: asset.id,
+        assetId: asset.id,
+        // The removal is still "about" this kit — populate the cross-ref so
+        // "all activity for kit X" report queries see both adds and removes.
+        kitId: kit.id,
+        field: "kitId",
+        fromValue: kit.id,
+        toValue: null,
+        // Qty-tracked: record the per-row AssetKit.quantity this asset held
+        // in the kit before its pivot row was deleted.
+        meta: { ...assetQtyMeta(asset, asset.kitQuantity) },
+      })),
+    ];
+    if (kitChangeEvents.length > 0) {
+      await recordEvents(kitChangeEvents);
+    }
+
+    /**
+     * If a kit is in custody then the assets added to kit will also inherit the status
+     */
+    const assetsToInheritStatus = newlyAddedAssets.filter(
+      (asset) => !hasCustody(asset.custody)
+    );
+
+    if (
+      kit.custody &&
+      kit.custody.id &&
+      kit.custody.custodian.id &&
+      assetsToInheritStatus.length > 0
+    ) {
+      // Uses `buildKitCustodyInheritData` below to write child Custody
+      // rows with `kitCustodyId` set and the *remaining* tracked
+      // quantity per asset. A regressed shape that does per-asset
+      // `Asset.update` with default `quantity: 1` and no `kitCustodyId`
+      // would orphan operator-assigned custody on qty-tracked assets
+      // and break the partial-custody invariants. The CUSTODY_ASSIGNED
+      // events are emitted further below alongside the inheritData.
+      const kitCustodyId = kit.custody.id;
+      const teamMemberId = kit.custody.custodian.id;
+
+      // Build child Custody rows tagged with `kitCustodyId` and threaded with
+      // the asset's *remaining* tracked quantity (qty-tracked) or 1
+      // (individual). The helper subtracts already-allocated custody so the
+      // kit-allocated row never over-allocates the asset's pool. See
+      // `buildKitCustodyInheritData`. Must run inside the tx — its read of
+      // existing custody must see rows written earlier in this tx.
+      // Returns the inherited Custody rows ({ assetId, quantity }) so the
+      // post-tx note can name the per-asset unit count without re-reading.
+      const inheritedRows = await db.$transaction(async (tx) => {
+        const inheritData = await buildKitCustodyInheritData({
+          tx,
+          kitId: kit.id,
+          kitCustodyId,
+          teamMemberId,
+          assetIds: assetsToInheritStatus.map((a) => a.id),
+        });
+
+        if (inheritData.length === 0) return [];
+
+        await tx.custody.createMany({ data: inheritData });
+
+        // `assetsToInheritStatus` filters on `hasCustody` alone, which does
+        // not exclude a checked-out asset — hence the guarded write.
+        // @see {@link file://./../asset/custody-status.server.ts}
+        const inheritedIds = inheritData.map((row) => row.assetId);
+        await setCustodyDrivenAssetStatus(
+          tx,
+          inheritedIds,
+          organizationId,
+          AssetStatus.IN_CUSTODY
+        );
+
+        // Activity events — one CUSTODY_ASSIGNED per asset that inherited
+        // custody. `meta.quantity` is the per-row count `buildKitCustodyInheritData`
+        // already computed (the asset's real slice for qty-tracked, 1 for
+        // INDIVIDUAL), so the event meta is left exactly as before.
+        await recordEvents(
+          inheritData.map((row) => ({
+            organizationId,
+            actorUserId: userId,
+            action: "CUSTODY_ASSIGNED" as const,
+            entityType: "ASSET" as const,
+            entityId: row.assetId,
+            assetId: row.assetId,
+            kitId: kit.id,
+            teamMemberId,
+            targetUserId: kit.custody?.custodian?.user?.id ?? undefined,
+            meta: { viaKit: true, quantity: row.quantity },
+          })),
+          tx
+        );
+        return inheritData.map((row) => ({
+          assetId: row.assetId,
+          quantity: row.quantity,
+        }));
+      });
+
+      // Create notes only for assets that actually received an inherited
+      // custody row. Fully operator-allocated qty-tracked assets are skipped
+      // (no kit-custody row → no "granted custody" note for that asset).
+      if (inheritedRows.length > 0) {
+        const custodianDisplay = kitCustodianDisplay ?? "**Unknown Custodian**";
+        // Asset shape (type / unitOfMeasure) keyed by id, for the unit count.
+        const assetById = new Map(allAssetsForKit.map((a) => [a.id, a]));
+        // One note per inheriting asset: qty-tracked assets name the granted
+        // units ("custody of 50 units"); INDIVIDUAL phrasing stays unchanged.
+        // why: assets resolved scoped to organizationId for this kit, so the
+        // note writes target same-tenant assets only.
+        const grantNoteData = inheritedRows.map((row) => {
+          const asset = assetById.get(row.assetId);
+          const count = asset ? formatUnitCount(asset, row.quantity) : null;
+          const custodyPhrase = count ? `custody of ${count}` : "custody";
+          return {
+            content: `${actor} granted ${custodianDisplay} ${custodyPhrase}.`,
+            type: NoteType.UPDATE,
+            userId,
+            assetId: row.assetId,
+          };
+        });
+        await db.note.createMany({ data: grantNoteData });
+      }
+    }
+
+    /**
+     * In-custody kit qty-edit cascade.
+     *
+     * When the user changes a QUANTITY_TRACKED asset's quantity inside a
+     * kit that's currently in custody, the kit-allocated `Custody.quantity`
+     * needs to track the new `AssetKit.quantity`. Otherwise the custodian's
+     * apparent allocation drifts out of sync with the kit's composition.
+     *
+     * For each qty-changed asset:
+     * - Look up the kit-allocated Custody row (`kitCustodyId =
+     *   kit.custody.id`).
+     * - Update its quantity to match.
+     * - Emit `CUSTODY_ASSIGNED` (increase) or `CUSTODY_RELEASED` (decrease)
+     *   with `meta: { viaKit: true, quantity: <delta> }` so reports see
+     *   the size of the change.
+     *
+     * If no kit-allocated Custody row exists (e.g. asset was fully
+     * operator-allocated when the kit got custody, so `buildKitCustodyInheritData`
+     * skipped it), we don't create one here — the qty-change alone
+     * doesn't grant new custody. Picker UX should explain this case to
+     * the user when it arises.
+     */
+    if (
+      kit.custody &&
+      kit.custody.id &&
+      kit.custody.custodian.id &&
+      qtyChangedAssets.length > 0
+    ) {
+      const kitCustodyId = kit.custody.id;
+      const targetUserId = kit.custody.custodian.user?.id ?? undefined;
+      const teamMemberId = kit.custody.custodian.id;
+
+      await db.$transaction(async (tx) => {
+        // Pre-fetch existing kit-allocated rows so we know which assets
+        // actually have something to cascade (and what the previous
+        // quantity was, in case it's drifted from `currentPivot.quantity`).
+        const existingRows = await tx.custody.findMany({
+          where: {
+            assetId: { in: qtyChangedAssets.map((c) => c.id) },
+            kitCustodyId,
+          },
+          select: { id: true, assetId: true, quantity: true },
+        });
+        const existingByAssetId = new Map(
+          existingRows.map((r) => [r.assetId, r])
+        );
+
+        const events: Parameters<typeof recordEvents>[0] = [];
+        for (const change of qtyChangedAssets) {
+          const existing = existingByAssetId.get(change.id);
+          if (!existing) continue;
+
+          const delta = change.newQuantity - existing.quantity;
+          if (delta === 0) continue;
+
+          await tx.custody.update({
+            where: { id: existing.id },
+            data: { quantity: change.newQuantity },
+          });
+
+          events.push({
+            organizationId,
+            actorUserId: userId,
+            action: delta > 0 ? "CUSTODY_ASSIGNED" : "CUSTODY_RELEASED",
+            entityType: "ASSET" as const,
+            entityId: change.id,
+            assetId: change.id,
+            kitId: kit.id,
+            teamMemberId,
+            targetUserId,
+            meta: { viaKit: true, quantity: Math.abs(delta) },
+          });
+        }
+
+        if (events.length > 0) {
+          await recordEvents(events, tx);
+        }
+      });
+    }
+
+    /**
+     * If a kit is in custody and some assets are removed,
+     * then we have to make the removed assets Available
+     * Only apply this when not in addOnly mode
+     */
+    // Archived members never took the kit's custody (issue #382), so they get
+    // no release note, event or status write when they leave the kit.
+    const removedCustodyMembers = removedAssets.filter(
+      (asset) => !asset.archivedAt
+    );
+    if (
+      !addOnly &&
+      removedCustodyMembers.length &&
+      kit.custody?.id &&
+      kit.custody.custodian.id
+    ) {
+      const custodianDisplay = kitCustodianDisplay ?? "**Unknown Custodian**";
+      const assetIds = removedCustodyMembers.map((a) => a.id);
+      // Filter the kit-custody delete by `kitCustodyId` so only the
+      // kit-allocated rows are removed; operator-assigned per-unit
+      // custody on the same asset stays. Emitting events keyed only
+      // on the kit's primary custodian id would mis-attribute
+      // multi-custodian qty-tracked rows.
+      const kitCustodyId = kit.custody.id;
+
+      // Asset shape (type / unitOfMeasure) keyed by id, for the unit count.
+      const assetById = new Map(removedCustodyMembers.map((a) => [a.id, a]));
+      // Per-asset released units, populated inside the tx from the kit-
+      // allocated Custody rows; consumed by the post-tx note. Assets with no
+      // kit-custody row stay absent → no count → unchanged "custody" wording.
+      const releasedQtyByAssetId = new Map<string, number | null>();
+
+      // Use transaction for atomicity - prevents orphaned custody records.
+      // Filter the deleteMany by `kitCustodyId` so only kit-allocated rows
+      // are removed. Operator-assigned per-unit custody on the same asset
+      // (`kitCustodyId IS NULL`) stays — that's separate ownership.
+      await db.$transaction(async (tx) => {
+        // Capture the kit-allocated rows before deletion to emit events.
+        const removedKitCustodyRows = await tx.custody.findMany({
+          where: { assetId: { in: assetIds }, kitCustodyId },
+          // quantity → qty-tracked unit count in the event meta + note.
+          select: { assetId: true, teamMemberId: true, quantity: true },
+        });
+
+        if (removedKitCustodyRows.length > 0) {
+          for (const row of removedKitCustodyRows) {
+            releasedQtyByAssetId.set(row.assetId, row.quantity);
+          }
+          await recordEvents(
+            removedKitCustodyRows.map((row) => {
+              const asset = assetById.get(row.assetId);
+              return {
+                organizationId,
+                actorUserId: userId,
+                action: "CUSTODY_RELEASED" as const,
+                entityType: "ASSET" as const,
+                entityId: row.assetId,
+                assetId: row.assetId,
+                kitId: kit.id,
+                teamMemberId: row.teamMemberId,
+                targetUserId: kit.custody?.custodian?.user?.id ?? undefined,
+                meta: {
+                  viaKit: true,
+                  ...(asset ? assetQtyMeta(asset, row.quantity) : {}),
+                },
+              };
+            }),
+            tx
+          );
+        }
+
+        await tx.custody.deleteMany({
+          where: { assetId: { in: assetIds }, kitCustodyId },
+        });
+
+        // Only flip the asset to AVAILABLE when no remaining Custody
+        // rows exist after deleting the kit-allocated ones (operator-
+        // assigned per-unit custody keeps it IN_CUSTODY). CUSTODY_RELEASED
+        // events are already emitted above keyed on each Custody row's
+        // `teamMemberId`, so a post-delete blanket emission keyed only
+        // on the kit's primary custodian would mis-attribute multi-
+        // custodian rows.
+        const stillCustodied = await tx.custody.findMany({
+          where: { assetId: { in: assetIds } },
+          select: { assetId: true },
+        });
+        const stillCustodiedIds = new Set(stillCustodied.map((c) => c.assetId));
+        const assetsToFlipAvailable = assetIds.filter(
+          (id) => !stillCustodiedIds.has(id)
+        );
+        await releaseAssetsToAvailableUnlessCheckedOut(
+          tx,
+          assetsToFlipAvailable,
+          organizationId
+        );
+      });
+
+      // Notes can be created outside transaction (not critical for consistency).
+      // One note per removed asset: qty-tracked assets that had kit custody
+      // name the released units ("custody of 50 units"); assets without a
+      // kit-custody row (and all INDIVIDUAL assets) keep the prior wording.
+      // why: assetIds derived from this kit's org-scoped assets — same-tenant
+      // by construction.
+      const releaseNoteData = removedCustodyMembers.map((asset) => {
+        const count = formatUnitCount(
+          asset,
+          releasedQtyByAssetId.get(asset.id)
+        );
+        const custodyPhrase = count ? `custody of ${count}` : "custody";
+        return {
+          content: `${actor} released ${custodianDisplay}'s ${custodyPhrase}.`,
+          type: NoteType.UPDATE,
+          userId,
+          assetId: asset.id,
+        };
+      });
+      if (releaseNoteData.length > 0) {
+        await db.note.createMany({ data: releaseNoteData });
+      }
+    }
+
+    /**
+     * If user is adding/removing an asset to a kit which is a part of DRAFT, RESERVED, ONGOING or OVERDUE booking,
+     * then we have to add or remove these assets to booking also
+     */
+    const bookingsToUpdate = kitBookings.filter(
+      (b) =>
+        b.status === "DRAFT" ||
+        b.status === "RESERVED" ||
+        b.status === "ONGOING" ||
+        b.status === "OVERDUE"
+    );
+
+    if (bookingsToUpdate?.length) {
+      // When the kit picks up a new asset and the kit is already part of
+      // a draft/active booking, the booking carries the kit as a unit —
+      // so the new asset must be added to that booking as a kit-driven
+      // row. Resolve the AssetKit ids the picker just created so we can
+      // populate `assetKitId` (groups the row under the kit in the
+      // booking UI) and `quantity` (inherits the kit's slice qty rather
+      // than defaulting to 1, which would silently mis-count
+      // QUANTITY_TRACKED assets in the booking).
+      const newAssetIds = newlyAddedAssets.map((a) => a.id);
+      const newAssetKits =
+        newAssetIds.length > 0
+          ? await db.assetKit.findMany({
+              where: { kitId: kit.id, assetId: { in: newAssetIds } },
+              select: { id: true, assetId: true, quantity: true },
+            })
+          : [];
+      const akByAssetId = new Map(newAssetKits.map((ak) => [ak.assetId, ak]));
+
+      /**
+       * Reporting events for the rows just propagated above.
+       *
+       * These are `ActivityEvent` rows — reporting data, NOT the booking's
+       * notes feed (that is `BookingNote`, which the Activity tab and its CSV
+       * export read). No note is written here deliberately: nobody acted on
+       * the booking, so there is nothing to tell its watchers.
+       *
+       * Emitting them matters because this insert is the only way a booking
+       * gains an asset without anybody touching the booking. Until now it left
+       * no trace in ANY table, which is what made the cross-kit leak this
+       * scoping fix addresses impossible to reconstruct after the fact.
+       * `BOOKING_ASSETS_ADDED` has no report consumer yet — it is recorded for
+       * the same reason `updateBookingAssets` records it, so the history exists
+       * when one arrives.
+       *
+       * One event per (booking, asset) pair rather than one per booking, so the
+       * data stays aggregable — see `.claude/rules/record-event-payload-shapes.md`.
+       * `kitId` names the kit that pulled the asset in, which is the provenance
+       * needed to explain why the row is there.
+       *
+       * Scoped to assets with a resolved `AssetKit`: those rows are keyed on a
+       * brand-new `assetKitId`, so the `(bookingId, assetKitId)` partial unique
+       * cannot collide and `skipDuplicates` cannot have silently dropped them.
+       * The `ak`-less fallback writes a standalone row that MAY be skipped
+       * against an existing one, and claiming an add that did not happen would
+       * make the trail lie.
+       */
+      const buildPropagatedEvents = (
+        bookings: typeof bookingsToUpdate,
+        assets: typeof newlyAddedAssets
+      ) =>
+        bookings.flatMap((booking) =>
+          assets.flatMap((asset) => {
+            const ak = akByAssetId.get(asset.id);
+            if (!ak) return [];
+            return [
+              {
+                organizationId,
+                actorUserId: userId,
+                action: "BOOKING_ASSETS_ADDED" as const,
+                entityType: "BOOKING" as const,
+                entityId: booking.id,
+                bookingId: booking.id,
+                assetId: asset.id,
+                kitId: kit.id,
+                meta: assetQtyMeta(asset, ak.quantity),
+              },
+            ];
+          })
+        );
+
+      /**
+       * Propagated rows and their events commit together.
+       *
+       * A row that lands without its event is not merely untidy, it is
+       * unrecoverable: the membership transaction above has already persisted
+       * the `AssetKit` rows, so a retried call recomputes `newlyAddedAssets` as
+       * empty (it diffs the submitted ids against the kit's CURRENT members),
+       * skips this block entirely, and never re-emits the event. The booking
+       * would keep an asset whose arrival nothing recorded — the exact
+       * untraceability these events exist to prevent.
+       *
+       * A NEW narrow transaction rather than the membership one above: that tx
+       * already carries the detachment-impact fetch, collision merge, placement
+       * preservation, location cascade and a `consumptionLog.groupBy`, and has
+       * produced P2028 on large operations. Reads stay outside it (the
+       * `assetKit.findMany` above, and the event array is pure computation) so
+       * it holds writes only.
+       *
+       * Sequential, not `Promise.all`: an interactive transaction runs on a
+       * single connection, so concurrent queries on one `tx` client are unsafe.
+       * `bookingsToUpdate` is the set of bookings holding this kit — small.
+       *
+       * Residual, deliberately accepted: the membership tx has already
+       * committed, so a failure here still surfaces an error over a partly
+       * applied operation. This guarantees only that the propagated rows and
+       * their audit trail live or die together.
+       */
+      if (newlyAddedAssets.length > 0) {
+        await db.$transaction(async (tx) => {
+          /**
+           * Which of those bookings is live, under a row lock, BEFORE anything
+           * in this transaction writes to them.
+           *
+           * `bookingsToUpdate` carries the status read at the top of this
+           * function — outside any transaction, and potentially seconds ago —
+           * so a check-in that has since completed still reads as ONGOING
+           * here. A plain re-read inside the transaction narrows that window;
+           * only the lock closes it. See `lockBookingForStatusCheck`.
+           *
+           * The lock has to come first, and the whole transaction has to be
+           * ordered around that. Inserting a `BookingAsset` row makes Postgres
+           * take FOR KEY SHARE on the parent `Booking` row to validate the
+           * foreign key, and FOR KEY SHARE is a SHARED mode: two callers can
+           * hold it on the same row at once. If either then asks for FOR
+           * UPDATE, which conflicts with it, each waits on the other's share
+           * and Postgres aborts one with a deadlock. Sorting cannot help — the
+           * two sides are contending for a single row, in identical order.
+           * Taking the strongest lock first means nothing is ever upgraded.
+           * `updateBookingAssets` and the scan-add path order themselves the
+           * same way.
+           *
+           * Sorted so concurrent callers take the locks in the same order and
+           * cannot deadlock across two different bookings.
+           *
+           * Sequential, not `Promise.all`: an interactive transaction runs on a
+           * single connection. The set is the bookings holding this kit, small.
+           *
+           * This does not make the stamp race-free by itself, and is not meant
+           * to. `checkinBooking` computes which assets to release BEFORE
+           * opening its own transaction, so a check-in already in flight never
+           * sees a member added after that read. Closing the remaining half
+           * belongs in the check-in path, not here.
+           */
+          const candidateBookingIds = bookingsToUpdate
+            .filter((b) => b.status === "ONGOING" || b.status === "OVERDUE")
+            .map((b) => b.id)
+            .sort();
+
+          const liveBookingIds: string[] = [];
+          for (const bookingId of candidateBookingIds) {
+            const currentStatus = await lockBookingForStatusCheck(
+              tx,
+              bookingId,
+              organizationId
+            );
+            if (
+              currentStatus === BookingStatus.ONGOING ||
+              currentStatus === BookingStatus.OVERDUE
+            ) {
+              liveBookingIds.push(bookingId);
+            }
+          }
+
+          /**
+           * The new members that may still go onto bookings. The membership
+           * transaction above locked and checked them, but it has committed,
+           * and an archive could have landed since (issue #382). Locked here
+           * after the booking locks — booking then assets, the order
+           * `updateBookingAssets` takes — and archived members SKIPPED rather
+           * than refused: the membership change has already happened, and an
+           * archived kit member stays out of bookings the same way it stays out
+           * of kit custody.
+           */
+          const newAssetIds = newlyAddedAssets.map((a) => a.id);
+          await lockAssetsForArchiveGuard(tx, newAssetIds, organizationId);
+          const archivedSinceIds = new Set(
+            (
+              await tx.asset.findMany({
+                where: {
+                  id: { in: newAssetIds },
+                  organizationId,
+                  archivedAt: { not: null },
+                },
+                select: { id: true },
+              })
+            ).map((a) => a.id)
+          );
+          const assetsToPropagate = newlyAddedAssets.filter(
+            (a) => !archivedSinceIds.has(a.id)
+          );
+
+          /**
+           * The bookings this call actually writes to.
+           *
+           * A booking that is still in planning takes the member unconditionally
+           * — nothing has left the building, so there is nothing to be late for.
+           * A live one has to prove it is still live under the lock: the status
+           * on `bookingsToUpdate` was read outside any transaction, and a
+           * check-in that has since committed would otherwise gain an asset it
+           * never held, on a booking already reported as finished.
+           */
+          const liveBookingIdSet = new Set(liveBookingIds);
+          const bookingsReceivingRows = bookingsToUpdate.filter(
+            (b) =>
+              b.status === BookingStatus.DRAFT ||
+              b.status === BookingStatus.RESERVED ||
+              liveBookingIdSet.has(b.id)
+          );
+
+          for (const booking of bookingsReceivingRows) {
+            await tx.bookingAsset.createMany({
+              data: assetsToPropagate.map((a) => {
+                const ak = akByAssetId.get(a.id);
+                return {
+                  bookingId: booking.id,
+                  assetId: a.id,
+                  quantity: ak?.quantity ?? 1,
+                  assetKitId: ak?.id ?? null,
+                  // Mirror the assetKitId branch exactly: a row that falls
+                  // back to standalone has no kit provenance either. Writing
+                  // one without the other breaks the
+                  // "assetKitId non-null ⇔ sourceKitId non-null" invariant.
+                  sourceKitId: ak ? kit.id : null,
+                };
+              }),
+              skipDuplicates: true,
+            });
+          }
+
+          // Built from the same set the rows were written to, so the trail
+          // reports exactly what persisted.
+          const propagatedEvents = buildPropagatedEvents(
+            bookingsReceivingRows,
+            assetsToPropagate
+          );
+          if (propagatedEvents.length > 0) {
+            await recordEvents(propagatedEvents, tx);
+          }
+
+          /**
+           * Is THIS kit out right now on one of those bookings?
+           *
+           * A booking's own status cannot answer that. Progressive checkout
+           * flips a booking to ONGOING on the first scan, so a booking can be
+           * live while this kit was never scanned out — partial checkout only
+           * stamps kits whose every slice went (`completeKitIds`).
+           * `BookingAsset.checkedOutAt` is the authoritative per-slice fact,
+           * so ask the slices instead.
+           *
+           * The rows created above carry a NULL `checkedOutAt`, so they are
+           * excluded by this predicate and cannot vouch for themselves.
+           *
+           * Read inside the same transaction as the writes, so a check-in
+           * completing concurrently cannot leave us stamping against a booking
+           * that has since finished.
+           */
+          if (liveBookingIds.length > 0) {
+            /**
+             * The kit's PRE-EXISTING slices on those bookings.
+             *
+             * `thisKitAssetKitIds` is read before the membership transaction,
+             * so it names only memberships that predate this call — and it has
+             * to. The `BookingAsset` rows written above carry this kit's
+             * `sourceKitId` with a NULL `checkedOutAt`, so letting them into
+             * this set would make the "did all of it leave" test below
+             * permanently unsatisfiable.
+             */
+            const preExistingAssetKitIds = [...thisKitAssetKitIds];
+
+            const priorSlices =
+              preExistingAssetKitIds.length > 0
+                ? await tx.bookingAsset.findMany({
+                    where: {
+                      bookingId: { in: liveBookingIds },
+                      // Names this kit's own membership rows, so no separate
+                      // `sourceKitId` filter is needed.
+                      assetKitId: { in: preExistingAssetKitIds },
+                    },
+                    select: {
+                      bookingId: true,
+                      checkedOutAt: true,
+                      checkedInAt: true,
+                    },
+                  })
+                : [];
+
+            /**
+             * A booking earns the stamp on its OWN evidence, and only when the
+             * whole kit left it.
+             *
+             * Per booking, because two live bookings can hold this kit and
+             * disagree: progressive checkout flips a booking to ONGOING on the
+             * first scan of anything, so the second can be live with none of
+             * this kit's slices out. One count across both would let the first
+             * vouch for the second.
+             *
+             * "Every prior slice left" is the other half. Progressive checkout
+             * stamps only the slices actually scanned, so a kit can sit half
+             * out on one booking, and a member that stayed behind is not
+             * evidence that a newcomer went anywhere.
+             *
+             * The disqualifier is `checkedOutAt` NULL — never left — not "not
+             * out right now". Check-in clears `Kit.status` only for a kit whose
+             * every member came back, so a kit returned one member at a time
+             * still reads CHECKED_OUT and the kit picker still promises that
+             * additions inherit that status. Refusing there would be stricter
+             * than the behaviour this replaces.
+             */
+            const eligibleBookingIds = liveBookingIds.filter((bookingId) => {
+              const slices = priorSlices.filter(
+                (s) => s.bookingId === bookingId
+              );
+              if (slices.length === 0) return false;
+              if (slices.some((s) => !s.checkedOutAt)) return false;
+              return slices.some((s) => !s.checkedInAt);
+            });
+
+            if (eligibleBookingIds.length > 0) {
+              /**
+               * The members whose kit-driven slice this call actually wrote.
+               *
+               * An asset with no resolved `AssetKit` fell back to a standalone
+               * row above, which `skipDuplicates` may have dropped against one
+               * that already existed — so there is no slice this call can
+               * prove it created. Stamping its status anyway would mint the
+               * status-without-a-marker state the pair below exists to avoid.
+               * Same scoping as `propagatedEvents`, for the same reason.
+               */
+              const stampable = assetsToPropagate.flatMap((a) => {
+                const ak = akByAssetId.get(a.id);
+                return ak
+                  ? [
+                      {
+                        assetId: a.id,
+                        assetKitId: ak.id,
+                        // The same reading `createMany` above wrote the row
+                        // with, so the count it receives matches what it booked.
+                        quantity: ak.quantity ?? 1,
+                      },
+                    ]
+                  : [];
+              });
+
+              if (stampable.length > 0) {
+                /**
+                 * Status and slice marker are written together, in the SAME
+                 * transaction as the count they rest on.
+                 *
+                 * `Asset.status` alone says the member is out; only
+                 * `BookingAsset.checkedOutAt` says which booking it went out
+                 * ON, and that is what the check-in guard reads to decide
+                 * eligibility. A member handed the status without the marker
+                 * is refused at the scanner with "Cannot check in assets that
+                 * were never checked out" — every path that sends an asset out
+                 * maintains both, per
+                 * `.claude/rules/booking-checkout-is-recorded-per-slice.md`.
+                 *
+                 * Outside the tx the two could disagree with the evidence they
+                 * rest on: a check-in committing in between would release the
+                 * kit's other slices and leave these stamped against nothing.
+                 */
+                await tx.asset.updateMany({
+                  where: {
+                    id: { in: stampable.map((s) => s.assetId) },
+                    organizationId,
+                  },
+                  data: { status: AssetStatus.CHECKED_OUT },
+                });
+
+                /**
+                 * Keyed on the `AssetKit` ids the membership write just
+                 * created, never on `assetId`: a member can hold a standalone
+                 * slice on the same booking alongside its kit-driven one (the
+                 * two partial uniques allow exactly that), and the standalone
+                 * one did not go out with this kit. Those ids are new, so the
+                 * only rows they reach are the ones `createMany` wrote above.
+                 *
+                 * Scoped to `eligibleBookingIds`, so a booking this kit never
+                 * left — one still in planning, or one that is live for a
+                 * different kit's sake — keeps an unmarked slice.
+                 */
+                await tx.bookingAsset.updateMany({
+                  // `BookingAsset` carries no organization column; tenancy here
+                  // comes from both keys — the booking ids from this kit's own
+                  // org-scoped slices, the assetKit ids from the org-scoped
+                  // membership write above.
+                  where: {
+                    bookingId: { in: eligibleBookingIds },
+                    assetKitId: { in: stampable.map((s) => s.assetKitId) },
+                  },
+                  data: { checkedOutAt: new Date(), checkedOutById: userId },
+                });
+
+                /**
+                 * Size those departures. A member joining a kit that is already
+                 * out goes out whole, so its count is its full booked quantity.
+                 *
+                 * Grouped by quantity because `updateMany`'s `data` takes
+                 * literals only and cannot name another column on the row. Same
+                 * keys as the marker above, so a slice gets a count exactly when
+                 * it got a marker — a marker without one leaves a departure
+                 * nothing can size.
+                 */
+                const assetKitIdsByQuantity = new Map<number, string[]>();
+                for (const s of stampable) {
+                  const ids = assetKitIdsByQuantity.get(s.quantity);
+                  if (ids) {
+                    ids.push(s.assetKitId);
+                  } else {
+                    assetKitIdsByQuantity.set(s.quantity, [s.assetKitId]);
+                  }
+                }
+                /**
+                 * A pool member goes out with its kit, so it leaves from the
+                 * kit's location. Recorded before its counter is set, while
+                 * the counter still reads 0 (see
+                 * `recordCheckoutSourceLocations`).
+                 */
+                const departingKitSlices = await tx.bookingAsset.findMany({
+                  where: {
+                    bookingId: { in: eligibleBookingIds },
+                    assetKitId: { in: stampable.map((s) => s.assetKitId) },
+                  },
+                  select: { id: true },
+                });
+                await recordCheckoutSourceLocations(tx, {
+                  organizationId,
+                  sliceIds: departingKitSlices.map((slice) => slice.id),
+                });
+
+                for (const [quantity, assetKitIds] of assetKitIdsByQuantity) {
+                  await tx.bookingAsset.updateMany({
+                    // Same two keys as the marker write above, and tenancy comes
+                    // from them the same way.
+                    where: {
+                      bookingId: { in: eligibleBookingIds },
+                      assetKitId: { in: assetKitIds },
+                    },
+                    data: { checkedOutQuantity: quantity },
+                  });
+                }
+              }
+            }
+          }
+        });
+      }
+
+      // why: there is deliberately no delete counterpart here. Removing an
+      // asset from a kit does not delete its BookingAsset rows from ACTIVE
+      // bookings — the DB-level `BookingAsset.assetKitId` FK fires
+      // `ON DELETE SET NULL` when the AssetKit row is dropped (the actual
+      // delete happens in the membership tx above), converting the kit-driven
+      // slice into a standalone reservation, and
+      // `emitAssetKitDetachmentNotes` writes a per-booking system note
+      // explaining the conversion. Deleting the row here would undo that SET
+      // NULL and silently shrink the booking. Planning-status bookings are the
+      // exception and are handled by `removeKitSlicesFromPlanningBookings`,
+      // inside that same tx.
+      //
+      // Asset-bulk-remove (asset-side flow) is unaffected; it still goes
+      // through `removeAssets`, which deletes the rows explicitly.
+    }
+
+    return kit;
+  } catch (cause) {
+    // Translate the DB `AssetKit total ... exceeds Asset.quantity` trigger
+    // violation into a friendly 400 (user tried to put more units in kits
+    // than the asset has). No-ops for every other error. See SHELF-WEBAPP-219.
+    throwIfAssetQuantityOverAllocation(cause, {
+      label,
+      additionalData: { kitId, assetIds },
+    });
+
+    const isShelfError = isLikeShelfError(cause);
+
+    throw new ShelfError({
+      cause,
+      message: isShelfError
+        ? cause.message
+        : "Something went wrong while updating kit assets.",
+      label,
+      additionalData: { kitId, assetIds },
+    });
+  }
+}
+
+/**
+ * Removes the selected assets from whatever kit holds them, releasing the
+ * custody each one inherited from its kit.
+ *
+ * @param args.assetIds - Asset ids, or `ALL_SELECTED_KEY` to act on every
+ *   asset the caller's list matches for `currentSearchParams`
+ * @param args.currentSearchParams - The asset list's query string, submitted
+ *   with the bulk action. The action posts to its own URL, so the request URL
+ *   does not carry the list's filters.
+ * @returns How many assets were detached from a kit
+ * @throws {ShelfError} When resolving the selection or the update fails
+ */
+export async function bulkRemoveAssetsFromKits({
+  assetIds,
+  organizationId,
+  userId,
+  request,
+  currentSearchParams,
+  settings,
+  lastAuditDateAccess,
+  bookableScope,
+}: {
+  assetIds: Asset["id"][];
+  organizationId: Organization["id"];
+  userId: User["id"];
+  request: Request;
+  currentSearchParams: string | null | undefined;
+  settings: AssetIndexSettings;
+  /**
+   * How the caller may use the last audit date, from `lastAuditDateAccessFor`.
+   * A select-all `lastAuditDate` filter without `available` access refuses the
+   * whole selection.
+   */
+  lastAuditDateAccess: LastAuditDateAccess;
+  /**
+   * The caller's asset list scope, from `resolveBookableListScope`. Select-all
+   * resolves to the assets the caller's list shows, so a bookable-only role
+   * never acts on assets outside it. `null` for a role that sees every asset.
+   */
+  bookableScope: BookableListScope | null;
+}) {
+  try {
+    const user = await getUserByID(userId, {
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      } satisfies Prisma.UserSelect,
+    });
+    const actor = wrapUserLinkForNote({ ...user, id: userId });
+
+    // Resolve IDs (works for both simple and advanced mode).
+    // Acting user's timezone: when "select all" is active the affected set is
+    // resolved from the current date filters, which must truncate the day in
+    // the user's tz (avoids an off-by-one for non-UTC users).
+    const { timeZone } = await resolveUserFormatPrefsById(
+      userId,
+      getClientHint(request)
+    );
+    const resolvedIds = await resolveAssetIdsForBulkOperation({
+      assetIds,
+      organizationId,
+      currentSearchParams,
+      settings,
+      timeZone,
+      // Kit write permissions are ADMIN/OWNER-only, so the custodian filter
+      // here can never come from a restricted viewer.
+      allowedTeamMemberIds: "all",
+      lastAuditDateAccess,
+      bookableScope,
+    });
+
+    // We pull the parent kit (today: ≤1 pivot row per asset) through
+    // `assetKits.kit`, then flatten back into a synthetic `asset.kit`
+    // shape so the rest of this function reads as it did pre-pivot.
+    const assetRows = await db.asset.findMany({
+      // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: removing assets from kits is allowed for archived assets
+      where: { id: { in: resolvedIds }, organizationId },
+      select: {
+        id: true,
+        title: true,
+        // type + unitOfMeasure label the qty-tracked unit count in the
+        // custody-release note ("custody of 50 units").
+        type: true,
+        unitOfMeasure: true,
+        assetKits: {
+          select: {
+            // This kit's per-row slice — surfaced in the cascade
+            // ASSET_KIT_CHANGED event meta ("removed 50 units"). This is
+            // AssetKit.quantity, NOT Asset.quantity.
+            quantity: true,
+            kit: {
+              select: {
+                id: true,
+                name: true,
+                custody: { select: { id: true } },
+              },
+            },
+          },
+        },
+        custody: {
+          select: {
+            id: true,
+            teamMemberId: true,
+            kitCustodyId: true,
+            // quantity → qty-tracked unit count in the CUSTODY_RELEASED
+            // event meta + the release note below.
+            quantity: true,
+            custodian: {
+              select: {
+                id: true,
+                name: true,
+                user: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                    displayName: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const assets = assetRows.map((asset) => ({
+      ...asset,
+      // Defensive `?.` — test fixtures from main's PR #2535 mock the legacy
+      // `kit` directly and omit the `assetKits` array entirely; this avoids a
+      // TypeError reading [0] of undefined for those rows.
+      kit: asset.assetKits?.[0]?.kit ?? null,
+      // Per-row AssetKit.quantity this asset held in the kit being detached
+      // (NOT Asset.quantity) — drives the qty-tracked count in the cascade
+      // ASSET_KIT_CHANGED event meta. `null` for the legacy-mock rows above.
+      kitQuantity: asset.assetKits?.[0]?.quantity ?? null,
+    }));
+
+    // Collect AssetKit ids being deleted across the bulk removal
+    // branches so the post-tx emitter can write per-booking notes for
+    // kit-driven slices that get SET-NULL'd by the DB cascade. See
+    // {@link fetchAssetKitDetachmentImpact}.
+    let bulkDetachmentImpact: Awaited<
+      ReturnType<typeof fetchAssetKitDetachmentImpact>
+    > = [];
+
+    const removedFromKitCount = await db.$transaction(async (tx) => {
+      /**
+       * If there are assets whose kits were in custody, then we have to remove
+       * the custody FIRST to avoid orphaned custody records when status is set
+       * to AVAILABLE.
+       *
+       * Important: only the Custody rows whose `kitCustodyId` matches the
+       * asset's kit's KitCustody.id are kit-allocated. Operator-assigned
+       * per-unit custody (`kitCustodyId IS NULL`, or pointing to a different
+       * kit) must be left alone — that's separate ownership and not part of
+       * this kit-removal.
+       */
+      const assetsWhoseKitsInCustody = assets.filter(
+        (asset) => !!asset.kit?.custody && hasCustody(asset.custody)
+      );
+
+      /** Pairs of (asset, kit-allocated custody row) to delete */
+      const kitAllocatedCustodyToDelete = assetsWhoseKitsInCustody.flatMap(
+        (asset) => {
+          const kitCustodyId = asset.kit?.custody?.id;
+          if (!kitCustodyId) return [];
+          return (asset.custody ?? [])
+            .filter((c) => c.kitCustodyId === kitCustodyId)
+            .map((c) => ({
+              custodyId: c.id,
+              assetId: asset.id,
+              kitId: asset.kit?.id,
+              teamMemberId: c.teamMemberId,
+              targetUserId: c.custodian?.user?.id,
+              // Units this row releases — drives the qty-tracked count.
+              quantity: c.quantity,
+            }));
+        }
+      );
+
+      // Asset shape (type / unitOfMeasure) and released-quantity per asset,
+      // keyed by id, for the qty-tracked unit count in the event + note.
+      const assetById = new Map(assets.map((a) => [a.id, a]));
+      const releasedQtyByAssetId = new Map(
+        kitAllocatedCustodyToDelete.map((row) => [row.assetId, row.quantity])
+      );
+
+      if (kitAllocatedCustodyToDelete.length > 0) {
+        // Emit CUSTODY_RELEASED events BEFORE deletion so they roll back
+        // atomically with the mutation if anything fails.
+        await recordEvents(
+          kitAllocatedCustodyToDelete.map((row) => {
+            const asset = assetById.get(row.assetId);
+            return {
+              organizationId,
+              actorUserId: userId,
+              action: "CUSTODY_RELEASED" as const,
+              entityType: "ASSET" as const,
+              entityId: row.assetId,
+              assetId: row.assetId,
+              kitId: row.kitId ?? undefined,
+              teamMemberId: row.teamMemberId,
+              targetUserId: row.targetUserId ?? undefined,
+              meta: {
+                viaKit: true,
+                ...(asset ? assetQtyMeta(asset, row.quantity) : {}),
+              },
+            };
+          }),
+          tx
+        );
+
+        await tx.custody.deleteMany({
+          where: {
+            id: { in: kitAllocatedCustodyToDelete.map((r) => r.custodyId) },
+          },
+        });
+      }
+
+      /**
+       * Removing assets from kits — AFTER custody is deleted. Only flip
+       * status to AVAILABLE when no remaining custody exists for the asset
+       * (operator-assigned per-unit custody keeps it IN_CUSTODY).
+       */
+      const allRemovedAssetIds = assets.map((a) => a.id);
+      const stillCustodied = await tx.custody.findMany({
+        where: { assetId: { in: allRemovedAssetIds } },
+        select: { assetId: true },
+      });
+      const stillCustodiedIds = new Set(stillCustodied.map((c) => c.assetId));
+      const assetsToFlipAvailable = allRemovedAssetIds.filter(
+        (id) => !stillCustodiedIds.has(id)
+      );
+
+      // Pre-fetch the kit-driven BookingAsset rows that the AssetKit
+      // delete will SET-NULL via the DB cascade. We capture ids + kit
+      // metadata BEFORE the delete (otherwise the join would lose its
+      // target) so the post-tx note emitter can craft per-booking
+      // system notes referencing the kit by name.
+      const aksToDelete = await tx.assetKit.findMany({
+        where: {
+          assetId: { in: allRemovedAssetIds },
+          organizationId,
+        },
+        select: { id: true },
+      });
+      const aksToDeleteIds = aksToDelete.map((ak: { id: string }) => ak.id);
+
+      // Runs FIRST: slices on bookings that haven't started are deleted rather
+      // than demoted, so neither the impact snapshot nor the collision merge
+      // below sees a row that is about to disappear.
+      await removeKitSlicesFromPlanningBookings(tx, aksToDeleteIds, {
+        actorUserId: userId,
+        organizationId,
+      });
+      bulkDetachmentImpact = bulkDetachmentImpact.concat(
+        await fetchAssetKitDetachmentImpact(tx, aksToDeleteIds)
+      );
+
+      // Detach all from the kit regardless of remaining custody.
+      // "detach from kit" means deleting the pivot rows for these
+      // assets within this organization.
+      //
+      // The merge was missing here: an asset held BOTH standalone and via the
+      // kit on the same booking made the `SET NULL` cascade trip
+      // `BookingAsset_manual_unique`, rolling back the whole bulk op with a
+      // P2002. Same guard the singular paths already run.
+      await mergeStandaloneCollisionsForKitDetachment(tx, aksToDeleteIds);
+      await preserveKitDrivenPlacements(tx, aksToDeleteIds);
+      await tx.assetKit.deleteMany({
+        where: {
+          assetId: { in: allRemovedAssetIds },
+          organizationId,
+        },
+      });
+      // The helper org-scopes the write itself, so the previous
+      // `require-org-scope-on-id-queries` suppression is no longer needed.
+      await releaseAssetsToAvailableUnlessCheckedOut(
+        tx,
+        assetsToFlipAvailable,
+        organizationId
+      );
+
+      /** Create notes for assets released from custody */
+      if (assetsWhoseKitsInCustody.length > 0) {
+        await tx.note.createMany({
+          data: assetsWhoseKitsInCustody.map((asset) => {
+            const primaryCustody = getPrimaryCustody(asset.custody);
+            const custodianDisplay = primaryCustody?.custodian
+              ? wrapCustodianForNote({
+                  teamMember: primaryCustody.custodian,
+                })
+              : "**Unknown Custodian**";
+            // qty-tracked assets name the units released ("custody of 50
+            // units"); INDIVIDUAL phrasing is unchanged.
+            const count = formatUnitCount(
+              asset,
+              releasedQtyByAssetId.get(asset.id)
+            );
+            const custodyPhrase = count ? `custody of ${count}` : "custody";
+            return {
+              content: `${actor} released ${custodianDisplay}'s ${custodyPhrase}.`,
+              type: "UPDATE",
+              userId,
+              assetId: asset.id,
+            };
+          }),
+        });
+      }
+
+      /** Create notes for assets removed from kit */
+      const assetsRemovedFromKit = assets.filter((asset) => asset.kit);
+      if (assetsRemovedFromKit.length > 0) {
+        await tx.note.createMany({
+          data: assetsRemovedFromKit.map((asset) => {
+            const kitLink = wrapLinkForNote(
+              `/kits/${asset.kit!.id}`,
+              asset.kit!.name.trim()
+            );
+            // Qty-tracked: name the unit count being removed from this
+            // kit ("removed 50 units from Camera Kit") using the per-row
+            // AssetKit.quantity threaded as `kitQuantity` on the asset
+            // shape above. INDIVIDUAL preserves the original countless
+            // wording. Mirrors the singular path in
+            // `createKitChangeNote` (note/service.server.ts).
+            const count = formatUnitCount(asset, asset.kitQuantity);
+            const content = count
+              ? `${actor} removed ${count} from ${kitLink}.`
+              : `${actor} removed asset from ${kitLink}.`;
+            return {
+              content,
+              type: "UPDATE",
+              userId,
+              assetId: asset.id,
+            };
+          }),
+        });
+      }
+
+      // Activity events — one ASSET_KIT_CHANGED per asset that left a kit.
+      if (assetsRemovedFromKit.length > 0) {
+        await recordEvents(
+          assetsRemovedFromKit.map((asset) => ({
+            organizationId,
+            actorUserId: userId,
+            action: "ASSET_KIT_CHANGED" as const,
+            entityType: "ASSET" as const,
+            entityId: asset.id,
+            assetId: asset.id,
+            kitId: asset.kit!.id,
+            field: "kitId",
+            fromValue: asset.kit!.id,
+            toValue: null,
+            // Qty-tracked: the per-row AssetKit.quantity this asset held in
+            // the detached kit (NOT Asset.quantity); {} for INDIVIDUAL.
+            meta: { ...assetQtyMeta(asset, asset.kitQuantity) },
+          })),
+          tx
+        );
+      }
+
+      // Activity events — one CUSTODY_RELEASED per asset whose kit-inherited
+      // custody was cleaned up. `meta.viaKit` mirrors the kit-custody flows
+      // in `releaseCustody` / `bulkReleaseKitCustody`. Phase 2 turned Custody
+      // from 1:1 into 1:N so `asset.custody` is an array now — read the
+      // primary row via the helper.
+      if (assetsWhoseKitsInCustody.length > 0) {
+        await recordEvents(
+          assetsWhoseKitsInCustody.map((asset) => {
+            const primaryCustody = getPrimaryCustody(asset.custody);
+            return {
+              organizationId,
+              actorUserId: userId,
+              action: "CUSTODY_RELEASED" as const,
+              entityType: "ASSET" as const,
+              entityId: asset.id,
+              assetId: asset.id,
+              kitId: asset.kit?.id,
+              teamMemberId: primaryCustody?.custodian?.id,
+              targetUserId: primaryCustody?.custodian?.user?.id ?? undefined,
+              meta: { viaKit: true },
+            };
+          }),
+          tx
+        );
+      }
+
+      // What the caller can honestly report: assets that were actually IN
+      // a kit, which is neither the number selected nor — under select-all —
+      // the number of ids it was given.
+      return assetsRemovedFromKit.length;
+    });
+
+    // Notify each affected booking that its kit-driven BookingAsset
+    // slice has been converted to standalone.
+    await emitAssetKitDetachmentNotes({
+      impact: bulkDetachmentImpact,
+      actor: { ...user, id: userId },
+      organizationId,
+    });
+
+    return { removedFromKitCount };
+  } catch (cause) {
+    rethrowIfClientError(cause);
+    throw new ShelfError({
+      cause,
+      message: "Failed to bulk remove assets from kits",
+      additionalData: { assetIds, organizationId, userId },
+      label: "Kit",
+    });
+  }
+}
+
+/**
+ * Move N units of a `QUANTITY_TRACKED` asset between two `AssetKit` pivot
+ * rows in a single transaction.
+ *
+ * Symmetric to `moveAssetLocationUnits` (on the location axis) but with the
+ * extra cascade and guard work the kit axis demands:
+ *
+ *   - Cascades the new dest-kit quantity to any **active** kit-driven
+ *     `BookingAsset` rows on the destination kit (mirrors the existing
+ *     `updateKitAssets` cascade pattern).
+ *   - **Blocks** the move when the source kit has active booking slices
+ *     (`DRAFT` / `RESERVED` / `ONGOING` / `OVERDUE`) — the user is told to
+ *     release those bookings first rather than have us silently shrink the
+ *     slices out from under an in-flight booking (decision 2026-06-10).
+ *   - **Blocks** the move when the source kit is in operator custody
+ *     (`KitCustody` → inherited `Custody` on this asset) — release custody
+ *     first rather than orphan units.
+ *
+ * Emits two paired `ASSET_KIT_CHANGED` activity events (`meta.moveCorrelationId`
+ * pairs them) and two paired Notes (`createKitMoveNote` — new phrasing
+ * "moved {N units} from kit {KitX} to kit {KitY}").
+ *
+ * @param args - `MoveAssetKitUnitsArgs`: assetId, organizationId, userId,
+ *   fromKitId, toKitId, quantity
+ * @returns `MoveUnitsResult` — post-tx quantities + the deleted-source flag
+ *   + the correlation id (so the action handler can surface a paired toast)
+ * @throws {ShelfError} 400 when validation fails (qty <= 0, same source/dest,
+ *   asset is INDIVIDUAL, asset not allocated to source kit, qty exceeds
+ *   source allocation, active bookings on source, active custody on source)
+ * @throws {ShelfError} 403 implicitly via `assertAssetsBelongToOrg` on a
+ *   cross-org IDOR attempt
+ */
+export async function moveAssetKitUnits(
+  args: MoveAssetKitUnitsArgs
+): Promise<MoveUnitsResult> {
+  const { assetId, organizationId, userId, fromKitId, toKitId, quantity } =
+    args;
+
+  // Cheap pre-tx guards — keeps the tx body focused on row work.
+  if (quantity <= 0) {
+    throw new ShelfError({
+      cause: null,
+      message: "Quantity must be greater than zero.",
+      label,
+      status: 400,
+      shouldBeCaptured: false,
+      additionalData: { assetId, quantity },
+    });
+  }
+
+  if (fromKitId === toKitId) {
+    throw new ShelfError({
+      cause: null,
+      message: "Source and destination kits must be different.",
+      label,
+      status: 400,
+      shouldBeCaptured: false,
+      additionalData: { assetId, fromKitId, toKitId },
+    });
+  }
+
+  try {
+    const txResult = await db.$transaction(async (tx) => {
+      // 1. Org-scope guards — every ID came from form input, prove it
+      //    belongs to the caller's org before any read/write touches it.
+      //    Per `.claude/rules/org-scope-user-supplied-ids.md`.
+      await assertAssetsBelongToOrg(
+        { assetIds: [assetId], organizationId },
+        tx
+      );
+
+      const [fromKit, toKit] = await Promise.all([
+        tx.kit.findFirst({
+          where: { id: fromKitId, organizationId },
+          select: { id: true, name: true },
+        }),
+        tx.kit.findFirst({
+          where: { id: toKitId, organizationId },
+          // `locationId` drives the re-placement of the moved units at the
+          // destination kit's location (step 9b).
+          select: { id: true, name: true, locationId: true },
+        }),
+      ]);
+
+      if (!fromKit) {
+        throw new ShelfError({
+          cause: null,
+          message:
+            "The source kit could not be found in your workspace. Please reload and try again.",
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+          additionalData: { organizationId, fromKitId },
+        });
+      }
+      if (!toKit) {
+        throw new ShelfError({
+          cause: null,
+          message:
+            "The destination kit could not be found in your workspace. Please reload and try again.",
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+          additionalData: { organizationId, toKitId },
+        });
+      }
+
+      // 2. Lock the asset row for the duration of the tx — serializes
+      //    concurrent moves on the same asset (Phase 2 pattern).
+      const asset = await lockAssetForQuantityUpdate(
+        tx,
+        assetId,
+        organizationId
+      );
+
+      // Defence-in-depth: the lock is now org-scoped (a foreign-org id 404s at
+      // the lock, taking no lock), so this re-check is belt-and-braces.
+      if (asset.organizationId !== organizationId) {
+        throw new ShelfError({
+          cause: null,
+          message: "Asset does not belong to this organization.",
+          label,
+          status: 403,
+          additionalData: { assetId, organizationId },
+        });
+      }
+
+      // 3. Refuse for INDIVIDUAL — split/merge is qty-tracked-only.
+      if (asset.type !== AssetType.QUANTITY_TRACKED) {
+        throw new ShelfError({
+          cause: null,
+          message: "Split/merge is only available for quantity-tracked assets.",
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+          additionalData: { assetId, assetType: asset.type },
+        });
+      }
+
+      // 4. Load source AssetKit pivot row — the source of truth for what
+      //    "currently allocated" means.
+      const source = await tx.assetKit.findFirst({
+        where: { assetId, kitId: fromKitId },
+        select: { id: true, quantity: true },
+      });
+      if (!source) {
+        throw new ShelfError({
+          cause: null,
+          message: "Asset is not allocated to the source kit.",
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+          additionalData: { assetId, fromKitId },
+        });
+      }
+
+      // 5. Refuse over-move — we can't move more than the source has.
+      const unitLabel = (asset.unitOfMeasure ?? "").trim() || "units";
+      if (quantity > source.quantity) {
+        throw new ShelfError({
+          cause: null,
+          message: `Only ${source.quantity} ${unitLabel} allocated to ${fromKit.name}.`,
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+          additionalData: {
+            assetId,
+            fromKitId,
+            requested: quantity,
+            available: source.quantity,
+          },
+        });
+      }
+
+      // 6. Active-booking block (decision 2026-06-10). Shrinking the
+      //    source kit's allocation would silently shrink any kit-driven
+      //    BookingAsset slice on an active booking out from under the
+      //    user. Block with a helpful error instead.
+      const activeBookingSlices = await tx.bookingAsset.findMany({
+        where: {
+          assetId,
+          assetKitId: source.id,
+          booking: {
+            status: {
+              in: [
+                BookingStatus.DRAFT,
+                BookingStatus.RESERVED,
+                BookingStatus.ONGOING,
+                BookingStatus.OVERDUE,
+              ],
+            },
+          },
+        },
+        select: {
+          bookingId: true,
+          quantity: true,
+          booking: { select: { name: true, status: true } },
+        },
+      });
+
+      if (activeBookingSlices.length > 0) {
+        const activeBookingsCount = activeBookingSlices.length;
+        const plural = activeBookingsCount === 1 ? "" : "s";
+        const names = activeBookingSlices.map((s) => s.booking.name);
+        const shown = names.slice(0, 3).join(", ");
+        const overflow = names.length > 3 ? ", …" : "";
+        throw new ShelfError({
+          cause: null,
+          message: `Cannot move — ${fromKit.name} is currently allocated to ${activeBookingsCount} active booking${plural}: ${shown}${overflow}. Release these bookings first.`,
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+          additionalData: {
+            assetId,
+            fromKitId,
+            activeBookings: activeBookingSlices.map((s) => ({
+              bookingId: s.bookingId,
+              name: s.booking.name,
+              status: s.booking.status,
+              quantity: s.quantity,
+            })),
+          },
+        });
+      }
+
+      // 7. Kit-inherited custody block. If the source kit is in operator
+      //    custody, the asset has an inherited Custody row pointing at
+      //    the source's KitCustody — moving units out from under that
+      //    would orphan the custody bookkeeping. Block instead.
+      const inheritedCustody = await tx.custody.findFirst({
+        where: { assetId, kitCustody: { kitId: fromKitId } },
+        select: {
+          id: true,
+          kitCustody: {
+            select: { custodian: { select: { name: true } } },
+          },
+        },
+      });
+      if (inheritedCustody) {
+        const custodianName =
+          inheritedCustody.kitCustody?.custodian.name ?? "an operator";
+        throw new ShelfError({
+          cause: null,
+          message: `Cannot move — ${fromKit.name} is currently in ${custodianName}'s custody. Release custody first.`,
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+          additionalData: { assetId, fromKitId, custodianName },
+        });
+      }
+
+      // 8. Decrement (or delete-on-zero) the source AssetKit row.
+      // No `removeKitSlicesFromPlanningBookings` call here: step 6 above
+      // already hard-blocks the move when ANY DRAFT/RESERVED/ONGOING/OVERDUE
+      // booking holds this slice, so no planning row can reach this delete.
+      const newSourceQty = source.quantity - quantity;
+      const sourceRowDeleted = newSourceQty === 0;
+      if (sourceRowDeleted) {
+        // INDIVIDUAL members keep their placement; a QUANTITY_TRACKED slice's
+        // row goes with the AssetKit via the DB cascade. Either way step 9b
+        // below re-places the units at the DESTINATION kit's location, so they
+        // don't linger at the kit they just left.
+        await preserveKitDrivenPlacements(tx, [source.id]);
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: source.id came from the org+asset+kit-scoped findFirst above, inside this same tx
+        await tx.assetKit.delete({ where: { id: source.id } });
+      } else {
+        await tx.assetKit.update({
+          // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: source.id came from the org+asset+kit-scoped findFirst above, inside this same tx
+          where: { id: source.id },
+          data: { quantity: newSourceQty },
+        });
+      }
+
+      // 9. Upsert destination AssetKit row on the (assetId, kitId)
+      //    partial-unique. Bump if exists, create at N otherwise.
+      const dest = await tx.assetKit.upsert({
+        where: { assetId_kitId: { assetId, kitId: toKitId } },
+        create: {
+          assetId,
+          kitId: toKitId,
+          organizationId,
+          quantity,
+        },
+        update: { quantity: { increment: quantity } },
+        select: { id: true, quantity: true },
+      });
+
+      // 9b. Re-place the moved units at the DESTINATION kit's location.
+      //     Without this the units stay recorded wherever the source kit was
+      //     (or nowhere), even though they now belong to a kit that lives
+      //     somewhere else. Reuses the shared cascade so the placement stays
+      //     type-aware: a plain row for INDIVIDUAL, a kit-driven slice
+      //     carrying the destination's new `AssetKit.quantity` for
+      //     QUANTITY_TRACKED.
+      //
+      //     `toKit.locationId` is org-safe without a further check: `toKit`
+      //     was read scoped to `organizationId`, so its location belongs to
+      //     the caller's org by construction.
+      if (toKit.locationId) {
+        await cascadeKitLocationToAssets(
+          {
+            kitIds: [toKitId],
+            newLocationId: toKit.locationId,
+            organizationId,
+            assetIds: [assetId],
+          },
+          tx
+        );
+      } else {
+        // Destination kit is unplaced, so no kit-driven row may survive for
+        // it — the units revert to whatever manual placement they hold.
+        await tx.assetLocation.deleteMany({ where: { assetKitId: dest.id } });
+      }
+
+      // 10. Cascade to active kit-driven BookingAsset rows on the DEST
+      //     kit — keep them in sync with the new slice quantity (mirrors
+      //     the `updateKitAssets` pattern at lines ~4127-4133). Only
+      //     active bookings need the cascade; historical (COMPLETE /
+      //     ARCHIVED / CANCELLED) slices are frozen records and stay
+      //     untouched. Source-side cascade is unreachable here because
+      //     step 6 already blocked when the source had active slices.
+      await tx.bookingAsset.updateMany({
+        where: {
+          assetKitId: dest.id,
+          booking: {
+            status: {
+              in: [
+                BookingStatus.DRAFT,
+                BookingStatus.RESERVED,
+                BookingStatus.ONGOING,
+                BookingStatus.OVERDUE,
+              ],
+            },
+          },
+        },
+        data: { quantity: dest.quantity },
+      });
+
+      // 11. Paired ASSET_KIT_CHANGED events. `moveCorrelationId` lets
+      //     reports rebuild the move from the two halves.
+      const moveCorrelationId = crypto.randomUUID();
+      await recordEvents(
+        [
+          {
+            organizationId,
+            actorUserId: userId,
+            action: "ASSET_KIT_CHANGED" as const,
+            entityType: "ASSET" as const,
+            entityId: assetId,
+            assetId,
+            kitId: fromKitId,
+            field: "kitId",
+            fromValue: fromKitId,
+            toValue: null,
+            meta: {
+              quantity,
+              moveCorrelationId,
+              side: "from" as const,
+              fromKitId,
+              toKitId,
+            },
+          },
+          {
+            organizationId,
+            actorUserId: userId,
+            action: "ASSET_KIT_CHANGED" as const,
+            entityType: "ASSET" as const,
+            entityId: assetId,
+            assetId,
+            kitId: toKitId,
+            field: "kitId",
+            fromValue: null,
+            toValue: toKitId,
+            meta: {
+              quantity,
+              moveCorrelationId,
+              side: "to" as const,
+              fromKitId,
+              toKitId,
+            },
+          },
+        ],
+        tx
+      );
+
+      // Load the acting user once for the post-tx note write. The read is
+      //     part of the tx, so a rolled-back move never produces a stale
+      //     name for the note.
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: { ...USER_NAME_SELECT },
+      });
+
+      return {
+        fromQuantity: sourceRowDeleted ? 0 : newSourceQty,
+        toQuantity: dest.quantity,
+        sourceRowDeleted,
+        moveCorrelationId,
+        // Carry forward the data the post-tx note writer needs so it
+        // can land only if the tx actually committed.
+        noteContext: {
+          user: user ?? { displayName: null },
+          assetType: asset.type,
+          unitOfMeasure: asset.unitOfMeasure,
+          fromKit,
+          toKit,
+        },
+      };
+    });
+
+    // 12. Paired notes (post-tx). Mirrors `createBulkKitChangeNotes` at
+    //     line ~4200 — kit notes land outside the tx so a rolled-back
+    //     move leaves the activity feed clean.
+    await createKitMoveNote({
+      fromKit: txResult.noteContext.fromKit,
+      toKit: txResult.noteContext.toKit,
+      user: txResult.noteContext.user,
+      assetId,
+      userId,
+      organizationId,
+      type: txResult.noteContext.assetType,
+      unitOfMeasure: txResult.noteContext.unitOfMeasure,
+      quantity,
+    });
+
+    return {
+      fromQuantity: txResult.fromQuantity,
+      toQuantity: txResult.toQuantity,
+      sourceRowDeleted: txResult.sourceRowDeleted,
+      moveCorrelationId: txResult.moveCorrelationId,
+    };
+  } catch (cause) {
+    // Pass through ShelfErrors with their context; wrap unknown causes.
+    if (isLikeShelfError(cause)) {
+      throw cause;
+    }
+    throw new ShelfError({
+      cause,
+      message: "Failed to move units between kits",
+      additionalData: { assetId, fromKitId, toKitId, quantity, userId },
+      label,
+    });
+  }
+}

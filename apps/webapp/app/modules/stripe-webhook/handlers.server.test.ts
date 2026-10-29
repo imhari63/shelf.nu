@@ -1,0 +1,1486 @@
+import { TierId } from "@prisma/client";
+import Stripe from "stripe";
+import { db } from "~/database/db.server";
+import { sendEmail } from "~/emails/mail.server";
+import { sendAuditTrialEndsSoonEmail } from "~/emails/stripe/audit-trial-ends-soon";
+import { sendBarcodeTrialEndsSoonEmail } from "~/emails/stripe/barcode-trial-ends-soon";
+import { subscriptionGrantedText } from "~/emails/stripe/subscription-granted";
+import { sendTrialEndsSoonEmail } from "~/emails/stripe/trial-ends-soon";
+import { unpaidInvoiceUserText } from "~/emails/stripe/unpaid-invoice";
+import { sendTeamTrialWelcomeEmail } from "~/emails/stripe/welcome-to-trial";
+import { captureServerEvent } from "~/integrations/posthog/client.server";
+import { scheduleTrialEndsTomorrowEmail } from "~/modules/addon-trial/scheduler.server";
+import { handleAuditAddonWebhook } from "~/modules/audit/addon.server";
+import { handleBarcodeAddonWebhook } from "~/modules/barcode/addon.server";
+import { resetPersonalWorkspaceBranding } from "~/modules/organization/service.server";
+import { resolveUserFormatPrefsById } from "~/utils/date-format.server";
+import { ShelfError } from "~/utils/error";
+import { Logger } from "~/utils/logger";
+import {
+  customerHasOtherActiveAddonSubscription,
+  customerHasPaymentMethod,
+  createCustomerSubscriptionsLoader,
+  fetchStripeSubscription,
+  getCustomerActiveSubscription,
+  getCustomerNotificationData,
+  getDataFromStripeEvent,
+  getInvoiceNotificationData,
+  getStripeCustomer,
+  stripe,
+  subscriptionStatusGrantsPlan,
+  type CustomerWithSubscriptions,
+} from "~/utils/stripe.server";
+
+import { resolveUserGreetingName } from "~/utils/user";
+import {
+  highestPlanTier,
+  isAddonSubscription,
+  isHigherOrEqualTier,
+  isHigherTier,
+  isTierId,
+  liveTierOf,
+  sendAdminInvoiceEmail,
+  type WebhookUser,
+} from "./helpers.server";
+
+const OK = () => new Response(null, { status: 200 });
+
+/**
+ * Applies a tier subscription's lifecycle event to the add-ons bundled on it.
+ *
+ * A Team trial or checkout can carry the Audits and Barcodes add-ons as extra
+ * line items on the tier subscription (`createTeamTrialSubscription`,
+ * `createStripeCheckoutSession`). Workspace creation links that subscription
+ * to the new organization through `metadata.organizationId` and switches the
+ * add-ons on; from then on they live and die with the tier subscription, so
+ * its pauses, cancellations and status changes have to reach the same
+ * organization flags the standalone add-on handlers maintain.
+ *
+ * Only add-ons present on this subscription are touched. A workspace can also
+ * hold a standalone add-on subscription, governed by its own webhook events;
+ * the add-on handlers keep the flag on while any other live subscription of
+ * the customer still carries the add-on for the workspace.
+ *
+ * @param args.eventType - The Stripe event type being handled
+ * @param args.subscription - The tier subscription from the event
+ * @param args.hasAuditAddon - Whether the subscription carries an Audits item
+ * @param args.hasBarcodeAddon - Whether the subscription carries a Barcodes item
+ */
+async function syncBundledAddons({
+  eventType,
+  subscription,
+  hasAuditAddon,
+  hasBarcodeAddon,
+}: {
+  eventType: string;
+  subscription: Stripe.Subscription;
+  hasAuditAddon: boolean;
+  hasBarcodeAddon: boolean;
+}) {
+  const organizationId = subscription.metadata?.organizationId;
+  if (!organizationId) return;
+
+  if (hasAuditAddon) {
+    await handleAuditAddonWebhook({ eventType, subscription, organizationId });
+  }
+  if (hasBarcodeAddon) {
+    await handleBarcodeAddonWebhook({
+      eventType,
+      subscription,
+      organizationId,
+    });
+  }
+}
+
+/**
+ * Switches off the add-ons carried by a subscription whose invoice went
+ * overdue.
+ *
+ * This is the add-on side of the overdue downgrade in `handleInvoiceOverdue`:
+ * a failed renewal (`past_due`) keeps both tier and add-ons, and the overdue
+ * invoice ends both. The add-on handlers still leave a flag on while another
+ * live subscription of the customer carries the add-on for the workspace.
+ *
+ * @param args.eventType - The Stripe event type being handled
+ * @param args.subscription - The subscription the overdue invoice belongs to,
+ *   with its line-item products expanded
+ */
+async function disableAddonsOnOverdueSubscription({
+  eventType,
+  subscription,
+}: {
+  eventType: string;
+  subscription: Stripe.Subscription;
+}) {
+  const organizationId = subscription.metadata?.organizationId;
+  if (!organizationId) return;
+
+  const addonTypes = new Set(
+    subscription.items.data.map((item) => {
+      const product = item.plan.product as Stripe.Product | null;
+      return product?.metadata?.product_type === "addon"
+        ? product.metadata.addon_type
+        : undefined;
+    })
+  );
+
+  if (addonTypes.has("audits")) {
+    await handleAuditAddonWebhook({ eventType, subscription, organizationId });
+  }
+  if (addonTypes.has("barcodes")) {
+    await handleBarcodeAddonWebhook({
+      eventType,
+      subscription,
+      organizationId,
+    });
+  }
+}
+
+/**
+ * Looks up the products an update removed from a subscription.
+ *
+ * Stripe lists the pre-update line items in `previous_attributes.items`. A
+ * product listed there that the subscription no longer carries was dropped or
+ * swapped for another product. Each one is looked up once and serves both the
+ * add-on and the plan side of the update.
+ *
+ * Product metadata is read the same way as in `getDataFromStripeEvent`, so an
+ * archived product still says which add-on or plan it was. A product Stripe no
+ * longer knows cannot be an add-on or plan this app tracks and is left out;
+ * any other lookup failure is rethrown so Stripe retries the webhook instead
+ * of the change being lost.
+ *
+ * @param args.event - The `customer.subscription.updated` event
+ * @param args.subscription - The subscription as it is after the update
+ * @returns The removed products, empty when the update kept every product
+ */
+async function getProductsRemovedFromSubscription({
+  event,
+  subscription,
+}: {
+  event: Stripe.Event;
+  subscription: Stripe.Subscription;
+}): Promise<Stripe.Product[]> {
+  const previousItems = (
+    event.data.previous_attributes as
+      | { items?: { data?: Stripe.SubscriptionItem[] } }
+      | undefined
+  )?.items?.data;
+  if (!previousItems?.length) return [];
+
+  const productIdOf = (item: Stripe.SubscriptionItem) =>
+    typeof item.price?.product === "string"
+      ? item.price.product
+      : item.price?.product?.id;
+  const currentProductIds = new Set(subscription.items.data.map(productIdOf));
+  const removedProductIds = new Set<string>();
+  for (const item of previousItems) {
+    const productId = productIdOf(item);
+    if (productId && !currentProductIds.has(productId)) {
+      removedProductIds.add(productId);
+    }
+  }
+
+  const products = await Promise.all(
+    [...removedProductIds].map(async (productId) => {
+      try {
+        return await stripe.products.retrieve(productId);
+      } catch (cause) {
+        const isUnknownProduct =
+          cause instanceof Stripe.errors.StripeInvalidRequestError &&
+          (cause.code === "resource_missing" || cause.statusCode === 404);
+        if (!isUnknownProduct) throw cause;
+        return null;
+      }
+    })
+  );
+  return products.filter((product) => product !== null);
+}
+
+/**
+ * Switches off the add-ons an update removed from a tier subscription.
+ *
+ * An add-on product the update removed has been dropped from the
+ * subscription, which for the workspace is the same as cancelling it, unless
+ * another live subscription of the customer still carries the add-on.
+ *
+ * @param args.subscription - The subscription as it is after the update
+ * @param args.removedProducts - The products the update removed, from
+ *   `getProductsRemovedFromSubscription`
+ * @param args.hasAuditAddon - Whether the subscription still carries an Audits item
+ * @param args.hasBarcodeAddon - Whether the subscription still carries a Barcodes item
+ * @param args.loadSubscriptions - The event's shared read of the customer's
+ *   subscriptions (`createCustomerSubscriptionsLoader`)
+ */
+async function disableAddonsRemovedFromSubscription({
+  subscription,
+  removedProducts,
+  hasAuditAddon,
+  hasBarcodeAddon,
+  loadSubscriptions,
+}: {
+  subscription: Stripe.Subscription;
+  removedProducts: Stripe.Product[];
+  hasAuditAddon: boolean;
+  hasBarcodeAddon: boolean;
+  loadSubscriptions: () => Promise<Stripe.Subscription[]>;
+}) {
+  const organizationId = subscription.metadata?.organizationId;
+  if (!organizationId) return;
+
+  const removed: { auditsEnabled?: false; barcodesEnabled?: false } = {};
+  for (const product of removedProducts) {
+    if (product.metadata?.product_type !== "addon") continue;
+    const addonType = product.metadata.addon_type;
+    if (addonType !== "audits" && addonType !== "barcodes") continue;
+
+    // An add-on product replaced by another product of the same add-on looks
+    // removed, but the subscription still carries the add-on; the bundled
+    // sync above has just confirmed it.
+    const stillOnSubscription =
+      addonType === "audits" ? hasAuditAddon : hasBarcodeAddon;
+    if (stillOnSubscription) continue;
+
+    // A standalone add-on subscription bought next to the bundled one, for
+    // instance, may still pay for the add-on.
+    const customerId =
+      typeof subscription.customer === "string"
+        ? subscription.customer
+        : subscription.customer.id;
+    const coveredElsewhere = await customerHasOtherActiveAddonSubscription({
+      customerId,
+      organizationId,
+      addonType,
+      exceptSubscriptionId: subscription.id,
+      loadSubscriptions,
+    });
+    if (coveredElsewhere) continue;
+
+    if (addonType === "audits") removed.auditsEnabled = false;
+    if (addonType === "barcodes") removed.barcodesEnabled = false;
+  }
+
+  if (Object.keys(removed).length === 0) return;
+
+  await db.organization.update({
+    where: { id: organizationId },
+    data: removed,
+    select: { id: true },
+  });
+}
+
+/**
+ * Whether a subscription update could lower the user's plan, decided from the
+ * event alone, before anything is read from Stripe.
+ *
+ * The plan can only drop when the update's subscription still grants a plan,
+ * the user is on a higher tier than it carries now, and support does not
+ * manage the user's plan by hand (`skipSubscriptionCheck`). The removed
+ * products are looked up only when this holds or the add-on side needs them.
+ *
+ * @param args.subscription - The subscription as it is after the update
+ * @param args.tierId - The tier the subscription carries after the update
+ * @param args.user - The user the customer belongs to
+ * @returns `true` when `applyPlanDowngrade` may have something to do
+ */
+function updateCouldLowerPlan({
+  subscription,
+  tierId,
+  user,
+}: {
+  subscription: Stripe.Subscription;
+  tierId: string | undefined;
+  user: WebhookUser;
+}): boolean {
+  return (
+    !user.skipSubscriptionCheck &&
+    isTierId(tierId) &&
+    subscriptionStatusGrantsPlan(subscription.status) &&
+    isHigherTier(user.tierId, tierId)
+  );
+}
+
+/**
+ * Lowers the user's tier when an update moved the subscription to a cheaper
+ * plan, for instance Team to Plus in the billing portal.
+ *
+ * The update moved the plan down when a plan product it removed is higher than
+ * the plan the subscription carries now. The tier is lowered only when all of
+ * these hold, so a tier set by hand is never touched by an unrelated update:
+ * - `updateCouldLowerPlan` holds: the subscription still grants a plan and
+ *   support does not manage the user's plan by hand;
+ * - the user is on exactly the removed plan's tier, so it was this
+ *   subscription that put them there (a Custom or hand-set tier is left alone);
+ * - no live subscription of the customer grants that tier or a higher one.
+ *
+ * The new tier is the highest plan the customer's live subscriptions grant as
+ * Stripe holds them now, this one included, and Free when none does. It is
+ * never read from the event: a late or retried event describes the
+ * subscription as it was, and the customer may since have switched back,
+ * switched again or cancelled.
+ *
+ * @param args.subscription - The subscription as it is after the update
+ * @param args.removedProducts - The products the update removed, from
+ *   `getProductsRemovedFromSubscription`
+ * @param args.tierId - The tier the subscription carries after the update
+ * @param args.user - The user the customer belongs to
+ * @param args.customerId - The Stripe customer of the subscription
+ * @param args.loadSubscriptions - The event's shared read of the customer's
+ *   subscriptions (`createCustomerSubscriptionsLoader`)
+ */
+async function applyPlanDowngrade({
+  subscription,
+  removedProducts,
+  tierId,
+  user,
+  customerId,
+  loadSubscriptions,
+}: {
+  subscription: Stripe.Subscription;
+  removedProducts: Stripe.Product[];
+  tierId: string | undefined;
+  user: WebhookUser;
+  customerId: string;
+  loadSubscriptions: () => Promise<Stripe.Subscription[]>;
+}) {
+  if (!isTierId(tierId)) return;
+  if (!updateCouldLowerPlan({ subscription, tierId, user })) return;
+
+  const previousTierId = highestPlanTier(removedProducts);
+  if (!previousTierId) return;
+  if (!isHigherTier(previousTierId, tierId)) return;
+  if (user.tierId !== previousTierId) return;
+
+  // A second subscription can still pay for the higher plan (one Team
+  // subscription per workspace, for instance).
+  const liveTierId = liveTierOf(await loadSubscriptions());
+  if (!isHigherTier(previousTierId, liveTierId)) return;
+
+  await db.user
+    .update({
+      where: { customerId },
+      data: { tierId: liveTierId },
+      select: { id: true },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to apply plan downgrade",
+        additionalData: { customerId, tierId: liveTierId, previousTierId },
+        label: "Stripe webhook",
+        status: 500,
+      });
+    });
+}
+
+/**
+ * Raises the user's tier when an update moved an active subscription to a
+ * higher plan than the user is on, for instance Plus to Team.
+ *
+ * The event only suggests the raise. The user is raised to the event's tier,
+ * and only while the customer's live subscriptions, as Stripe holds them now,
+ * still grant that tier or a higher one. The raise never goes past the event's
+ * tier: a higher live plan reaches the user through its own events. Plan updates can
+ * arrive out of order: a Plus to Team event delivered after the Team to Plus
+ * that followed it describes a plan the customer no longer pays for.
+ *
+ * Only an `active` subscription raises the tier; see
+ * `subscriptionStatusGrantsPlan` for why a trialing or past-due one does not.
+ *
+ * @param args.subscription - The subscription as it is after the update
+ * @param args.tierId - The tier the subscription carries after the update
+ * @param args.user - The user the customer belongs to
+ * @param args.customerId - The Stripe customer of the subscription
+ * @param args.loadSubscriptions - The event's shared read of the customer's
+ *   subscriptions (`createCustomerSubscriptionsLoader`)
+ * @returns The tier the user was raised to, or `undefined` when unchanged
+ */
+async function applyPlanUpgrade({
+  subscription,
+  tierId,
+  user,
+  customerId,
+  loadSubscriptions,
+}: {
+  subscription: Stripe.Subscription;
+  tierId: string | undefined;
+  user: WebhookUser;
+  customerId: string;
+  loadSubscriptions: () => Promise<Stripe.Subscription[]>;
+}): Promise<TierId | undefined> {
+  if (subscription.status !== "active") return;
+  if (!isTierId(tierId) || !isHigherTier(tierId, user.tierId)) return;
+
+  const liveTierId = liveTierOf(await loadSubscriptions());
+  if (!isHigherOrEqualTier(liveTierId, tierId)) return;
+
+  await db.user
+    .update({
+      where: { customerId },
+      data: { tierId },
+      select: { id: true },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to update user tier",
+        additionalData: { customerId, tierId, liveTierId },
+        label: "Stripe webhook",
+        status: 500,
+      });
+    });
+  return tierId;
+}
+
+/**
+ * Builds the `upgrade_completed` PostHog properties from a Stripe subscription.
+ * Normalises the recurring price to a monthly figure (`mrr`) so monthly,
+ * yearly, weekly and daily plans are comparable; `mrr` is `null` when the plan
+ * price or interval is unavailable/unrecognised rather than guessing.
+ *
+ * @param subscription - The Stripe subscription from the webhook event
+ * @param tierId - The resolved Shelf tier for the subscription
+ * @param via - How the paid conversion happened: `direct` (subscribed without a
+ *   trial), `upgrade` (moved to a higher paid tier), or `trial_conversion`
+ *   (a trial transitioned to an active paid subscription)
+ * @returns Flat, PII-free property bag for the funnel event
+ */
+function buildUpgradeCompletedProps(
+  subscription: Stripe.Subscription,
+  tierId: string | undefined,
+  via: "direct" | "upgrade" | "trial_conversion"
+) {
+  const plan = subscription.items.data[0]?.plan;
+
+  // Normalise the recurring amount to a monthly figure. Unknown intervals fall
+  // through to null so we never report a wrong MRR for an unexpected cadence.
+  let mrr: number | null = null;
+  if (typeof plan?.amount === "number") {
+    const perPeriod = plan.amount / 100;
+    switch (plan.interval) {
+      case "month":
+        mrr = perPeriod;
+        break;
+      case "year":
+        mrr = Number((perPeriod / 12).toFixed(2));
+        break;
+      case "week":
+        mrr = Number(((perPeriod * 52) / 12).toFixed(2));
+        break;
+      case "day":
+        mrr = Number(((perPeriod * 365) / 12).toFixed(2));
+        break;
+      default:
+        mrr = null;
+    }
+  }
+
+  return {
+    tierId: tierId ?? "unknown",
+    billing_cycle: plan?.interval ?? null,
+    mrr,
+    via,
+  };
+}
+
+// ─── Checkout ──────────────────────────────────────────────
+
+export async function handleCheckoutCompleted(
+  event: Stripe.Event,
+  _user: WebhookUser
+) {
+  const { subscription: subscriptionId } = event.data
+    .object as Stripe.Checkout.Session;
+
+  if (!subscriptionId) {
+    throw new ShelfError({
+      cause: null,
+      message: "No subscription ID found",
+      additionalData: { event },
+      label: "Stripe webhook",
+      status: 500,
+    });
+  }
+
+  const subscription = await fetchStripeSubscription(subscriptionId as string);
+
+  const product = subscription.items.data[0].plan.product as Stripe.Product;
+  const customerId = subscription.customer as string;
+  const tierId = product?.metadata?.shelf_tier;
+  const productType = product?.metadata?.product_type;
+
+  if (
+    isAddonSubscription({
+      tierId,
+      productType,
+      event,
+      additionalData: { subscription },
+    })
+  ) {
+    const organizationId = subscription?.metadata?.organizationId;
+    if (product?.metadata?.addon_type === "audits" && organizationId) {
+      await handleAuditAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    if (product?.metadata?.addon_type === "barcodes" && organizationId) {
+      await handleBarcodeAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    return OK();
+  }
+
+  await db.user
+    .update({
+      where: { customerId },
+      data: { tierId: tierId as TierId },
+      select: { id: true },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to update user tier",
+        additionalData: { customerId, tierId, event },
+        label: "Stripe webhook",
+        status: 500,
+      });
+    });
+
+  return OK();
+}
+
+// ─── Subscription Created ──────────────────────────────────
+
+export async function handleSubscriptionCreated(
+  event: Stripe.Event,
+  user: WebhookUser
+) {
+  const { subscription, customerId, tierId, productType, product } =
+    await getDataFromStripeEvent(event);
+
+  if (
+    isAddonSubscription({
+      tierId,
+      productType,
+      event,
+      additionalData: { subscription },
+    })
+  ) {
+    const organizationId = subscription?.metadata?.organizationId;
+    if (product?.metadata?.addon_type === "audits" && organizationId) {
+      await handleAuditAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    if (product?.metadata?.addon_type === "barcodes" && organizationId) {
+      await handleBarcodeAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    return OK();
+  }
+
+  const isTransferredSubscription =
+    !!subscription.metadata?.transferred_from_subscription;
+  const isTrialSubscription =
+    !!subscription.trial_end && !!subscription.trial_start;
+
+  if (isTrialSubscription && !isTransferredSubscription) {
+    const trialUser = await db.user
+      .update({
+        where: { customerId },
+        data: {
+          tierId: tierId as TierId,
+          usedFreeTrial: true,
+        },
+        select: { email: true, firstName: true, displayName: true },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Failed to update user tier",
+          additionalData: { customerId, tierId, event },
+          label: "Stripe webhook",
+          status: 500,
+        });
+      });
+
+    void sendTeamTrialWelcomeEmail({
+      email: trialUser.email,
+      firstName: resolveUserGreetingName(trialUser),
+    });
+  } else if (isTransferredSubscription) {
+    // Transferred subscription: update tier but skip welcome emails
+    // and don't set usedFreeTrial (already handled in transferOwnership)
+    await db.user
+      .update({
+        where: { customerId },
+        data: { tierId: tierId as TierId },
+        select: { id: true },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Failed to update user tier",
+          additionalData: { customerId, tierId, event },
+          label: "Stripe webhook",
+          status: 500,
+        });
+      });
+  } else {
+    await db.user
+      .update({
+        where: { customerId },
+        data: { tierId: tierId as TierId },
+        select: { id: true },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Failed to update user tier",
+          additionalData: { customerId, tierId, event },
+          label: "Stripe webhook",
+          status: 500,
+        });
+      });
+
+    // Direct paid conversion (non-trial, non-transfer): a free user just
+    // became paying. Best-effort funnel event — never blocks the webhook.
+    captureServerEvent({
+      distinctId: user.id,
+      event: "upgrade_completed",
+      properties: buildUpgradeCompletedProps(subscription, tierId, "direct"),
+    });
+
+    const { emailsToNotify, customerName } = await getCustomerNotificationData({
+      customerId,
+      user,
+    });
+    const subscriptionName = product?.name || "Shelf Subscription";
+
+    for (const email of emailsToNotify) {
+      sendEmail({
+        to: email,
+        subject: "Your Shelf subscription is now active",
+        text: subscriptionGrantedText({ customerName, subscriptionName }),
+      });
+    }
+  }
+
+  return OK();
+}
+
+// ─── Subscription Paused ───────────────────────────────────
+
+export async function handleSubscriptionPaused(
+  event: Stripe.Event,
+  user: WebhookUser
+) {
+  const {
+    subscription,
+    customerId,
+    tierId,
+    productType,
+    product,
+    hasAuditAddon,
+    hasBarcodeAddon,
+  } = await getDataFromStripeEvent(event);
+
+  if (
+    isAddonSubscription({
+      tierId,
+      productType,
+      event,
+      additionalData: { subscription },
+    })
+  ) {
+    const organizationId = subscription?.metadata?.organizationId;
+    if (product?.metadata?.addon_type === "audits" && organizationId) {
+      await handleAuditAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    if (product?.metadata?.addon_type === "barcodes" && organizationId) {
+      await handleBarcodeAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    return OK();
+  }
+
+  await syncBundledAddons({
+    eventType: event.type,
+    subscription,
+    hasAuditAddon,
+    hasBarcodeAddon,
+  });
+
+  const pausedSubscriptionIsHigherOrEqualTier = isHigherOrEqualTier(
+    tierId as TierId,
+    user.tierId
+  );
+
+  if (
+    subscription.status === "paused" &&
+    pausedSubscriptionIsHigherOrEqualTier
+  ) {
+    await db.user
+      .update({
+        where: { customerId },
+        data: { tierId: "free" },
+        select: { id: true },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Failed to update user tier",
+          additionalData: { customerId, tierId, event },
+          label: "Stripe webhook",
+          status: 500,
+        });
+      });
+
+    // Only reset branding when downgrading from Plus (tier_1) to Free
+    if (user.tierId === TierId.tier_1) {
+      await resetPersonalWorkspaceBranding(user.id);
+    }
+  }
+
+  return OK();
+}
+
+// ─── Subscription Updated ──────────────────────────────────
+
+export async function handleSubscriptionUpdated(
+  event: Stripe.Event,
+  user: WebhookUser
+) {
+  const {
+    subscription,
+    customerId,
+    tierId,
+    productType,
+    product,
+    hasAuditAddon,
+    hasBarcodeAddon,
+  } = await getDataFromStripeEvent(event);
+
+  if (
+    isAddonSubscription({
+      tierId,
+      productType,
+      event,
+      additionalData: { subscription },
+    })
+  ) {
+    const organizationId = subscription?.metadata?.organizationId;
+    if (product?.metadata?.addon_type === "audits" && organizationId) {
+      await handleAuditAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    if (product?.metadata?.addon_type === "barcodes" && organizationId) {
+      await handleBarcodeAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    return OK();
+  }
+
+  await syncBundledAddons({
+    eventType: event.type,
+    subscription,
+    hasAuditAddon,
+    hasBarcodeAddon,
+  });
+  // The add-on and plan checks below may each need the customer's
+  // subscriptions; they share one read.
+  const loadSubscriptions = createCustomerSubscriptionsLoader(customerId);
+
+  // The removed products feed the add-on side (workspace-linked
+  // subscriptions only) and the plan downgrade; skip the lookups when neither
+  // can act.
+  const removedProducts =
+    subscription.metadata?.organizationId ||
+    updateCouldLowerPlan({ subscription, tierId, user })
+      ? await getProductsRemovedFromSubscription({ event, subscription })
+      : [];
+  await disableAddonsRemovedFromSubscription({
+    subscription,
+    removedProducts,
+    hasAuditAddon,
+    hasBarcodeAddon,
+    loadSubscriptions,
+  });
+  await applyPlanDowngrade({
+    subscription,
+    removedProducts,
+    tierId,
+    user,
+    customerId,
+    loadSubscriptions,
+  });
+  const raisedTo = await applyPlanUpgrade({
+    subscription,
+    tierId,
+    user,
+    customerId,
+    loadSubscriptions,
+  });
+
+  // A trial converting to paid arrives as a status transition from trialing
+  // to active. The trial-creation path already set the user's paid tier, so
+  // no raise happens for these; detect the transition explicitly, otherwise
+  // every trial-originated paid conversion is missed.
+  const previousStatus = (
+    event.data.previous_attributes as
+      | { status?: Stripe.Subscription.Status }
+      | undefined
+  )?.status;
+  const isTrialConversion =
+    previousStatus === "trialing" && subscription.status === "active";
+
+  // Fire upgrade_completed for either a tier raise or a trial to paid
+  // conversion. The DB tier (set on the first such event) prevents repeats, so
+  // renewals and no-op updates don't re-emit. Best-effort; never blocks the
+  // webhook.
+  if (isTrialConversion || raisedTo) {
+    captureServerEvent({
+      distinctId: user.id,
+      event: "upgrade_completed",
+      properties: buildUpgradeCompletedProps(
+        subscription,
+        tierId,
+        isTrialConversion ? "trial_conversion" : "upgrade"
+      ),
+    });
+  }
+
+  return OK();
+}
+
+// ─── Subscription Deleted ──────────────────────────────────
+
+export async function handleSubscriptionDeleted(
+  event: Stripe.Event,
+  user: WebhookUser
+) {
+  const {
+    subscription,
+    customerId,
+    tierId,
+    productType,
+    product,
+    hasAuditAddon,
+    hasBarcodeAddon,
+  } = await getDataFromStripeEvent(event);
+
+  if (isAddonSubscription({ tierId, productType, event })) {
+    const organizationId = subscription?.metadata?.organizationId;
+    // Skip addon disable when this cancellation is part of a subscription
+    // transfer — the new subscription's create webhook already enabled the addon.
+    const isTransferCancellation =
+      !!subscription?.metadata?.transferred_to_subscription;
+    if (
+      product?.metadata?.addon_type === "audits" &&
+      organizationId &&
+      !isTransferCancellation
+    ) {
+      await handleAuditAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    if (
+      product?.metadata?.addon_type === "barcodes" &&
+      organizationId &&
+      !isTransferCancellation
+    ) {
+      await handleBarcodeAddonWebhook({
+        eventType: event.type,
+        subscription,
+        organizationId,
+      });
+    }
+    return OK();
+  }
+
+  // A transfer cancels the old subscription only after its replacement exists
+  // with the same items and metadata, so the add-ons stay with the workspace.
+  if (!subscription?.metadata?.transferred_to_subscription) {
+    await syncBundledAddons({
+      eventType: event.type,
+      subscription,
+      hasAuditAddon,
+      hasBarcodeAddon,
+    });
+  }
+
+  const deletedSubscriptionIsHigherOrEqualTier = isHigherOrEqualTier(
+    tierId as TierId,
+    user.tierId
+  );
+
+  if (deletedSubscriptionIsHigherOrEqualTier) {
+    await db.user
+      .update({
+        where: { customerId },
+        data: { tierId: TierId.free },
+        select: { id: true },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Failed to delete user subscription",
+          additionalData: { customerId, event },
+          label: "Stripe webhook",
+          status: 500,
+        });
+      });
+
+    // Count churn only for users who actually paid. Trial users are placed on
+    // the paid tier at trial start, so the tier guard above also passes for a
+    // mid-trial cancellation — exclude those (still inside the trial window) so
+    // trial abandonment doesn't inflate churn. Best-effort; never blocks.
+    const stillWithinTrial = subscription.trial_end
+      ? subscription.trial_end * 1000 > Date.now()
+      : false;
+    if (!stillWithinTrial) {
+      captureServerEvent({
+        distinctId: user.id,
+        event: "subscription_cancelled",
+        properties: { tierId: tierId ?? "unknown" },
+      });
+    }
+
+    // Only reset branding when downgrading from Plus (tier_1) to Free
+    if (user.tierId === TierId.tier_1) {
+      await resetPersonalWorkspaceBranding(user.id);
+    }
+  }
+
+  return OK();
+}
+
+// ─── Invoice Payment Failed ────────────────────────────────
+
+export async function handleInvoicePaymentFailed(
+  event: Stripe.Event,
+  user: WebhookUser,
+  customerId: string
+) {
+  const failedInvoice = event.data.object as Stripe.Invoice;
+
+  await db.user
+    .update({
+      where: { customerId },
+      data: { hasUnpaidInvoice: true },
+      select: { id: true },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to update unpaid invoice flag",
+        additionalData: { customerId, event },
+        label: "Stripe webhook",
+        status: 500,
+      });
+    });
+
+  // If user was warned about missing payment method and payment fails,
+  // pause the subscription immediately instead of waiting for Stripe's retry logic.
+  // This prevents service without payment method from continuing through retry period.
+  const failedSubscriptionId =
+    failedInvoice.parent?.subscription_details?.subscription;
+  if (user.warnForNoPaymentMethod && failedSubscriptionId) {
+    await stripe.subscriptions.update(failedSubscriptionId as string, {
+      pause_collection: {
+        behavior: "void", // Void upcoming invoices while paused
+      },
+    });
+    // Note: This will trigger customer.subscription.paused webhook
+    // which handles tier downgrade
+  }
+
+  sendAdminInvoiceEmail({
+    user,
+    eventType: event.type,
+    invoiceId: failedInvoice.id,
+    subject: `Unpaid invoice: ${user.email}`,
+  });
+
+  // Send user notification (deduplicated). The due date is formatted with the
+  // billed (recipient) user's resolved prefs.
+  const prefs = await resolveUserFormatPrefsById(user.id, null);
+  const { emailsToNotify, customerName, subscriptionName, amountDue, dueDate } =
+    await getInvoiceNotificationData({
+      customerId,
+      invoice: failedInvoice,
+      user,
+      prefs,
+    });
+
+  for (const email of emailsToNotify) {
+    sendEmail({
+      to: email,
+      subject: "Action needed: Payment issue with your Shelf subscription",
+      text: unpaidInvoiceUserText({
+        customerEmail: email,
+        customerName,
+        subscriptionName,
+        amountDue,
+        dueDate,
+      }),
+    });
+  }
+
+  return OK();
+}
+
+// ─── Invoice Paid ──────────────────────────────────────────
+
+export async function handleInvoicePaid(
+  event: Stripe.Event,
+  user: WebhookUser,
+  customerId: string
+) {
+  const paidInvoice = event.data.object as Stripe.Invoice;
+
+  // Clear unpaid invoice flag and missing payment method warning
+  // (paying an invoice proves they have a working payment method)
+  await db.user
+    .update({
+      where: { customerId },
+      data: { hasUnpaidInvoice: false, warnForNoPaymentMethod: false },
+      select: { id: true },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to update unpaid invoice flag",
+        additionalData: { customerId, event },
+        label: "Stripe webhook",
+        status: 500,
+      });
+    });
+
+  /**
+   * Safety net: Update user tier when a subscription invoice is paid.
+   *
+   * In most cases, the tier is already set by `customer.subscription.created`.
+   * However, this serves as a fallback for edge cases like:
+   * - Subscription created in "incomplete" state that only activates after payment
+   * - If `customer.subscription.created` event was missed or failed
+   * - Any other scenario where the tier wasn't properly set on creation
+   *
+   * Iterates ALL subscription items to handle bundled subscriptions
+   * (tier + audit addon in a single subscription).
+   */
+  const subscriptionId = paidInvoice.parent?.subscription_details?.subscription;
+  if (subscriptionId) {
+    const subscription = await fetchStripeSubscription(
+      subscriptionId as string
+    );
+
+    if (subscription.status === "active") {
+      // Iterate all items to find tier and addon products
+      for (const item of subscription.items.data) {
+        const product = item.plan.product as Stripe.Product;
+        const tierId = product?.metadata?.shelf_tier;
+        const productType = product?.metadata?.product_type;
+
+        // Handle audit add-on invoice paid as safety net
+        if (
+          productType === "addon" &&
+          product?.metadata?.addon_type === "audits"
+        ) {
+          const organizationId = subscription?.metadata?.organizationId;
+          if (organizationId) {
+            await db.organization.update({
+              where: { id: organizationId },
+              data: { auditsEnabled: true },
+              select: { id: true },
+            });
+          }
+        }
+
+        // Handle barcode add-on invoice paid as safety net
+        if (
+          productType === "addon" &&
+          product?.metadata?.addon_type === "barcodes"
+        ) {
+          const organizationId = subscription?.metadata?.organizationId;
+          if (organizationId) {
+            await db.organization.update({
+              where: { id: organizationId },
+              data: { barcodesEnabled: true },
+              select: { id: true },
+            });
+          }
+        }
+
+        // Update tier for non-addon products
+        if (tierId && productType !== "addon") {
+          if (isHigherOrEqualTier(tierId as TierId, user.tierId)) {
+            await db.user
+              .update({
+                where: { customerId },
+                data: { tierId: tierId as TierId },
+                select: { id: true },
+              })
+              .catch((cause) => {
+                throw new ShelfError({
+                  cause,
+                  message: "Failed to update user tier from paid invoice",
+                  additionalData: { customerId, tierId, event },
+                  label: "Stripe webhook",
+                  status: 500,
+                });
+              });
+          }
+        }
+      }
+    }
+  }
+
+  // Only send admin notification for actual paid invoices (not $0 trial invoices)
+  if (paidInvoice.amount_paid > 0) {
+    sendAdminInvoiceEmail({
+      user,
+      eventType: event.type,
+      invoiceId: paidInvoice.id,
+      subject: `Invoice resolved: ${user.email}`,
+    });
+  }
+
+  return OK();
+}
+
+// ─── Invoice Resolved (voided / marked_uncollectible) ──────
+
+export async function handleInvoiceResolved(
+  event: Stripe.Event,
+  user: WebhookUser,
+  customerId: string
+) {
+  const resolvedInvoice = event.data.object as Stripe.Invoice;
+
+  await db.user
+    .update({
+      where: { customerId },
+      data: { hasUnpaidInvoice: false },
+      select: { id: true },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to update unpaid invoice flag",
+        additionalData: { customerId, event },
+        label: "Stripe webhook",
+        status: 500,
+      });
+    });
+
+  sendAdminInvoiceEmail({
+    user,
+    eventType: event.type,
+    invoiceId: resolvedInvoice.id,
+    subject: `Invoice resolved: ${user.email}`,
+  });
+
+  return OK();
+}
+
+// ─── Invoice Overdue ───────────────────────────────────────
+
+export async function handleInvoiceOverdue(
+  event: Stripe.Event,
+  user: WebhookUser,
+  customerId: string
+) {
+  const overdueInvoice = event.data.object as Stripe.Invoice;
+
+  // Mark user as having unpaid invoice
+  await db.user
+    .update({
+      where: { customerId },
+      data: { hasUnpaidInvoice: true },
+      select: { id: true },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to update unpaid invoice flag",
+        additionalData: { customerId, event },
+        label: "Stripe webhook",
+        status: 500,
+      });
+    });
+
+  sendAdminInvoiceEmail({
+    user,
+    eventType: event.type,
+    invoiceId: overdueInvoice.id,
+    subject: `Invoice overdue: ${user.email}`,
+  });
+
+  // Send user notification (deduplicated). The due date is formatted with the
+  // billed (recipient) user's resolved prefs.
+  const prefs = await resolveUserFormatPrefsById(user.id, null);
+  const { emailsToNotify, customerName, subscriptionName, amountDue, dueDate } =
+    await getInvoiceNotificationData({
+      customerId,
+      invoice: overdueInvoice,
+      user,
+      prefs,
+    });
+
+  for (const email of emailsToNotify) {
+    sendEmail({
+      to: email,
+      subject: "Action needed: Your Shelf invoice is overdue",
+      text: unpaidInvoiceUserText({
+        customerEmail: email,
+        customerName,
+        subscriptionName,
+        amountDue,
+        dueDate,
+      }),
+    });
+  }
+
+  // End the tier and the add-ons of the subscription the invoice belongs to
+  const subscriptionId =
+    overdueInvoice.parent?.subscription_details?.subscription;
+  if (subscriptionId) {
+    const subscription = await fetchStripeSubscription(
+      subscriptionId as string
+    );
+    const product = subscription.items.data[0].plan.product as Stripe.Product;
+    const tierId = product?.metadata?.shelf_tier;
+    const productType = product?.metadata?.product_type;
+
+    // Add-ons on the overdue subscription end with it, whether they are
+    // bundled on a tier subscription or bought standalone.
+    await disableAddonsOnOverdueSubscription({
+      eventType: event.type,
+      subscription,
+    });
+
+    // Only downgrade for non-addon subscription products with a tier
+    if (tierId && productType !== "addon") {
+      if (isHigherOrEqualTier(tierId as TierId, user.tierId)) {
+        await db.user
+          .update({
+            where: { customerId },
+            data: { tierId: TierId.free },
+            select: { id: true },
+          })
+          .catch((cause) => {
+            throw new ShelfError({
+              cause,
+              message: "Failed to downgrade user tier for overdue invoice",
+              additionalData: { customerId, tierId, event },
+              label: "Stripe webhook",
+              status: 500,
+            });
+          });
+
+        // Reset branding when downgrading from Plus (tier_1) to Free
+        if (user.tierId === TierId.tier_1) {
+          await resetPersonalWorkspaceBranding(user.id);
+        }
+      }
+    }
+  }
+
+  return OK();
+}
+
+// ─── Trial Will End ────────────────────────────────────────
+
+export async function handleTrialWillEnd(
+  event: Stripe.Event,
+  user: WebhookUser
+) {
+  const { tierId, subscription, productType, product, customerId } =
+    await getDataFromStripeEvent(event);
+
+  if (
+    isAddonSubscription({
+      tierId,
+      productType,
+      event,
+      additionalData: { subscription },
+    })
+  ) {
+    const addonType = product?.metadata?.addon_type as
+      | "audits"
+      | "barcodes"
+      | undefined;
+
+    if (subscription.trial_end && addonType) {
+      const hasPaymentMethod = await customerHasPaymentMethod(customerId);
+      const trialEndDate = new Date(subscription.trial_end * 1000);
+
+      // Resolve the billed (recipient) user's formatting prefs once for both
+      // addon variants' trial-end date.
+      const prefs = await resolveUserFormatPrefsById(user.id, null);
+
+      // Send 3-day warning email
+      if (addonType === "audits") {
+        void sendAuditTrialEndsSoonEmail({
+          firstName: resolveUserGreetingName(user),
+          email: user.email,
+          hasPaymentMethod,
+          trialEndDate,
+          prefs,
+        });
+      } else {
+        void sendBarcodeTrialEndsSoonEmail({
+          firstName: resolveUserGreetingName(user),
+          email: user.email,
+          hasPaymentMethod,
+          trialEndDate,
+          prefs,
+        });
+      }
+
+      // Schedule 1-day warning email (only for users with payment method)
+      if (hasPaymentMethod) {
+        const oneDayBefore = new Date(
+          trialEndDate.getTime() - 24 * 60 * 60 * 1000
+        );
+        scheduleTrialEndsTomorrowEmail({
+          data: {
+            addonType,
+            userId: user.id,
+            email: user.email,
+            firstName: resolveUserGreetingName(user),
+            customerId,
+            subscriptionId: subscription.id,
+            trialEndDate: trialEndDate.toISOString(),
+          },
+          when: oneDayBefore,
+        }).catch((cause) => {
+          // Log but don't fail the webhook — the 1-day email is best-effort
+          Logger.error(
+            new ShelfError({
+              cause,
+              message: "Failed to schedule trial ends tomorrow email",
+              additionalData: {
+                addonType,
+                subscriptionId: subscription.id,
+              },
+              label: "Stripe",
+            })
+          );
+        });
+      }
+    }
+    return OK();
+  }
+
+  const isTrialSubscription =
+    subscription.trial_end && subscription.trial_start;
+
+  if (isTrialSubscription) {
+    const hasPaymentMethod = await customerHasPaymentMethod(customerId);
+    // Format the trial-end date with the billed (recipient) user's prefs.
+    const prefs = await resolveUserFormatPrefsById(user.id, null);
+    void sendTrialEndsSoonEmail({
+      firstName: resolveUserGreetingName(user),
+      email: user.email,
+      hasPaymentMethod,
+      planName: product?.name || "Shelf",
+      trialEndDate: new Date((subscription.trial_end as number) * 1000),
+      prefs,
+    });
+  }
+
+  return OK();
+}
+
+// ─── Payment Method Attached ───────────────────────────────
+
+export async function handlePaymentMethodAttached(
+  _event: Stripe.Event,
+  _user: WebhookUser,
+  customerId: string
+) {
+  // Clear the warning flag when user adds a payment method
+  await db.user
+    .update({
+      where: { customerId },
+      data: { warnForNoPaymentMethod: false },
+      select: { id: true },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to clear missing payment method warning",
+        additionalData: { customerId, event: _event },
+        label: "Stripe webhook",
+        status: 500,
+      });
+    });
+
+  return OK();
+}
+
+// ─── Payment Method Detached ───────────────────────────────
+
+export async function handlePaymentMethodDetached(
+  _event: Stripe.Event,
+  _user: WebhookUser,
+  customerId: string
+) {
+  // When user removes a payment method, check if they still have one
+  // If they have an active subscription but no payment method, warn them
+  const hasPaymentMethod = await customerHasPaymentMethod(customerId);
+
+  if (!hasPaymentMethod) {
+    const customer = (await getStripeCustomer(
+      customerId
+    )) as CustomerWithSubscriptions;
+    const activeSubscription = getCustomerActiveSubscription({ customer });
+
+    if (activeSubscription) {
+      await db.user
+        .update({
+          where: { customerId },
+          data: { warnForNoPaymentMethod: true },
+          select: { id: true },
+        })
+        .catch((cause) => {
+          throw new ShelfError({
+            cause,
+            message: "Failed to set missing payment method warning",
+            additionalData: { customerId, event: _event },
+            label: "Stripe webhook",
+            status: 500,
+          });
+        });
+    }
+  }
+
+  return OK();
+}

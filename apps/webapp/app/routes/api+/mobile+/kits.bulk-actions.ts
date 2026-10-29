@@ -1,0 +1,148 @@
+import { data, type LoaderFunctionArgs } from "react-router";
+import { db } from "~/database/db.server";
+import {
+  getMobileUserContext,
+  requireMobileAuth,
+  requireMobilePermission,
+  requireOrganizationAccess,
+} from "~/modules/api/mobile-auth.server";
+import { viewerCanSeeLegacyCustody } from "~/modules/api/mobile-custody-visibility.server";
+import { KIT_ACTIVE_MEMBER_COUNT } from "~/modules/kit/fields";
+import { refreshExpiredKitImages } from "~/modules/kit/service.server";
+import { makeShelfError } from "~/utils/error";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+
+/**
+ * GET /api/mobile/kits?orgId=xxx&search=xxx&page=1&perPage=20&status=X&myCustody=true
+ *
+ * Returns paginated kits for the given organization, each with its category,
+ * location, asset count, and custodian. Mirrors the mobile assets list route
+ * (search, infinite scroll, status filter, and the my-custody filter). A kit
+ * image whose signed URL has lapsed is re-signed, and the new URL written back
+ * to the kit, before it is sent.
+ *
+ * @see {@link file://./assets.ts} the asset twin of this route
+ */
+export async function loader({ request }: LoaderFunctionArgs) {
+  try {
+    const { user } = await requireMobileAuth(request);
+    const organizationId = await requireOrganizationAccess(request, user.id);
+    const { access } = await getMobileUserContext(user.id, organizationId);
+
+    await requireMobilePermission({
+      userId: user.id,
+      organizationId,
+      entity: PermissionEntity.kit,
+      action: PermissionAction.read,
+    });
+
+    const url = new URL(request.url);
+
+    const rawSearch = url.searchParams.get("search") || "";
+    const search = rawSearch.slice(0, 100);
+
+    const rawPage = parseInt(url.searchParams.get("page") || "1", 10);
+    const page = Number.isNaN(rawPage) ? 1 : Math.max(1, rawPage);
+
+    const rawPerPage = parseInt(url.searchParams.get("perPage") || "20", 10);
+    const perPage = Number.isNaN(rawPerPage)
+      ? 20
+      : Math.min(50, Math.max(1, rawPerPage));
+
+    const skip = (page - 1) * perPage;
+
+    const statusFilter = url.searchParams.get("status");
+    const myCustody = url.searchParams.get("myCustody") === "true";
+
+    const where: Record<string, unknown> = {
+      organizationId,
+      ...(search
+        ? { name: { contains: search, mode: "insensitive" as const } }
+        : {}),
+      ...(statusFilter ? { status: statusFilter } : {}),
+      // Scope to the current user's custody — mirrors the asset list filter.
+      ...(myCustody ? { custody: { custodian: { userId: user.id } } } : {}),
+    };
+
+    const [storedKits, totalCount] = await Promise.all([
+      db.kit.findMany({
+        where,
+        select: {
+          id: true,
+          // Scopes the write-back of a re-signed image below.
+          organizationId: true,
+          name: true,
+          status: true,
+          image: true,
+          imageExpiration: true,
+          // Kits link to assets via the `AssetKit` pivot model. Count that
+          // relation, then re-key it below to `_count.assets`, the key the
+          // companion reads. Archived members are out of service and not
+          // counted, matching the kit screen's own count.
+          _count: KIT_ACTIVE_MEMBER_COUNT,
+          category: { select: { id: true, name: true } },
+          location: { select: { id: true, name: true } },
+          custody: {
+            select: {
+              // why: `userId` distinguishes the viewer's own custody from a
+              // colleague's for the visibility gate applied to the response.
+              custodian: { select: { id: true, name: true, userId: true } },
+            },
+          },
+        },
+        orderBy: { createdAt: "desc" },
+        skip,
+        take: perPage,
+      }),
+      db.kit.count({ where }),
+    ]);
+
+    // A kit's `image` is a signed storage URL that stops working once
+    // `imageExpiration` passes, and the app has no way to renew it. Re-sign the
+    // lapsed ones so the list never receives a dead link. `organizationId` only
+    // scopes that write-back, so it is dropped before the response.
+    const kits = (await refreshExpiredKitImages(storedKits)).map(
+      ({ organizationId: _organizationId, ...kit }) => kit
+    );
+
+    // Re-shape `_count.assetKits` → `_count.assets` so the response matches
+    // the contract the companion app already consumes (see
+    // `apps/companion/lib/api/types.ts` Kit shape).
+    const kitsForResponse = kits.map(({ _count, ...rest }) => ({
+      ...rest,
+      _count: { assets: _count.assetKits },
+      /**
+       * `kit: read` is held by BASE and SELF_SERVICE, so a restricted viewer
+       * reaches this list. Null the object for holders the viewer may not
+       * see, matching the mobile detail routes; the caller's own custody
+       * stays visible.
+       */
+      custody:
+        rest.custody &&
+        viewerCanSeeLegacyCustody({
+          custodianUserId: rest.custody.custodian.userId,
+          viewerUserId: user.id,
+          canSeeAllCustody: access.custody.seeAll,
+        })
+          ? rest.custody
+          : null,
+    }));
+
+    return data({
+      kits: kitsForResponse,
+      page,
+      perPage,
+      totalCount,
+      totalPages: Math.ceil(totalCount / perPage),
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    return data(
+      { error: { message: reason.message } },
+      { status: reason.status }
+    );
+  }
+}

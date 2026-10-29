@@ -1,0 +1,410 @@
+import { useRef, useState } from "react";
+import type { Barcode, Kit } from "@prisma/client";
+import { useAtom, useAtomValue } from "jotai";
+import { useActionData, useLocation } from "react-router";
+import { useZorm } from "react-zorm";
+import { z } from "zod";
+import { updateDynamicTitleAtom } from "~/atoms/dynamic-title-atom";
+import { fileErrorAtom, assetImageValidateFileAtom } from "~/atoms/file";
+import { useAutoFocus } from "~/hooks/use-auto-focus";
+import { useDisabled } from "~/hooks/use-disabled";
+import { useDiscardRemount } from "~/hooks/use-discard-remount";
+import { useTrackedFormRef } from "~/hooks/use-unsaved-changes";
+import type { action as editKitAction } from "~/routes/_layout+/kits.$kitId_.edit";
+import type { action as createKitAction } from "~/routes/_layout+/kits.new";
+import { resolveCancelTo } from "~/utils/cancel-destination";
+import { getValidationErrors } from "~/utils/http";
+import { useBarcodePermissions } from "~/utils/permissions/use-barcode-permissions";
+import { tw } from "~/utils/tw";
+import { zodFieldIsRequired } from "~/utils/zod";
+import { Form } from "../custom-form";
+import KitImage from "./kit-image";
+import DynamicSelect from "../dynamic-select/dynamic-select";
+import BarcodesInput, { type BarcodesInputRef } from "../forms/barcodes-input";
+import FormRow from "../forms/form-row";
+import {
+  IMAGE_FIELD_PICTURE_CLASSES,
+  IMAGE_HINT_8MB,
+  ImageFileField,
+} from "../forms/image-file-field";
+import Input from "../forms/input";
+import { RefererRedirectInput } from "../forms/referer-redirect-input";
+import { UnsavedChangesGuard } from "../forms/unsaved-changes-bar";
+import ImageWithPreview from "../image-with-preview/image-with-preview";
+import InlineEntityCreationDialog from "../inline-entity-creation-dialog/inline-entity-creation-dialog";
+import { Button } from "../shared/button";
+import { Card } from "../shared/card";
+import When from "../when/when";
+
+export const NewKitFormSchema = z.object({
+  name: z
+    .string()
+    .min(2, "Name is required")
+    .transform((value) => value.trim()),
+  description: z
+    .string()
+    .optional()
+    .transform((value) => value?.trim()),
+  category: z.string().optional(),
+  qrId: z.string().optional(),
+  locationId: z.string().optional(),
+  redirectTo: z.string().optional(),
+});
+
+type KitFormProps = Partial<
+  Pick<Kit, "name" | "description" | "categoryId" | "locationId" | "image">
+> & {
+  /** Expiry of the saved image's signed URL; an expired one is refreshed. */
+  imageExpiration?: Kit["imageExpiration"] | string;
+  className?: string;
+  /** Present when editing an existing kit; absent on create. Only used to
+   * pick a sensible Cancel destination when there's no referer. */
+  id?: string;
+  qrId?: string | null;
+  barcodes?: Pick<Barcode, "id" | "value" | "type">[];
+  referer?: string | null;
+};
+
+/**
+ * Create and edit form for kits: name, description, category, location,
+ * image and barcodes, with the unsaved-changes bar.
+ *
+ * Discard remounts the inner form (see `useDiscardRemount`), which resets
+ * every widget that keeps its value in React state.
+ *
+ * @param props - Current values when editing; omit them to create a kit
+ */
+export default function KitsForm(props: KitFormProps) {
+  const { key, discard, discarded } = useDiscardRemount();
+  return (
+    <KitsFormInner
+      key={key}
+      {...props}
+      onDiscard={discard}
+      autoFocusName={!discarded}
+    />
+  );
+}
+
+function KitsFormInner({
+  className,
+  id,
+  name,
+  description,
+  qrId,
+  categoryId,
+  barcodes,
+  locationId,
+  image,
+  imageExpiration,
+  referer,
+  onDiscard,
+  autoFocusName,
+}: KitFormProps & {
+  /** Resets the form to the loaded values (remounts it). */
+  onDiscard: () => void;
+  /** Focus the Name field on mount; false after a Discard. */
+  autoFocusName: boolean;
+}) {
+  const disabled = useDisabled();
+  const { canUseBarcodes } = useBarcodePermissions();
+  const barcodesInputRef = useRef<BarcodesInputRef>(null);
+
+  /**
+   * Snapshot of the referer as it was when this form first mounted.
+   * Deliberately ignores later prop updates — see the matching comment in
+   * `~/components/assets/form.tsx`. The Referer header is only meaningful on
+   * arrival; any in-route navigation overwrites it with this page's own URL.
+   */
+  const [initialReferer] = useState(referer);
+
+  /**
+   * Where Cancel goes. The referer is best-effort and unusable in three
+   * separate cases (absent prop, no Referer header, and self-reference).
+   * `resolveCancelTo` owns all three — see its JSDoc.
+   */
+  const { pathname } = useLocation();
+  const cancelTo = resolveCancelTo({
+    referer: initialReferer,
+    currentPathname: pathname,
+    fallback: id ? `/kits/${id}` : "/kits",
+  });
+
+  // Focus the Name field on mount so create/edit pages start the user
+  // typing immediately instead of relying on a removed autoFocus prop.
+  const nameInputRef = useAutoFocus<HTMLInputElement>({
+    when: autoFocusName,
+  });
+
+  const actionData = useActionData<
+    typeof createKitAction | typeof editKitAction
+  >();
+
+  const fileError = useAtomValue(fileErrorAtom);
+  const [, updateDynamicTitle] = useAtom(updateDynamicTitleAtom);
+
+  const zo = useZorm("NewKitForm", NewKitFormSchema);
+
+  /** The form element, shared by Zorm and the unsaved-changes tracking. */
+  const { formRef, setFormRef } = useTrackedFormRef(zo.ref);
+
+  const serverValidationErrors = getValidationErrors(actionData?.error);
+  const nameErrorMessage =
+    serverValidationErrors?.name?.message ?? zo.errors.name()?.message;
+
+  const imageError =
+    serverValidationErrors?.image?.message ??
+    (actionData?.error?.additionalData?.field === "image"
+      ? actionData?.error?.message
+      : undefined) ??
+    fileError;
+
+  return (
+    <Card className={tw("w-full md:w-min", className)}>
+      <UnsavedChangesGuard
+        formRef={formRef}
+        actionData={actionData}
+        onDiscard={onDiscard}
+      />
+      <Form
+        ref={setFormRef}
+        method="post"
+        className="flex w-full flex-col gap-2"
+        encType="multipart/form-data"
+        onSubmit={(e) => {
+          // Force validation of all barcode fields to show errors
+          barcodesInputRef.current?.validateAll();
+
+          // Check for barcode validation errors
+          const hasBarcodeErrors = barcodesInputRef.current?.hasErrors();
+
+          // If there are barcode errors, prevent submission
+          // Zorm will handle its own validation and prevent submission if needed
+          if (hasBarcodeErrors) {
+            e.preventDefault();
+            e.stopPropagation();
+            return false;
+          }
+        }}
+      >
+        {qrId ? (
+          <input type="hidden" name={zo.fields.qrId()} value={qrId} />
+        ) : null}
+        <RefererRedirectInput
+          fieldName={zo.fields.redirectTo()}
+          referer={referer}
+        />
+
+        <FormRow rowLabel="Name" className="border-b-0 pb-[10px]" required>
+          <Input
+            ref={nameInputRef}
+            label="Name"
+            hideLabel
+            name={zo.fields.name()}
+            disabled={disabled}
+            error={nameErrorMessage}
+            onChange={updateDynamicTitle}
+            className="w-full"
+            defaultValue={name || ""}
+            required
+          />
+        </FormRow>
+
+        <FormRow
+          rowLabel="Description"
+          subHeading={
+            <p>
+              Briefly describe what is included and/or what is will be used for.
+              It will be shown on the kit’s overview page.
+            </p>
+          }
+          className="border-b-0"
+          required={zodFieldIsRequired(NewKitFormSchema.shape.description)}
+        >
+          <Input
+            inputType="textarea"
+            maxLength={1000}
+            label={"Description"}
+            name={zo.fields.description()}
+            defaultValue={description || ""}
+            hideLabel
+            placeholder="Write your description here..."
+            disabled={disabled}
+            className="w-full"
+            required={zodFieldIsRequired(NewKitFormSchema.shape.description)}
+          />
+        </FormRow>
+
+        <FormRow
+          rowLabel="Category"
+          subHeading={
+            <p>
+              Make it unique. Each kit can have 1 category. It will show on your
+              index.{" "}
+              <Button
+                to="/categories/new"
+                variant="link-gray"
+                className="text-gray-600 underline"
+                target="_blank"
+              >
+                Create categories
+              </Button>
+            </p>
+          }
+          className="border-b-0 pb-[10px]"
+          required={zodFieldIsRequired(NewKitFormSchema.shape.category)}
+        >
+          <DynamicSelect
+            disabled={disabled}
+            defaultValue={categoryId ?? undefined}
+            model={{ name: "category", queryKey: "name" }}
+            triggerWrapperClassName="flex flex-col !gap-0 justify-start items-start [&_.inner-label]:w-full [&_.inner-label]:text-left "
+            contentLabel="Categories"
+            label="Category"
+            hideLabel
+            initialDataKey="categories"
+            countKey="totalCategories"
+            closeOnSelect
+            selectionMode="none"
+            allowClear={true}
+            extraContent={({ onItemCreated, closePopover }) => (
+              <InlineEntityCreationDialog
+                type="category"
+                title="Create new category"
+                buttonLabel="Create new category"
+                onCreated={(created) => {
+                  if (created?.type !== "category") return;
+                  const category = created.entity;
+                  onItemCreated({
+                    id: category.id,
+                    name: category.name,
+                    color: category.color,
+                    metadata: { ...category },
+                  });
+                  closePopover();
+                }}
+              />
+            )}
+          />
+        </FormRow>
+
+        <FormRow
+          rowLabel="Location"
+          subHeading={
+            <p>
+              A location is a place where an item is supposed to be located.
+              This is different than the last scanned location{" "}
+              <Button
+                to="/locations/new"
+                className="text-gray-600 underline"
+                target="_blank"
+                variant="link-gray"
+              >
+                Create locations
+              </Button>
+            </p>
+          }
+          className="border-b-0 py-[10px]"
+          required={zodFieldIsRequired(NewKitFormSchema.shape.locationId)}
+        >
+          <DynamicSelect
+            disabled={disabled}
+            fieldName="locationId"
+            triggerWrapperClassName="flex flex-col !gap-0 justify-start items-start [&_.inner-label]:w-full [&_.inner-label]:text-left "
+            defaultValue={locationId ?? undefined}
+            model={{ name: "location", queryKey: "name" }}
+            contentLabel="Locations"
+            label="Location"
+            hideLabel
+            initialDataKey="locations"
+            countKey="totalLocations"
+            closeOnSelect
+            allowClear
+            extraContent={({ onItemCreated, closePopover }) => (
+              <InlineEntityCreationDialog
+                type="location"
+                title="Create new location"
+                buttonLabel="Create new location"
+                onCreated={(created) => {
+                  if (created?.type !== "location") return;
+                  const location = created.entity;
+                  onItemCreated({
+                    id: location.id,
+                    name: location.name,
+                    metadata: { ...location },
+                  });
+                  closePopover();
+                }}
+              />
+            )}
+            renderItem={({ name, metadata }) => (
+              <div className="flex items-center gap-2">
+                {metadata?.thumbnailUrl ? (
+                  <ImageWithPreview
+                    thumbnailUrl={metadata.thumbnailUrl}
+                    alt={metadata.name}
+                    className="size-6 rounded-[2px]"
+                  />
+                ) : null}
+                <div>{name}</div>
+              </div>
+            )}
+          />
+        </FormRow>
+
+        <FormRow rowLabel="Image" className="border-b-0 pt-[10px]">
+          <ImageFileField
+            name="image"
+            label="Image"
+            currentImage={
+              // Same picture as the kits list: the saved image (its signed
+              // URL refreshed when expired) or the placeholder.
+              <KitImage
+                kit={{
+                  kitId: id ?? "new-kit",
+                  image: image ?? null,
+                  imageExpiration: imageExpiration ?? null,
+                  alt: "Kit image",
+                }}
+                className={IMAGE_FIELD_PICTURE_CLASSES}
+              />
+            }
+            previewAlt="Kit image"
+            validateFileAtom={assetImageValidateFileAtom}
+            hint={IMAGE_HINT_8MB}
+            error={imageError}
+            disabled={disabled}
+          />
+        </FormRow>
+
+        <When truthy={canUseBarcodes}>
+          <FormRow
+            rowLabel={"Barcodes"}
+            className="border-b-0"
+            subHeading="Add additional barcodes to this kit (Code 128, Code 39, or Data Matrix). Note: Each kit automatically gets a default Shelf QR code for tracking."
+          >
+            <BarcodesInput
+              ref={barcodesInputRef}
+              barcodes={barcodes || []}
+              typeName={(i) => `barcodes[${i}].type`}
+              valueName={(i) => `barcodes[${i}].value`}
+              idName={(i) => `barcodes[${i}].id`}
+              disabled={disabled}
+            />
+          </FormRow>
+        </When>
+
+        <FormRow className="border-y-0 pb-0 pt-5" rowLabel="">
+          <div className="ml-auto flex gap-2">
+            <Button to={cancelTo} variant="secondary" disabled={disabled}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={disabled}>
+              {disabled ? "Saving..." : "Save"}
+            </Button>
+          </div>
+        </FormRow>
+      </Form>
+    </Card>
+  );
+}

@@ -1,0 +1,564 @@
+import { useCallback, useMemo, useState } from "react";
+import { BookingStatus } from "@prisma/client";
+import { useLoaderData } from "react-router";
+import { useBookingBulkActions } from "~/hooks/use-booking-bulk-actions";
+import { useBookingStatusHelpers } from "~/hooks/use-booking-status";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { useViewportHeight } from "~/hooks/use-viewport-height";
+import type { AssetWithResolvableImage } from "~/modules/asset/image-resolution";
+import type { BookingPageLoaderData } from "~/routes/_layout+/bookings.$bookingId.overview";
+import type { AssetWithBooking } from "~/routes/_layout+/bookings.$bookingId.overview.manage-assets";
+import { canAssignModelUnits } from "~/utils/booking-model-requests";
+import { describeBookingRows } from "~/utils/booking-rows";
+import { canManageBookingItems } from "~/utils/permissions/role-access";
+import { BookingAssetsFilters } from "./booking-assets-filters";
+import { BookingModelReservationsSection } from "./booking-model-reservations-section";
+import { BookingPagination } from "./booking-pagination";
+import KitRow from "./kit-row";
+import ListAssetContent from "./list-asset-content";
+import ListBulkActionsDropdown from "./list-bulk-actions-dropdown";
+import { ModelRequestRowActionsDropdown } from "./model-request-row-actions-dropdown";
+import type { LoaderData } from "../list/bulk-actions/bulk-list-header";
+import BulkListHeader from "../list/bulk-actions/bulk-list-header";
+import { EmptyState } from "../list/empty-state";
+import { ListHeader } from "../list/list-header";
+import { ListItem } from "../list/list-item";
+import ListTitle from "../list/list-title";
+import { Button } from "../shared/button";
+import { InfoTooltip } from "../shared/info-tooltip";
+import TextualDivider from "../shared/textual-divider";
+import { Table, Th } from "../table";
+import When from "../when/when";
+
+/**
+ * Type assertion helpers for booking asset rows.
+ *
+ * The loader enriches the pivot's asset rows with full details from
+ * `assetDetailsMap`, and the client receives that payload serialized (Dates
+ * arrive as strings), so the runtime shape cannot satisfy `AssetWithBooking`
+ * structurally. These helpers are the single documented point where that gap
+ * is asserted away.
+ *
+ * `T extends AssetWithResolvableImage` is the part that must not be relaxed.
+ * Everything downstream renders `<AssetImage>`, which resolves
+ * `own image → model cover → placeholder`, and a loader that ships the image
+ * SCALARS but omits the `assetModel` relation silently drops every inheriting
+ * asset to the placeholder. Nothing about that is observable in types once a
+ * row has been cast, and nothing fails at runtime either — the page just shows
+ * the wrong picture. The constraint is what forces each loader to prove it
+ * carries all three fields before its rows may enter this path.
+ *
+ * Do not relax the constraint to a bare `<T>`: that accepts a row of any shape,
+ * so a loader missing the relation reaches the render path with nothing to stop
+ * it.
+ *
+ * @see {@link file://./../../modules/asset/image-resolution.ts}
+ */
+function asEnrichedAssets<T extends AssetWithResolvableImage>(
+  assets: T[]
+): AssetWithBooking[] {
+  return assets as unknown as AssetWithBooking[];
+}
+
+function asEnrichedAsset<T extends AssetWithResolvableImage>(
+  asset: T
+): AssetWithBooking {
+  return asset as unknown as AssetWithBooking;
+}
+
+export function BookingAssetsColumn() {
+  const {
+    userId,
+    booking,
+    items: paginatedItems,
+    partialCheckinDetails,
+    partialCheckinProgress,
+    partialCheckoutDetails,
+    checkedOutAssetIds,
+    modelShortfalls,
+  } = useLoaderData<BookingPageLoaderData>();
+  // const [searchParams] = useSearchParams();
+
+  // Gates the assets TABLE only. Model reservations render in their own
+  // section above it (`BookingModelReservationsSection`), so a pure
+  // book-by-model booking still shows its reservations while this table
+  // correctly reports that no concrete assets have been added yet.
+  const hasItems = paginatedItems?.length > 0;
+  const roleAccess = useRoleAccess();
+  const { isCompleted, isArchived, isCancelled } = useBookingStatusHelpers(
+    booking.status
+  );
+
+  // Determine if we should show the check-in columns
+  const shouldShowCheckinColumns = useMemo(() => {
+    // const currentStatusFilter = searchParams.get("status");
+    const hasValidStatus =
+      booking.status === BookingStatus.ONGOING ||
+      booking.status === BookingStatus.OVERDUE ||
+      booking.status === BookingStatus.COMPLETE ||
+      booking.status === BookingStatus.ARCHIVED;
+    const hasPartialCheckins = partialCheckinProgress?.hasPartialCheckins;
+    // const isNotCheckedOutFilter =
+    //   currentStatusFilter !== AssetStatus.CHECKED_OUT;
+
+    return hasValidStatus && hasPartialCheckins;
+    // && isNotCheckedOutFilter;
+  }, [
+    booking.status,
+    partialCheckinProgress?.hasPartialCheckins,
+    // searchParams,
+  ]);
+
+  // Determine if we should show the check-OUT columns. Mirrors the check-in
+  // columns above. The gate is RECORD-based (`checkedOutAssetIds`, derived from
+  // PartialBookingCheckout records) — NOT the status-derived
+  // `lifecycleProgress.hasPartialCheckouts`. The cell values come from
+  // `partialCheckoutDetails` (the same records), so gating on status would
+  // render empty columns for ordinary all-at-once checkouts (which flip assets
+  // to CHECKED_OUT without writing any partial-checkout records). RESERVED is a
+  // valid status here (assets can be progressively checked out while the booking
+  // is still reserved), alongside the in-progress and finished states.
+  const shouldShowCheckoutColumns = useMemo(() => {
+    const hasValidStatus =
+      booking.status === BookingStatus.RESERVED ||
+      booking.status === BookingStatus.ONGOING ||
+      booking.status === BookingStatus.OVERDUE ||
+      booking.status === BookingStatus.COMPLETE ||
+      booking.status === BookingStatus.ARCHIVED;
+    const hasPartialCheckouts = checkedOutAssetIds.length > 0;
+
+    return hasValidStatus && hasPartialCheckouts;
+  }, [booking.status, checkedOutAssetIds.length]);
+
+  const manageAssetsUrl = `manage-assets?${new URLSearchParams({
+    bookingFrom: new Date(booking.from).toISOString(),
+    bookingTo: new Date(booking.to).toISOString(),
+    hideUnavailable: "true",
+    unhideAssetsBookigIds: booking.id,
+  })}`;
+
+  // Items can be added while the booking is open; members held to DRAFT are
+  // told why.
+  const cantManageItems = !canManageBookingItems({
+    access: roleAccess,
+    bookingStatus: booking.status,
+  });
+
+  const [expandedKits, setExpandedKits] = useState<Record<string, boolean>>({});
+
+  // Initially expand all kits
+  useMemo(() => {
+    const initialExpandState: Record<string, boolean> = {};
+    paginatedItems.forEach((item) => {
+      if (item.type === "kit") {
+        initialExpandState[item.id] = false; // Kits are collapsed by default
+      }
+    });
+    setExpandedKits(initialExpandState);
+  }, [paginatedItems]);
+
+  const toggleKitExpansion = (kitId: string) => {
+    setExpandedKits((prev) => ({
+      ...prev,
+      [kitId]: !prev[kitId],
+    }));
+  };
+
+  const manageAssetsButtonDisabled = useMemo(
+    () =>
+      isCompleted || isArchived || isCancelled || cantManageItems
+        ? {
+            reason: isCompleted
+              ? "Booking is completed. You cannot change the assets anymore"
+              : isArchived
+              ? "Booking is archived. You cannot change the assets anymore"
+              : isCancelled
+              ? "Booking is cancelled. You cannot change the assets anymore"
+              : cantManageItems
+              ? "You are unable to add assets at this point because the booking is already reserved. Cancel this booking and create another one if you need to make changes."
+              : "You need to select a start and end date and save your booking before you can add assets to your booking",
+          }
+        : false,
+    [isCompleted, isArchived, isCancelled, cantManageItems]
+  );
+
+  /**
+   * Whether the user can see row actions: members who write every booking
+   * always do; everyone else only on a booking they hold.
+   */
+  const canSeeActions =
+    roleAccess.bookings.writeAll || booking?.custodianUser?.id === userId;
+
+  /**
+   * Custody alone decides whether this column offers actions at all; which of
+   * them the role may actually take is the hook's question, and it is what
+   * decides whether selecting rows leads anywhere.
+   */
+  const { hasAny: hasAnyBulkAction } = useBookingBulkActions();
+
+  function itemsGetter(data: LoaderData) {
+    return data.items
+      .map((item) => {
+        if (item?.type === "kit") {
+          // For kits, return the kit's assets first, then the actual kit object
+          // This matches what individual kit selection puts in the atom
+          return [...item.assets, item.kit];
+        } else {
+          // For individual assets, return the asset
+          return item.assets[0];
+        }
+      })
+      .flat();
+  }
+
+  return (
+    <div className="flex-1">
+      <div className="w-full">
+        <TextualDivider text="Assets & Kits" className="mb-8 lg:hidden" />
+        <div className="mb-3 flex gap-4 lg:hidden"></div>
+
+        <div className="flex flex-col">
+          {/* Outstanding model reservations sit ABOVE the search/sort bar,
+              not just above the table.
+
+              The search box is labelled "Search assets & kits" and filters only
+              the assets table; reservations are deliberately unaffected. Placing
+              this section BELOW that bar implied the filter scoped it too, so a
+              search that changed the table while the reservations stayed put
+              read as a bug. Above the bar, the filter visually governs exactly
+              what it filters.
+
+              They also stay out of the table itself, which is what lets the
+              Assets & Kits header describe exactly the rows beneath it.
+              Fulfilled rows are filtered out inside the section; they're
+              history and live in the Models tab of manage-assets. */}
+          <BookingModelReservationsSection
+            modelRequests={booking.modelRequests}
+            canAssign={canAssignModelUnits(booking.status)}
+            shortfalls={modelShortfalls}
+            className="-mx-4 mb-2 md:mx-0"
+            /* Gives the outstanding work the same weight as "Scan to add" on
+               the assets list below. Without it, assigning units meant either
+               a per-row kebab or starting a check-out, so the section stated a
+               problem and offered no visible way to act on it. Points at the
+               plain scanner rather than fulfil-and-checkout: an operator
+               prepping days ahead wants to assign units without beginning a
+               check-out they can't finish. */
+            headerAction={
+              canSeeActions ? (
+                <Button
+                  icon="scan"
+                  variant="secondary"
+                  size="sm"
+                  to="scan-assets"
+                  disabled={manageAssetsButtonDisabled}
+                  className="whitespace-nowrap"
+                >
+                  Scan to assign
+                </Button>
+              ) : null
+            }
+            renderAction={(request) => (
+              <ModelRequestRowActionsDropdown
+                request={request}
+                bookingId={booking.id}
+                bookingStatus={booking.status}
+                // The SAME filtered picker URL the "Add assets" button on this
+                // page uses. A bare `manage-assets` link drops
+                // `hideUnavailable`, so the picker stops excluding assets in
+                // custody, kit members, and assets already committed to an
+                // overlapping booking — ticking one either fails the save or
+                // double-books a unit the button beside it would have hidden.
+                manageAssetsUrl={manageAssetsUrl}
+                // Same gate the asset rows use. Without `canSeeActions` a
+                // BASE/SELF_SERVICE non-custodian saw reservation actions on a
+                // DRAFT booking while every asset control was hidden.
+                canManage={canSeeActions && !manageAssetsButtonDisabled}
+              />
+            )}
+          />
+
+          {/* Filters */}
+          <div className="mb-2">
+            <BookingAssetsFilters />
+          </div>
+
+          {/* This is a fake table header */}
+          <div className="-mx-4 border border-b-0 bg-white px-4 pb-3 pt-4 text-left font-normal text-gray-600 md:mx-0 md:rounded-t ">
+            <BookingAssetsHeader
+              canSeeActions={canSeeActions}
+              itemsGetter={itemsGetter}
+              manageAssetsUrl={manageAssetsUrl}
+              manageAssetsButtonDisabled={manageAssetsButtonDisabled}
+            />
+          </div>
+
+          <div className="-mx-4 overflow-x-auto border border-b-0 border-gray-200 bg-white md:mx-0 md:rounded-b">
+            {!hasItems ? (
+              <EmptyState
+                className="py-10"
+                customContent={{
+                  // The period prompt is only true before dates are set. Once
+                  // they are, an empty table means "no concrete assets yet",
+                  // which is now reachable on its own: a book-by-model booking
+                  // has reservations above but nothing in this table.
+                  title:
+                    booking.from && booking.to
+                      ? "No assets added yet"
+                      : "Start by defining a booking period",
+                  text: "Assets added to your booking will show up here. Scan tags or search for assets to add to your booking.",
+                  newButtonRoute: manageAssetsUrl,
+                  newButtonContent: "Add assets",
+                  buttonProps: {
+                    disabled: manageAssetsButtonDisabled,
+                  },
+                }}
+              />
+            ) : (
+              <>
+                <Table className="border-collapse">
+                  <ListHeader hideFirstColumn>
+                    {/* Select-all is offered only when there is a bulk action
+                        to feed, matching the per-row checkboxes. The empty
+                        header cell mirrors their `<Td> </Td>` fallback, so the
+                        column stays aligned either way. */}
+                    <When
+                      truthy={hasAnyBulkAction}
+                      fallback={<Th className="md:pl-4 md:pr-3"> </Th>}
+                    >
+                      <BulkListHeader itemsGetter={itemsGetter} />
+                    </When>
+                    <Th>Name</Th>
+                    <Th>Qty</Th>
+                    <Th> </Th>
+                    <Th>Category</Th>
+                    <Th>Tags</Th>
+                    <Th>Location</Th>
+                    {shouldShowCheckoutColumns && (
+                      <>
+                        <Th className="whitespace-nowrap">
+                          Checked out on{" "}
+                          <InfoTooltip
+                            iconClassName="size-4"
+                            content={
+                              <p>
+                                Shows the date when the asset was checked out
+                                via a partial check-out.
+                              </p>
+                            }
+                          />
+                        </Th>
+                        <Th className="whitespace-nowrap">
+                          Checked out by{" "}
+                          <InfoTooltip
+                            iconClassName="size-4"
+                            content={
+                              <p>
+                                Shows the user who checked out the asset via a
+                                partial check-out.
+                              </p>
+                            }
+                          />
+                        </Th>
+                      </>
+                    )}
+                    {shouldShowCheckinColumns && (
+                      <>
+                        <Th className="whitespace-nowrap">
+                          Checked in on{" "}
+                          <InfoTooltip
+                            iconClassName="size-4"
+                            content={
+                              <p>
+                                Shows the date when the asset was checked in via
+                                a partial check-in.
+                              </p>
+                            }
+                          />
+                        </Th>
+                        <Th className="whitespace-nowrap">
+                          Checked in by{" "}
+                          <InfoTooltip
+                            iconClassName="size-4"
+                            content={
+                              <p>
+                                Shows the user who checked in the asset via a
+                                partial check-in.
+                              </p>
+                            }
+                          />
+                        </Th>
+                      </>
+                    )}
+                    <Th> </Th>
+                  </ListHeader>
+                  <tbody>
+                    {/* Only concrete assets/kits live in this table. Model
+                        reservations render in their own section above it, so
+                        the header count above matches these rows exactly and
+                        every row here is bulk-selectable. */}
+                    {/* Render paginated items (kits and individual assets) */}
+                    {paginatedItems.map((item) => {
+                      if (item.type === "kit") {
+                        const kit = item.kit;
+                        const isExpanded = expandedKits[item.id] ?? false;
+                        if (!kit) {
+                          return null;
+                        }
+
+                        return (
+                          <KitRow
+                            key={`kit-${item.id}`}
+                            bookingId={booking.id}
+                            kit={kit}
+                            isExpanded={isExpanded}
+                            onToggleExpansion={toggleKitExpansion}
+                            bookingStatus={booking.status}
+                            assets={asEnrichedAssets(item.assets)}
+                            partialCheckinDetails={partialCheckinDetails}
+                            shouldShowCheckinColumns={shouldShowCheckinColumns}
+                            partialCheckoutDetails={partialCheckoutDetails}
+                            shouldShowCheckoutColumns={
+                              shouldShowCheckoutColumns
+                            }
+                          />
+                        );
+                      }
+
+                      // Individual asset
+                      const asset = item.assets[0];
+                      return (
+                        <ListItem key={`asset-${asset.id}`} item={asset}>
+                          <ListAssetContent
+                            item={asEnrichedAsset(asset)}
+                            partialCheckinDetails={partialCheckinDetails}
+                            shouldShowCheckinColumns={shouldShowCheckinColumns}
+                            partialCheckoutDetails={partialCheckoutDetails}
+                            shouldShowCheckoutColumns={
+                              shouldShowCheckoutColumns
+                            }
+                          />
+                        </ListItem>
+                      );
+                    })}
+                  </tbody>
+                </Table>
+                <BookingPagination className="border-b" />
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface BookingAssetsHeaderProps {
+  canSeeActions: boolean;
+  itemsGetter: (data: any) => any[];
+  manageAssetsUrl: string;
+  manageAssetsButtonDisabled: any;
+}
+
+function BookingAssetsHeader({
+  canSeeActions,
+  itemsGetter,
+  manageAssetsUrl,
+  manageAssetsButtonDisabled,
+}: BookingAssetsHeaderProps) {
+  const { items } = useLoaderData<BookingPageLoaderData>();
+  const rowsLabel = useCallback(() => describeBookingRows(items), [items]);
+
+  const { isMd } = useViewportHeight();
+  // const [searchParams] = useSearchParams();
+  // const statusFilter = searchParams.get("status");
+
+  // const title = useMemo(() => {
+  //   switch (statusFilter) {
+  //     case "AVAILABLE":
+  //       return "Available Assets & Kits";
+  //     case "CHECKED_OUT":
+  //       return "Checked out Assets & Kits";
+  //     default:
+  //       return "Assets & Kits";
+  //   }
+  // }, [statusFilter]);
+
+  if (isMd) {
+    // Desktop layout: everything in one row
+    return (
+      <div className="flex justify-between">
+        <ListTitle
+          title={"Assets & Kits"}
+          titleClassName="text-transform normal-case"
+          hasBulkActions
+          itemsGetter={itemsGetter}
+          disableSelectAllItems
+          countLabel={rowsLabel}
+        />
+
+        <When truthy={canSeeActions}>
+          <div className="flex items-center gap-2">
+            <ListBulkActionsDropdown />
+            <Button
+              icon="scan"
+              variant="secondary"
+              to="scan-assets"
+              disabled={manageAssetsButtonDisabled}
+            >
+              Scan to add
+            </Button>
+            <Button
+              to={manageAssetsUrl}
+              className="whitespace-nowrap"
+              disabled={manageAssetsButtonDisabled}
+            >
+              Add assets
+            </Button>
+          </div>
+        </When>
+      </div>
+    );
+  }
+
+  // Mobile layout: two rows
+  return (
+    <div>
+      {/* First row: ListTitle and ListBulkActionsDropdown */}
+      <div className="flex items-start justify-between">
+        <ListTitle
+          title="Assets & Kits"
+          hasBulkActions
+          itemsGetter={itemsGetter}
+          disableSelectAllItems
+          countLabel={rowsLabel}
+        />
+        <When truthy={canSeeActions}>
+          <ListBulkActionsDropdown />
+        </When>
+      </div>
+
+      {/* Second row: Scan and Manage assets buttons */}
+      <When truthy={canSeeActions}>
+        <div className="flex gap-2">
+          <Button
+            icon="scan"
+            variant="secondary"
+            to="scan-assets"
+            disabled={manageAssetsButtonDisabled}
+            className="flex-1"
+          >
+            Scan
+          </Button>
+          <Button
+            to={manageAssetsUrl}
+            className="flex-1 whitespace-nowrap"
+            disabled={manageAssetsButtonDisabled}
+          >
+            Add assets
+          </Button>
+        </div>
+      </When>
+    </div>
+  );
+}

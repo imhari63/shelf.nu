@@ -1,0 +1,747 @@
+import { Currency, OrganizationRoles, OrganizationType } from "@prisma/client";
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import { accessFor } from "@helpers/role-access";
+import { createLoaderArgs, createActionArgs } from "@mocks/remix";
+
+import { db } from "~/database/db.server";
+import {
+  getOrganizationAdmins,
+  transferOwnership,
+  updateOrganization,
+} from "~/modules/organization/service.server";
+import { getOrganizationTierLimit } from "~/modules/tier/service.server";
+import { action, loader } from "~/routes/_layout+/settings.general";
+import { requirePermission } from "~/utils/roles.server";
+import {
+  getOwnerSubscriptionInfo,
+  userHasActiveSubscription,
+} from "~/utils/stripe.server";
+import { canHideShelfBranding } from "~/utils/subscription.server";
+
+// why: mock parseFormData to avoid actual file upload in tests
+vi.mock("@remix-run/form-data-parser", () => ({
+  parseFormData: vi.fn(async () => new FormData()),
+}));
+
+vi.mock("~/database/db.server", () => ({
+  db: {
+    user: {
+      findUniqueOrThrow: vi.fn(),
+    },
+    organization: {
+      count: vi.fn().mockResolvedValue(0),
+    },
+  },
+}));
+
+// why: mock Stripe functions to avoid real Stripe API calls in tests
+vi.mock("~/utils/stripe.server", () => ({
+  getOwnerSubscriptionInfo: vi.fn(),
+  userHasActiveSubscription: vi.fn(),
+  premiumIsEnabled: false,
+}));
+
+vi.mock("~/modules/organization/service.server", () => ({
+  getOrganizationAdmins: vi.fn(),
+  transferOwnership: vi.fn(),
+  updateOrganization: vi.fn(),
+  updateOrganizationPermissions: vi.fn(),
+}));
+
+vi.mock("~/modules/tier/service.server", () => ({
+  getOrganizationTierLimit: vi.fn(),
+}));
+
+vi.mock("~/utils/roles.server", () => ({
+  requirePermission: vi.fn(),
+}));
+
+vi.mock("~/utils/subscription.server", () => ({
+  canHideShelfBranding: vi.fn(),
+}));
+
+vi.mock("~/utils/emitter/send-notification.server", () => ({
+  sendNotification: vi.fn(),
+}));
+
+const dbMock = db as unknown as {
+  user: {
+    findUniqueOrThrow: ReturnType<typeof vi.fn>;
+  };
+  organization: {
+    count: ReturnType<typeof vi.fn>;
+  };
+};
+const getOrganizationTierLimitMock = vi.mocked(getOrganizationTierLimit);
+const getOrganizationAdminsMock = vi.mocked(getOrganizationAdmins);
+const updateOrganizationMock = vi.mocked(updateOrganization);
+const requirePermissionMock = vi.mocked(requirePermission);
+const canHideShelfBrandingMock = vi.mocked(canHideShelfBranding);
+const getOwnerSubscriptionInfoMock = vi.mocked(getOwnerSubscriptionInfo);
+const userHasActiveSubscriptionMock = vi.mocked(userHasActiveSubscription);
+
+const mockContext = {
+  getSession: () => ({ userId: "user-1" }),
+  setSession: vi.fn(),
+  destroySession: vi.fn(),
+  commitSession: vi.fn(),
+  isAuthenticated: true,
+  appVersion: "test",
+} as any;
+
+function baseOrganization() {
+  return {
+    id: "org-1",
+    name: "Test Org",
+    type: OrganizationType.TEAM,
+    currency: Currency.USD,
+    qrIdDisplayPreference: "QR_ID" as const,
+    showShelfBranding: true,
+    enabledSso: false,
+    userId: "owner-1",
+    imageId: null,
+    updatedAt: new Date(),
+    ssoDetails: null,
+    workspaceDisabled: false,
+    selfServiceCanSeeCustody: false,
+    selfServiceCanSeeBookings: false,
+    baseUserCanSeeCustody: false,
+    baseUserCanSeeBookings: false,
+    barcodesEnabled: false,
+    hasSequentialIdsMigrated: false,
+    owner: { id: "owner-1", email: "owner@example.com" },
+  };
+}
+
+describe("settings.general loader", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      organizations: [baseOrganization()],
+      currentOrganization: baseOrganization(),
+      role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({
+      firstName: "Carlos",
+      tierId: "tier_2",
+      userOrganizations: [],
+    });
+
+    getOrganizationTierLimitMock.mockResolvedValue({
+      id: "tier_1",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      canImportAssets: true,
+      canExportAssets: true,
+      canImportNRM: true,
+      canHideShelfBranding: true,
+      canUseReports: true,
+      maxCustomFields: 0,
+      maxOrganizations: 1,
+    } as any);
+
+    getOrganizationAdminsMock.mockResolvedValue([]);
+    canHideShelfBrandingMock.mockReturnValue(true);
+    // why: mock Stripe subscription functions to return default values
+    getOwnerSubscriptionInfoMock.mockResolvedValue({
+      hasActiveSubscription: false,
+      subscriptions: [],
+      tierId: null,
+    });
+    userHasActiveSubscriptionMock.mockResolvedValue(false);
+  });
+
+  it("includes canHideShelfBranding in the loader payload", async () => {
+    const result = await loader(
+      createLoaderArgs({
+        context: mockContext,
+        request: new Request("http://localhost/settings/general"),
+        params: {},
+      })
+    );
+
+    expect(canHideShelfBrandingMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        canHideShelfBranding: true,
+      })
+    );
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        canHideShelfBranding: true,
+      })
+    );
+  });
+
+  it("prevents Team tier users from hiding branding on personal workspaces", async () => {
+    const personalOrg = {
+      ...baseOrganization(),
+      type: OrganizationType.PERSONAL,
+    };
+
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      organizations: [personalOrg],
+      currentOrganization: personalOrg,
+      role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({
+      firstName: "Carlos",
+      tierId: "tier_2", // Team tier
+      userOrganizations: [],
+    });
+
+    const result = await loader(
+      createLoaderArgs({
+        context: mockContext,
+        request: new Request("http://localhost/settings/general"),
+        params: {},
+      })
+    );
+
+    // Even though tier allows hiding, workspace-tier mismatch prevents it
+    expect(result).toEqual(
+      expect.objectContaining({
+        canHideShelfBranding: false,
+      })
+    );
+  });
+
+  it("allows Plus tier users to hide branding on personal workspaces", async () => {
+    const personalOrg = {
+      ...baseOrganization(),
+      type: OrganizationType.PERSONAL,
+    };
+
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      organizations: [personalOrg],
+      currentOrganization: personalOrg,
+      role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({
+      firstName: "Carlos",
+      tierId: "tier_1", // Plus tier
+      userOrganizations: [],
+    });
+
+    const result = await loader(
+      createLoaderArgs({
+        context: mockContext,
+        request: new Request("http://localhost/settings/general"),
+        params: {},
+      })
+    );
+
+    // Plus tier on personal workspace = allowed
+    expect(result).toEqual(
+      expect.objectContaining({
+        canHideShelfBranding: true,
+      })
+    );
+  });
+
+  it("allows Team tier users to hide branding on team workspaces", async () => {
+    // baseOrganization() defaults to TEAM type
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({
+      firstName: "Carlos",
+      tierId: "tier_2", // Team tier
+      userOrganizations: [],
+    });
+
+    const result = await loader(
+      createLoaderArgs({
+        context: mockContext,
+        request: new Request("http://localhost/settings/general"),
+        params: {},
+      })
+    );
+
+    // Team tier on team workspace = allowed
+    expect(result).toEqual(
+      expect.objectContaining({
+        canHideShelfBranding: true,
+      })
+    );
+  });
+});
+
+describe("settings.general action", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: baseOrganization(),
+      role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
+      organizations: [baseOrganization()],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({
+      tierId: "tier_2",
+    });
+
+    getOrganizationTierLimitMock.mockResolvedValue({
+      id: "tier_1",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      canImportAssets: true,
+      canExportAssets: true,
+      canImportNRM: true,
+      canHideShelfBranding: false,
+      canUseReports: true,
+      maxCustomFields: 0,
+      maxOrganizations: 1,
+    } as any);
+    canHideShelfBrandingMock.mockReturnValue(false);
+  });
+
+  it("forces Shelf branding to stay enabled when the tier does not allow hiding", async () => {
+    const formData = new FormData();
+    formData.append("intent", "general");
+    formData.append("id", "org-1");
+    formData.append("name", "Test Org");
+    formData.append("currency", Currency.USD);
+    formData.append("qrIdDisplayPreference", "QR_ID");
+    formData.append("showShelfBranding", "off");
+
+    const request = new Request("http://localhost/settings/general", {
+      method: "POST",
+      body: formData,
+    });
+
+    await action(
+      createActionArgs({ context: mockContext, request, params: {} })
+    );
+
+    expect(canHideShelfBrandingMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        canHideShelfBranding: false,
+      })
+    );
+
+    expect(updateOrganizationMock).toHaveBeenCalledWith(
+      expect.objectContaining({ showShelfBranding: true })
+    );
+  });
+
+  it("allows hiding branding when tier permits and toggle is off", async () => {
+    // Set up tier that ALLOWS hiding
+    getOrganizationTierLimitMock.mockResolvedValue({
+      id: "tier_2",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      canImportAssets: true,
+      canExportAssets: true,
+      canImportNRM: true,
+      canHideShelfBranding: true, // ✅ Tier allows hiding
+      canUseReports: true,
+      maxCustomFields: 0,
+      maxOrganizations: 1,
+    } as any);
+    canHideShelfBrandingMock.mockReturnValue(true);
+
+    const formData = new FormData();
+    formData.append("intent", "general");
+    formData.append("id", "org-1");
+    formData.append("name", "Test Org");
+    formData.append("currency", Currency.USD);
+    formData.append("qrIdDisplayPreference", "QR_ID");
+    // Simulate unchecked switch (hidden input sends "off")
+    formData.append("showShelfBranding", "off");
+
+    const request = new Request("http://localhost/settings/general", {
+      method: "POST",
+      body: formData,
+    });
+
+    await action(
+      createActionArgs({ context: mockContext, request, params: {} })
+    );
+
+    expect(canHideShelfBrandingMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        canHideShelfBranding: true,
+      })
+    );
+
+    // Verify branding is actually turned OFF
+    expect(updateOrganizationMock).toHaveBeenCalledWith(
+      expect.objectContaining({ showShelfBranding: false })
+    );
+  });
+
+  it("allows showing branding when tier permits and toggle is on", async () => {
+    // Organization currently has branding hidden
+    const orgWithBrandingOff = {
+      ...baseOrganization(),
+      showShelfBranding: false,
+    };
+
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: orgWithBrandingOff,
+      role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
+      organizations: [orgWithBrandingOff],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    getOrganizationTierLimitMock.mockResolvedValue({
+      id: "tier_2",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      canImportAssets: true,
+      canExportAssets: true,
+      canImportNRM: true,
+      canHideShelfBranding: true,
+      canUseReports: true,
+      maxCustomFields: 0,
+      maxOrganizations: 1,
+    } as any);
+    canHideShelfBrandingMock.mockReturnValue(true);
+
+    const formData = new FormData();
+    formData.append("intent", "general");
+    formData.append("id", "org-1");
+    formData.append("name", "Test Org");
+    formData.append("currency", Currency.USD);
+    formData.append("qrIdDisplayPreference", "QR_ID");
+    // Simulate checked switch (sends "on", overrides hidden "off")
+    formData.append("showShelfBranding", "on");
+
+    const request = new Request("http://localhost/settings/general", {
+      method: "POST",
+      body: formData,
+    });
+
+    await action(
+      createActionArgs({ context: mockContext, request, params: {} })
+    );
+
+    // Verify branding is turned back ON
+    expect(updateOrganizationMock).toHaveBeenCalledWith(
+      expect.objectContaining({ showShelfBranding: true })
+    );
+  });
+
+  it("prevents Team tier users from hiding branding on personal workspaces via action", async () => {
+    const personalOrg = {
+      ...baseOrganization(),
+      type: OrganizationType.PERSONAL,
+    };
+
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: personalOrg,
+      role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
+      organizations: [personalOrg],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({
+      tierId: "tier_2", // Team tier
+    });
+
+    getOrganizationTierLimitMock.mockResolvedValue({
+      id: "tier_2",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      canImportAssets: true,
+      canExportAssets: true,
+      canImportNRM: true,
+      canHideShelfBranding: true, // Tier allows it
+      canUseReports: true,
+      maxCustomFields: 0,
+      maxOrganizations: 1,
+    } as any);
+    canHideShelfBrandingMock.mockReturnValue(true);
+
+    const formData = new FormData();
+    formData.append("intent", "general");
+    formData.append("id", "org-1");
+    formData.append("name", "Test Org");
+    formData.append("currency", Currency.USD);
+    formData.append("qrIdDisplayPreference", "QR_ID");
+    formData.append("showShelfBranding", "off");
+
+    const request = new Request("http://localhost/settings/general", {
+      method: "POST",
+      body: formData,
+    });
+
+    await action(
+      createActionArgs({ context: mockContext, request, params: {} })
+    );
+
+    // Should force branding to stay on due to workspace-tier mismatch
+    expect(updateOrganizationMock).toHaveBeenCalledWith(
+      expect.objectContaining({ showShelfBranding: true })
+    );
+  });
+
+  it("allows Plus tier users to hide branding on personal workspaces via action", async () => {
+    const personalOrg = {
+      ...baseOrganization(),
+      type: OrganizationType.PERSONAL,
+    };
+
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: personalOrg,
+      role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
+      organizations: [personalOrg],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({
+      tierId: "tier_1", // Plus tier
+    });
+
+    getOrganizationTierLimitMock.mockResolvedValue({
+      id: "tier_1",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      canImportAssets: true,
+      canExportAssets: true,
+      canImportNRM: true,
+      canHideShelfBranding: true,
+      canUseReports: true,
+      maxCustomFields: 0,
+      maxOrganizations: 1,
+    } as any);
+    canHideShelfBrandingMock.mockReturnValue(true);
+
+    const formData = new FormData();
+    formData.append("intent", "general");
+    formData.append("id", "org-1");
+    formData.append("name", "Test Org");
+    formData.append("currency", Currency.USD);
+    formData.append("qrIdDisplayPreference", "QR_ID");
+    formData.append("showShelfBranding", "off");
+
+    const request = new Request("http://localhost/settings/general", {
+      method: "POST",
+      body: formData,
+    });
+
+    await action(
+      createActionArgs({ context: mockContext, request, params: {} })
+    );
+
+    // Should allow hiding branding (Plus tier on personal workspace)
+    expect(updateOrganizationMock).toHaveBeenCalledWith(
+      expect.objectContaining({ showShelfBranding: false })
+    );
+  });
+});
+
+describe("settings.general transfer-ownership authorization", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    getOrganizationTierLimitMock.mockResolvedValue({
+      id: "tier_2",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      canImportAssets: true,
+      canExportAssets: true,
+      canImportNRM: true,
+      canHideShelfBranding: true,
+      canUseReports: true,
+      maxCustomFields: 0,
+      maxOrganizations: 1,
+    } as any);
+    canHideShelfBrandingMock.mockReturnValue(true);
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({ tierId: "tier_2" });
+  });
+
+  /** Builds the POST body an attacker would hand-craft */
+  function transferRequest() {
+    const body = new URLSearchParams();
+    body.append("intent", "transfer-ownership");
+    body.append("newOwner", "user-2");
+    body.append("agreeConditions", "on");
+
+    return new Request("http://localhost/settings/general", {
+      method: "POST",
+      body,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+  }
+
+  function mockRole(role: OrganizationRoles) {
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: baseOrganization(),
+      role,
+      access: accessFor([role]),
+      organizations: [baseOrganization()],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+  }
+
+  it("rejects a direct POST from a workspace ADMIN", async () => {
+    // ADMIN passes requirePermission — ADMIN and OWNER share every permission —
+    // so only the explicit role check in the action can stop this.
+    mockRole(OrganizationRoles.ADMIN);
+
+    const response = (await action(
+      createActionArgs({
+        context: mockContext,
+        request: transferRequest(),
+        params: {},
+      })
+      // The action funnels thrown ShelfErrors through `data(error(reason), {
+      // status })`, which returns a DataWithResponseInit rather than a Response.
+    )) as { init?: { status?: number } };
+
+    expect(response.init?.status).toBe(403);
+    expect(transferOwnership).not.toHaveBeenCalled();
+  });
+
+  it("allows the OWNER to transfer ownership", async () => {
+    mockRole(OrganizationRoles.OWNER);
+    vi.mocked(transferOwnership).mockResolvedValue({
+      newOwner: { id: "user-2", email: "new@example.com" },
+    } as any);
+
+    await action(
+      createActionArgs({
+        context: mockContext,
+        request: transferRequest(),
+        params: {},
+      })
+    );
+
+    expect(transferOwnership).toHaveBeenCalledWith(
+      expect.objectContaining({ newOwnerId: "user-2" })
+    );
+  });
+});
+
+describe("settings.general SSO settings refusals", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({ tierId: "tier_2" });
+  });
+
+  /** Posts the SSO group-mapping form as the given role. */
+  async function postSso(role: OrganizationRoles) {
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: baseOrganization(),
+      role,
+      access: accessFor([role]),
+      organizations: [baseOrganization()],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    const body = new URLSearchParams({
+      intent: "sso",
+      id: "sso-1",
+      adminGroupId: "grp-admin",
+    });
+
+    return (await action(
+      createActionArgs({
+        context: mockContext,
+        request: new Request("http://localhost/settings/general", {
+          method: "POST",
+          body,
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        }),
+        params: {},
+      })
+    )) as { init?: { status?: number } };
+  }
+
+  it("answers an ADMIN with 403: only the owner edits SSO settings", async () => {
+    const response = await postSso(OrganizationRoles.ADMIN);
+
+    expect(response.init?.status).toBe(403);
+  });
+
+  it("answers the OWNER of a workspace without SSO with 400", async () => {
+    const response = await postSso(OrganizationRoles.OWNER);
+
+    expect(response.init?.status).toBe(400);
+  });
+});
+
+describe("settings.general SSO settings write", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({ tierId: "tier_2" });
+  });
+
+  it("writes every group mapping, the Manager group included", async () => {
+    const ssoOrganization = { ...baseOrganization(), enabledSso: true };
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: ssoOrganization,
+      role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
+      organizations: [ssoOrganization],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    const body = new URLSearchParams({
+      intent: "sso",
+      id: "org-1",
+      adminGroupId: "grp-admin",
+      managerGroupId: "grp-manager",
+      selfServiceGroupId: "grp-self-service",
+      baseUserGroupId: "grp-base",
+    });
+
+    await action(
+      createActionArgs({
+        context: mockContext,
+        request: new Request("http://localhost/settings/general", {
+          method: "POST",
+          body,
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        }),
+        params: {},
+      })
+    );
+
+    expect(updateOrganizationMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "org-1",
+        ssoDetails: {
+          adminGroupId: "grp-admin",
+          managerGroupId: "grp-manager",
+          selfServiceGroupId: "grp-self-service",
+          baseUserGroupId: "grp-base",
+        },
+      })
+    );
+  });
+});

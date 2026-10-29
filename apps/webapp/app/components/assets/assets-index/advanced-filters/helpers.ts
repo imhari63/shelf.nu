@@ -1,0 +1,370 @@
+import type { CustomField } from "@prisma/client";
+import { useSearchParams } from "~/hooks/search-params";
+import { splitFilterParam } from "~/modules/asset/filter-param";
+import type {
+  Column,
+  ColumnLabelKey,
+} from "~/modules/asset-index-settings/helpers";
+import { getTodayInUserTimezone } from "~/utils/date-fns";
+import { isShelfQrCode } from "~/utils/qr-code";
+import type { Filter, FilterFieldType, FilterOperator } from "./schema";
+import type { Sort } from "../advanced-asset-index-filters-and-sorting";
+
+/**
+ * Represents how a field should be displayed and interacted with in the UI
+ */
+export type UIFieldType =
+  | "string"
+  | "text"
+  | "boolean"
+  | "date"
+  | "number"
+  | "amount"
+  | "enum"
+  | "array";
+/**
+ * Mapping of friendly names for UI display
+ */
+const uiFieldTypeNames: Record<UIFieldType, string> = {
+  string: "Single-line text",
+  text: "Multi-line text",
+  boolean: "Yes/No",
+  date: "Date",
+  number: "Number",
+  amount: "Amount",
+  enum: "Option",
+  array: "List",
+};
+
+/**
+ * Determines how a field should be presented and interacted with in the UI
+ * Used for generating appropriate form controls and filter interfaces
+ *
+ * `stockStatus`, `available` and `reserved` are DERIVED, no such column exists
+ * on `Asset`. They are typed here like stored fields so the filter UI offers the
+ * right operators; the SQL layer maps them to computed expressions. This map
+ * MUST stay in step with `getQueryFieldType` in
+ * `modules/asset/field-type-mapping.ts`, which decides which SQL builder runs:
+ * updating only one is silent, and produced a 500 (`column a.stockStatus does
+ * not exist`) the first time.
+ *
+ * @param column - Column configuration object
+ * @param friendlyName - Whether to return a user-friendly name instead of the technical type
+ * @returns The UI field type or its friendly name
+ */
+export function getUIFieldType({
+  column,
+  friendlyName = false,
+}: {
+  column: Column;
+  friendlyName?: boolean;
+}): string {
+  let fieldType: UIFieldType;
+
+  // Determine base field type
+  switch (column.name) {
+    case "id":
+    case "name":
+    case "unitOfMeasure":
+      fieldType = "string";
+      break;
+    case "custody":
+    case "status":
+    case "category":
+    case "location":
+    case "kit":
+    case "type":
+    case "upcomingBookings":
+    case "assetModel":
+    case "stockStatus":
+      fieldType = "enum";
+      break;
+    case "description":
+      fieldType = "text";
+      break;
+    case "valuation":
+    case "quantity":
+    case "minQuantity":
+    case "available":
+    case "reserved":
+      fieldType = "number";
+      break;
+    case "availableToBook":
+      fieldType = "boolean";
+      break;
+    case "createdAt":
+    case "updatedAt":
+    case "lastAuditDate":
+      fieldType = "date";
+      break;
+    case "tags":
+      fieldType = "array";
+      break;
+    default:
+      // Handle custom fields
+      if (column.name.startsWith("cf_")) {
+        switch (column.cfType) {
+          case "TEXT":
+            fieldType = "string";
+            break;
+          case "MULTILINE_TEXT":
+            fieldType = "text";
+            break;
+          case "BOOLEAN":
+            fieldType = "boolean";
+            break;
+          case "DATE":
+            fieldType = "date";
+            break;
+          case "OPTION":
+            fieldType = "enum";
+            break;
+          case "AMOUNT":
+            fieldType = "amount";
+            break;
+          case "NUMBER":
+            fieldType = "number";
+            break;
+          default:
+            fieldType = "string";
+        }
+      } else {
+        fieldType = "string";
+      }
+  }
+
+  return friendlyName ? uiFieldTypeNames[fieldType] : fieldType;
+}
+/** Gets the intial filters of the advanced index based on search params
+ * @returns intialFilters -{@link Filter, Filter[]}
+ */
+export function useInitialFilters(columns: Column[]) {
+  const [searchParams] = useSearchParams();
+
+  const initialFilters: Filter[] = [];
+  searchParams.forEach((value, key) => {
+    const column = columns.find((c) => c.name === key);
+    if (column) {
+      const [operator, filterValue] = splitFilterParam(value);
+
+      // No separator means no value; there is no filter row to rebuild, and
+      // the `between` branch below would read `.split` off `undefined`.
+      if (filterValue === undefined) {
+        return;
+      }
+
+      initialFilters.push({
+        name: key,
+        operator: operator as FilterOperator,
+        value: operator === "between" ? filterValue.split(",") : filterValue, // Split the value if it's a range
+        type: getUIFieldType({ column }) as FilterFieldType,
+      });
+    }
+  });
+  return initialFilters;
+}
+
+/**
+ * Gets the default value for a newly-added filter row based on the column's
+ * field type.
+ *
+ * For date fields (both built-in and custom-field DATE), the default is
+ * *today's* calendar day in the acting user's timezone — not the server/UTC
+ * day — so a user in e.g. `Asia/Tokyo` seeds the filter with the day they
+ * actually see, avoiding an off-by-one when their local day differs from UTC.
+ *
+ * @param column - The column the filter row targets
+ * @param customFields - Available custom fields (or null when not loaded), used
+ *   to resolve OPTION defaults
+ * @param timeZone - The acting user's resolved preference timezone (IANA name,
+ *   e.g. `America/New_York`). Falls back to UTC when omitted so non-UI callers
+ *   still compile and behave deterministically.
+ * @returns The seed value appropriate for the column's field type
+ */
+export function getDefaultValueForFieldType(
+  column: Column,
+  customFields: CustomField[] | null, // Update the type to allow null
+  timeZone: string = "UTC"
+): any {
+  if (column.name.startsWith("cf_")) {
+    // Find the matching custom field, handle potential null customFields
+    const customField = customFields?.find(
+      (cf) => `cf_${cf.name}` === column.name
+    );
+
+    switch (column.cfType) {
+      case "DATE":
+        return getTodayInUserTimezone(timeZone);
+      case "BOOLEAN":
+        return true;
+      case "OPTION":
+        return customField?.options?.[0] || "";
+      case "TEXT":
+      case "MULTILINE_TEXT":
+        return "";
+      default:
+        return "";
+    }
+  } else {
+    // Handle regular fields
+    switch (getUIFieldType({ column })) {
+      case "boolean":
+        return true;
+      case "date":
+        return getTodayInUserTimezone(timeZone);
+      case "number":
+        return 0;
+      default:
+        return "";
+    }
+  }
+}
+
+export const COLUMNS_WITHOUT_FILTER: ColumnLabelKey[] = [
+  "actions",
+  "upcomingReminder",
+];
+
+/**
+ * The value a filter keeps when its operator changes.
+ *
+ * `isEmpty` takes no value, so switching to it clears the value. Leaving it
+ * re-seeds the column's default, since "" is not a valid value for the other
+ * operators. Any other switch keeps the current value.
+ *
+ * @param args.filter - The filter before the change
+ * @param args.operator - The operator being switched to
+ * @param args.columns - Every column the caller may filter on. Pass the full
+ *   filterable list, not the picker's remaining columns: the filter's own
+ *   column is already in use, so the picker list leaves it out.
+ * @param args.customFields - Custom field definitions, for custom date defaults
+ * @param args.timeZone - The user's time zone, for date defaults
+ * @returns The value for the filter after the operator change
+ */
+export function valueForOperatorChange({
+  filter,
+  operator,
+  columns,
+  customFields,
+  timeZone,
+}: {
+  filter: Filter;
+  operator: FilterOperator;
+  columns: Column[];
+  customFields: CustomField[] | null;
+  timeZone: string;
+}): Filter["value"] {
+  if (operator === "isEmpty") return "";
+  if (filter.operator !== "isEmpty") return filter.value;
+
+  const column = columns.find((c) => c.name === filter.name);
+  return column
+    ? getDefaultValueForFieldType(column, customFields, timeZone)
+    : filter.value;
+}
+
+/**
+ * Determines what columns are available based on already used columns and operation type
+ * @param columns - All available columns
+ * @param usedColumns - Currently used columns (filters or sorts)
+ * @param operation - Whether we're filtering or sorting
+ * @returns Filtered list of available columns
+ */
+export function getAvailableColumns(
+  columns: Column[],
+  usedColumns: Array<Filter | Sort>,
+  operation: "filter" | "sort"
+) {
+  // Get columns that are visible and not already used
+  const availableColumns = columns.filter(
+    (column) =>
+      column.visible &&
+      !usedColumns.find((f) => {
+        if (operation === "filter" && "isNew" in f) {
+          return f.name === column.name && !f.isNew;
+        }
+        return f.name === column.name;
+      })
+  );
+
+  // Apply operation-specific filtering
+  return availableColumns.filter((column) => {
+    // Common exclusions for both operations
+    if (!column.visible) return false;
+
+    /**
+     * Some columns like `actions` does not support filtering,
+     * so we have to skip them to be availableColumns.
+     */
+    if (COLUMNS_WITHOUT_FILTER.includes(column.name)) {
+      return false;
+    }
+
+    if (operation === "sort") {
+      // Columns that can't be sorted
+      const unsortableColumns = ["tags"];
+      if (unsortableColumns.includes(column.name)) return false;
+
+      // Custom fields that can't be sorted
+      if (column.name.startsWith("cf_")) {
+        const unsortableTypes = ["MULTILINE_TEXT"];
+        return !unsortableTypes.includes(column.cfType || "");
+      }
+
+      return true;
+    }
+
+    if (operation === "filter") {
+      const unfilterableColumns: string[] = [];
+      if (unfilterableColumns.includes(column.name)) return false;
+
+      return true;
+    }
+
+    return true;
+  });
+}
+
+/**
+ * Extracts the QR ID from a Shelf QR URL or returns the full value for external QR codes
+ *
+ * For Shelf QR codes, extracts the ID:
+ * - localhost:3000/qr/abc123?hello=world -> abc123
+ * - https://shelf.nu/qr/abc123 -> abc123
+ * - https://eam.sh/abc123 -> abc123
+ * - abc123 -> abc123
+ *
+ * For external QR codes, returns full value:
+ * - https://example.com/product/123 -> https://example.com/product/123
+ * - Any other QR content -> original value
+ *
+ * @param value - The input value (URL or QR ID)
+ * @returns The extracted QR ID for Shelf QRs or full value for external QRs
+ */
+export function extractQrIdFromValue(value: string): string {
+  // First check if it's a Shelf QR code
+  if (isShelfQrCode(value)) {
+    try {
+      // Try to parse as URL first
+      const url = new URL(value);
+
+      // Remove leading and trailing slashes and split path
+      const pathParts = url.pathname.split("/").filter(Boolean);
+
+      // Get the last part of the path (if exists)
+      if (pathParts.length > 0) {
+        return pathParts[pathParts.length - 1];
+      }
+
+      return value;
+    } catch (_e) {
+      // If URL parsing fails, return original value (raw QR ID case)
+      return value;
+    }
+  }
+
+  // For external QR codes, return the full value
+  return value;
+}
+
+// isShelfQrCode function moved to ~/utils/qr-code.ts for shared usage

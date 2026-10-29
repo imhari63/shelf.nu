@@ -1,0 +1,207 @@
+{
+  "root": true,
+  "parser": "@typescript-eslint/parser",
+  "plugins": [
+    "@typescript-eslint",
+    "import",
+    "tailwindcss",
+    "no-restricted-imports",
+    "local-rules"
+  ],
+  "extends": [
+    "eslint:recommended",
+    "plugin:react/recommended",
+    "plugin:react/jsx-runtime",
+    "plugin:react-hooks/recommended",
+    "plugin:jsx-a11y/recommended",
+    "plugin:tailwindcss/recommended",
+    "prettier"
+  ],
+  "ignorePatterns": ["coverage"],
+  "env": {
+    "browser": true,
+    "node": true,
+    "es2022": true
+  },
+  "globals": {
+    "NodeJS": "readonly"
+  },
+  "parserOptions": {
+    "ecmaVersion": "latest",
+    "sourceType": "module",
+    "ecmaFeatures": {
+      "jsx": true
+    },
+    "project": ["./tsconfig.json"]
+  },
+  "settings": {
+    "react": {
+      "version": "detect"
+    },
+    // Help eslint-plugin-tailwindcss to parse Tailwind classes outside of className
+    "tailwindcss": {
+      "callees": ["tw"]
+    },
+    "jest": {
+      "version": 27
+    },
+    "import/resolver": {
+      "typescript": {
+        "alwaysTryTypes": true,
+        "project": "./tsconfig.json"
+      }
+    }
+  },
+  "rules": {
+    "tailwindcss/no-custom-classname": "off",
+    "no-console": "warn",
+    "arrow-body-style": ["warn", "as-needed"],
+    // Note: you must disable the base rule as it can report incorrect errors
+    "no-unused-vars": "off",
+    // Note: you must disable the base rule as it can report incorrect errors
+    "no-redeclare": "off",
+    // @typescript-eslint
+    // Note: you must disable the base rule as it can report incorrect errors
+    "no-return-await": "off",
+    "@typescript-eslint/return-await": ["error", "in-try-catch"],
+    // Note: you must disable the base rule as it can report incorrect errors
+    "require-await": "off",
+    "@typescript-eslint/require-await": "error",
+    "@typescript-eslint/no-floating-promises": "error",
+    "@typescript-eslint/await-thenable": "error",
+    "@typescript-eslint/no-redeclare": [
+      "error",
+      {
+        "ignoreDeclarationMerge": true
+      }
+    ],
+    "@typescript-eslint/consistent-type-imports": "error",
+    "@typescript-eslint/no-explicit-any": "off", // TODO: Enable in future PR - too many warnings currently
+    "@typescript-eslint/ban-ts-comment": "off", // Allow both @ts-ignore and @ts-expect-error
+    "@typescript-eslint/no-unused-vars": [
+      "warn",
+      {
+        "vars": "all",
+        "varsIgnorePattern": "^_",
+        "args": "all",
+        "argsIgnorePattern": "^_",
+        "caughtErrors": "all",
+        "caughtErrorsIgnorePattern": "^_",
+        "destructuredArrayIgnorePattern": "^_",
+        "ignoreRestSiblings": false
+      }
+    ],
+    // import
+    "import/no-cycle": "error",
+    "import/no-unresolved": "error",
+    "import/no-default-export": "off",
+    "import/order": [
+      "error",
+      {
+        "groups": ["builtin", "external", "internal"],
+        "pathGroups": [
+          {
+            "pattern": "react",
+            "group": "external",
+            "position": "before"
+          }
+        ],
+        "pathGroupsExcludedImportTypes": ["react"],
+        "alphabetize": {
+          "order": "asc",
+          "caseInsensitive": true
+        }
+      }
+    ],
+    // jsx-a11y
+    "jsx-a11y/no-autofocus": "off",
+    "jsx-a11y/click-events-have-key-events": "off",
+    "jsx-a11y/no-noninteractive-element-interactions": "off",
+    // react
+    "react/no-unescaped-entities": "off",
+    "react/prop-types": "off", // Disabled for TypeScript projects - use TypeScript types instead
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "react-router",
+            "importNames": ["useSearchParams"]
+          }
+        ]
+      }
+    ],
+    // Custom local rules
+    "local-rules/require-react-import-when-using-namespace": "error",
+    "local-rules/require-satisfies-on-nested-prisma-selects": "error",
+    "local-rules/require-deleted-at-check-on-custom-field-queries": "error",
+    "local-rules/require-meta-export-in-routes": "warn",
+    "local-rules/require-button-type": "error",
+    "local-rules/require-org-scope-on-id-queries": "error",
+    "local-rules/require-complete-404-shape": "error",
+    "local-rules/no-test-files-in-routes": "error",
+    "local-rules/no-direct-role-checks": "error",
+    "local-rules/no-hand-coerced-numeric-transform": "error",
+    "local-rules/require-archived-at-check-on-asset-queries": "error"
+  },
+  "overrides": [
+    {
+      "files": [
+        "./app/root.tsx",
+        "./app/entry.client.tsx",
+        "./app/entry.server.tsx",
+        "./app/routes/**/*.tsx"
+      ],
+      "rules": {
+        "import/no-default-export": "off"
+      }
+    },
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx"],
+      "globals": {
+        "vi": "readonly",
+        "vitest": "readonly",
+        "describe": "readonly",
+        "it": "readonly",
+        "expect": "readonly",
+        "beforeEach": "readonly",
+        "afterEach": "readonly",
+        "beforeAll": "readonly",
+        "afterAll": "readonly"
+      }
+    },
+    {
+      "files": ["scripts/**/*.ts"],
+      "rules": {
+        "no-console": "off",
+        "@typescript-eslint/require-await": "off"
+      }
+    },
+    {
+      // Client code runs in browsers and on plain-HTTP self-hosted origins where
+      // `crypto.randomUUID` is undefined; `generateClientId` covers both. The
+      // selector catches every spelling (`crypto.`, `globalThis.crypto.`,
+      // `window.crypto.`, bracket access), which `no-restricted-properties`
+      // cannot do for nested objects.
+      //
+      // Regex lookbehind is the one syntax the build cannot lower to the browser
+      // floor: esbuild rewrites the literal into `new RegExp(...)`, so the chunk
+      // parses and then throws when that line runs on Safari below 16.4.
+      "files": ["app/**/*.ts", "app/**/*.tsx"],
+      "excludedFiles": ["app/**/*.server.ts", "app/utils/id/client-id.ts"],
+      "rules": {
+        "no-restricted-syntax": [
+          "error",
+          {
+            "selector": "MemberExpression[computed=false][property.name='randomUUID'], MemberExpression[computed=true][property.value='randomUUID']",
+            "message": "Use generateClientId() from ~/utils/id/client-id: crypto.randomUUID is missing in older browsers and in insecure contexts."
+          },
+          {
+            "selector": "Literal[regex.pattern=/\\(\\?<(=|!)/], :matches(NewExpression, CallExpression)[callee.name='RegExp'] > Literal[value=/\\(\\?<(=|!)/]",
+            "message": "Regex lookbehind throws on Safari below 16.4, which is above the browser floor, and the build cannot lower it. Rewrite without lookbehind, or keep it in a *.server.ts module."
+          }
+        ]
+      }
+    }
+  ]
+}

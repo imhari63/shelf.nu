@@ -1,0 +1,115 @@
+/** CSV export route for the asset index: standard and import-ready downloads. */
+import { data, type LoaderFunctionArgs } from "react-router";
+import { getAssetIndexSettings } from "~/modules/asset-index-settings/service.server";
+import { csvResponse } from "~/utils/csv-utf8";
+import {
+  exportAssetsForImportToCsv,
+  exportAssetsFromIndexToCsv,
+} from "~/utils/csv.server";
+import { ShelfError, makeShelfError } from "~/utils/error";
+import {
+  buildContentDisposition,
+  error,
+  getCurrentSearchParams,
+} from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { assertUserCanExportAssets } from "~/utils/subscription.server";
+
+/** Exports the requested asset selection as a CSV download. */
+export const loader = async ({
+  context,
+  request,
+  params,
+}: LoaderFunctionArgs) => {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    const { organizationId, organizations, currentOrganization, role, access } =
+      await requirePermission({
+        userId: authSession.userId,
+        request,
+        entity: PermissionEntity.asset,
+        action: PermissionAction.export,
+      });
+
+    // Subscription assertion and settings lookup are independent once
+    // requirePermission has resolved — run them in parallel
+    const [, settings] = await Promise.all([
+      assertUserCanExportAssets({ organizationId, organizations }),
+      /** Get the setttings, we need them for a few things */
+      getAssetIndexSettings({
+        userId,
+        organizationId,
+        canUseBarcodes: currentOrganization.barcodesEnabled ?? false,
+        role,
+      }),
+    ]);
+
+    const searchParams = getCurrentSearchParams(request);
+    const assetIds = searchParams.get("assetIds");
+    const assetIndexCurrentSearchParams = searchParams.get(
+      "assetIndexCurrentSearchParams"
+    );
+    // `exportType=import` requests the importer-native CSV (re-importable
+    // into another workspace) instead of the human/analytics export.
+    const exportType =
+      searchParams.get("exportType") === "import" ? "import" : "standard";
+    // `columnScope=all` exports every configured column regardless of the
+    // user's current visibility settings; defaults to "visible" when absent.
+    const columnScope =
+      searchParams.get("columnScope") === "all" ? "all" : "visible";
+
+    // Every export starts from an index selection: explicit ids or the
+    // select-all sentinel.
+    if (!assetIds) {
+      throw new ShelfError({
+        cause: null,
+        title: "No assets selected",
+        message: "Select the assets you want to export from the asset index.",
+        label: "CSV",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const csvString =
+      exportType === "import"
+        ? await exportAssetsForImportToCsv({
+            request,
+            userId,
+            assetIds,
+            settings,
+            currentOrganization,
+            assetIndexCurrentSearchParams,
+            columnScope,
+            access,
+          })
+        : await exportAssetsFromIndexToCsv({
+            request,
+            userId,
+            assetIds,
+            settings,
+            currentOrganization,
+            assetIndexCurrentSearchParams,
+            columnScope,
+            access,
+          });
+
+    return csvResponse(csvString, {
+      headers: {
+        "content-disposition": buildContentDisposition(null, {
+          fallback: "assets",
+          filename: params.fileName ? `${params.fileName}.csv` : undefined,
+        }),
+      },
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+};

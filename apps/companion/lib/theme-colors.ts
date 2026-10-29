@@ -1,0 +1,335 @@
+/**
+ * Light + Dark color palettes for the Shelf companion app.
+ *
+ * Both objects share the same keys so they can be swapped at runtime
+ * via the ThemeProvider. Status-badge and shadow maps are also duplicated
+ * per theme for convenience.
+ */
+import {
+  AUDIT_ASSET_STATUS_TONES,
+  AUDIT_STATUS_TONES,
+  type StatusTone,
+} from "@shelf/labels";
+
+// ────────────────────────────── Light palette ──────────────────────────────
+
+export const lightColors = {
+  // Brand — Shelf orange
+  primary: "#EF6820",
+  primaryLight: "#F38744",
+  primaryBg: "#FEF6EE",
+  primaryForeground: "#FFFFFF",
+  // Accessible orange for ORANGE TEXT on light surfaces. `primary` itself
+  // is only ~3.1:1 on white (fine for icons/large graphics, fails the
+  // 4.5:1 bar for body text), so small brand-tinted labels must use this
+  // deeper shade instead. WCAG AA 5.4:1 on white.
+  primaryText: "#B54708",
+
+  // Neutrals — Gray scale from webapp
+  white: "#FFFFFF",
+  background: "#FFFFFF",
+  backgroundSecondary: "#FCFCFD", // gray-25
+  backgroundTertiary: "#F9FAFB", // gray-50
+  foreground: "#101828", // gray-900
+  foregroundSecondary: "#3E4A5C", // gray-600 — WCAG AA 5.1:1
+  muted: "#576274", // gray-500 — WCAG AA 5.0:1
+  mutedLight: "#6F7A8B", // gray-400 — WCAG AA 4.0:1 (icons/large text)
+  border: "#EAECF0", // gray-200
+  borderLight: "#F2F4F7", // gray-100
+  gray700: "#344054",
+  gray800: "#1D2939",
+  gray300: "#D0D5DD",
+
+  // Status — from webapp badge color schemes
+  available: "#2E7D32",
+  availableBg: "#E8F5E9",
+  inCustody: "#01579B",
+  inCustodyBg: "#E1F5FE",
+  checkedOut: "#8E24AA",
+  checkedOutBg: "#F3E5F5",
+
+  // Semantic
+  error: "#F04438",
+  errorBg: "#FEF3F2",
+  errorBorder: "#FDA29B",
+  warning: "#F79009",
+  warningBg: "#FFFAEB",
+  // Accessible amber for WARNING TEXT/ICONS on light surfaces. `warning`
+  // itself is only ~2.35:1 on white (fine for badge fills, fails the 4.5:1
+  // text bar and the 3:1 non-text bar), so small amber labels/icons (e.g.
+  // the low-stock indicator) must use this deeper shade instead. Mirrors
+  // `primaryText`'s relationship to `primary`. WCAG AA 7.1:1 on white.
+  warningText: "#92400E", // amber-800 — 6.79:1 on warningBg (AA)
+  // Text-safe foregrounds: use these for any WORDS drawn on `successBg` /
+  // `errorBg`. The `success` and `error` values below are tuned for icons and
+  // bars; as text on those backgrounds they measure 2.49:1 and 3.46:1, under
+  // the 4.5:1 WCAG AA requires. `errorText` is the hex the webapp uses for red
+  // badge text, so both apps also match.
+  successText: "#05603A", // green-800 — 7.26:1 on successBg (AA)
+  errorText: "#B42318", // red-700 — 6.05:1 on errorBg (AA)
+  success: "#12B76A",
+  successBg: "#ECFDF3",
+
+  // Placeholder text — dedicated token for input placeholders (3.6:1 on white)
+  placeholderText: "#767F8D",
+
+  // Buttons — secondary and ghost variants (reserve primary for main CTAs)
+  buttonSecondaryBg: "#F2F4F7",
+  buttonSecondaryText: "#344054",
+  buttonSecondaryBorder: "#D0D5DD",
+  buttonGhostText: "#475467",
+
+  // Icons — neutral defaults (use primary only for key brand moments)
+  iconDefault: "#667085",
+  iconActive: "#344054",
+
+  // Filters — neutral pill colors
+  filterPillBg: "#F2F4F7",
+  filterPillActiveBg: "#344054",
+  filterPillActiveText: "#FFFFFF",
+
+  // Progress — green instead of orange
+  progressBar: "#2E7D32",
+
+  // Overlays
+  overlayDark: "rgba(0,0,0,0.4)",
+};
+
+/** Shared type — both palettes have the same keys with string values */
+export type Colors = { [K in keyof typeof lightColors]: string };
+
+// ────────────────────────────── Dark palette ───────────────────────────────
+
+export const darkColors: Colors = {
+  // Brand — slightly brighter orange for dark backgrounds
+  primary: "#FF8C42",
+  primaryLight: "#FFA566",
+  primaryBg: "#2A1B0E",
+  primaryForeground: "#FFFFFF",
+  // Brand orange is already legible as text on the dark surfaces
+  // (~7:1 on #161B22), so the text token matches `primary` here.
+  primaryText: "#FF8C42",
+
+  // Neutrals — GitHub-style dark palette
+  white: "#161B22", // "white" becomes the card/surface color in dark mode
+  background: "#0D1117",
+  backgroundSecondary: "#161B22",
+  backgroundTertiary: "#1C2128",
+  foreground: "#E6EDF3",
+  foregroundSecondary: "#A8B5C4",
+  muted: "#8B949E",
+  mutedLight: "#6E7681",
+  border: "#30363D",
+  borderLight: "#21262D",
+  gray700: "#C9D1D9",
+  gray800: "#E6EDF3",
+  gray300: "#484F58",
+
+  // Status — brighter for dark backgrounds
+  available: "#3FB950",
+  availableBg: "#0D2818",
+  inCustody: "#58A6FF",
+  inCustodyBg: "#0D1D31",
+  checkedOut: "#D2A8FF",
+  checkedOutBg: "#271535",
+
+  // Semantic — brighter for dark backgrounds
+  error: "#F85149",
+  errorBg: "#2D1214",
+  errorBorder: "#A84040",
+  warning: "#F0A020",
+  warningBg: "#2E200A",
+  // `warning` is already legible as text on the dark surfaces (~8.0:1 on
+  // #161B22), so the text token matches `warning` here — same pattern as
+  // dark `primaryText` matching `primary`.
+  warningText: "#F0A020",
+  // Dark-mode counterparts of the light palette's text-safe foregrounds. Here
+  // the base colours already clear AA on their own backgrounds (6.20:1 and
+  // 5.18:1), so these alias them rather than darkening them further.
+  successText: "#3FB950",
+  errorText: "#F85149",
+  success: "#3FB950",
+  successBg: "#0D2818",
+
+  // Placeholder text — reuse mutedLight for dark mode (already compliant)
+  placeholderText: "#6E7681",
+
+  // Buttons — secondary and ghost variants
+  buttonSecondaryBg: "#1D2939",
+  buttonSecondaryText: "#D0D5DD",
+  buttonSecondaryBorder: "#344054",
+  buttonGhostText: "#98A2B3",
+
+  // Icons — neutral defaults
+  iconDefault: "#98A2B3",
+  iconActive: "#D0D5DD",
+
+  // Filters — neutral pill colors
+  filterPillBg: "#1D2939",
+  filterPillActiveBg: "#D0D5DD",
+  filterPillActiveText: "#1D2939",
+
+  // Progress — green
+  progressBar: "#4CAF50",
+
+  // Overlays — slightly more opaque on dark
+  overlayDark: "rgba(0,0,0,0.6)",
+};
+
+// ────────────────────────── Status badge maps ──────────────────────────────
+
+function buildStatusBadge(c: Colors) {
+  return {
+    AVAILABLE: { bg: c.availableBg, text: c.available },
+    IN_CUSTODY: { bg: c.inCustodyBg, text: c.inCustody },
+    CHECKED_OUT: { bg: c.checkedOutBg, text: c.checkedOut },
+    // Not an `Asset.status` value: an archived asset shows this one calm badge
+    // instead of its status (see lib/archived-assets.ts). Same pair as the
+    // archived booking badge below.
+    ARCHIVED: { bg: c.borderLight, text: c.muted },
+  } as Record<string, { bg: string; text: string }>;
+}
+
+function buildBookingStatusBadge(c: Colors) {
+  return {
+    DRAFT: { bg: c.borderLight, text: c.gray700 },
+    RESERVED: { bg: c.inCustodyBg, text: c.inCustody },
+    ONGOING: { bg: c.checkedOutBg, text: c.checkedOut },
+    // why: `error` and `success` are FILL tokens — as badge TEXT they read
+    // 3.46:1 and 2.49:1 on their own backgrounds in light mode, under the
+    // 4.5:1 bar. `errorText` / `successText` are their foreground twins
+    // (6.05:1 and 7.26:1) and alias the base colours in dark mode, so dark is
+    // unchanged. Same fix the audit badges got; these were simply missed.
+    OVERDUE: { bg: c.errorBg, text: c.errorText },
+    COMPLETE: { bg: c.successBg, text: c.successText },
+    ARCHIVED: { bg: c.borderLight, text: c.muted },
+    CANCELLED: { bg: c.borderLight, text: c.muted },
+  } as Record<string, { bg: string; text: string }>;
+}
+
+export const lightStatusBadge = buildStatusBadge(lightColors);
+export const darkStatusBadge = buildStatusBadge(darkColors);
+
+export const lightBookingStatusBadge = buildBookingStatusBadge(lightColors);
+export const darkBookingStatusBadge = buildBookingStatusBadge(darkColors);
+
+/**
+ * Resolves a shared {@link StatusTone} against one theme's palette.
+ *
+ * The tone-per-status decision lives in `@shelf/labels` next to the words, so
+ * this app and the webapp cannot disagree about which status carries which
+ * weight. Only the colour VALUES are app-owned, because the companion resolves
+ * every tone twice — once for light, once for dark — while the webapp has one
+ * fixed palette.
+ *
+ * This map and the webapp's `toneBadgeColors`
+ * (`apps/webapp/app/utils/status-tone-colors.ts`) are what make a tone mean the
+ * same thing in both apps — change one and you must change the other.
+ */
+function buildToneBadge(
+  c: Colors
+): Record<StatusTone, { bg: string; text: string }> {
+  return {
+    neutral: { bg: c.borderLight, text: c.muted },
+    info: { bg: c.inCustodyBg, text: c.inCustody },
+    success: { bg: c.successBg, text: c.successText },
+    warning: { bg: c.warningBg, text: c.warningText },
+    danger: { bg: c.errorBg, text: c.errorText },
+  };
+}
+
+function buildAuditStatusBadge(c: Colors) {
+  const tone = buildToneBadge(c);
+  return Object.fromEntries(
+    Object.entries(AUDIT_STATUS_TONES).map(([status, t]) => [status, tone[t]])
+  ) as Record<string, { bg: string; text: string }>;
+}
+
+function buildAuditAssetStatusBadge(c: Colors) {
+  const tone = buildToneBadge(c);
+  return Object.fromEntries(
+    Object.entries(AUDIT_ASSET_STATUS_TONES).map(([status, t]) => [
+      status,
+      tone[t],
+    ])
+  ) as Record<string, { bg: string; text: string }>;
+}
+
+export const lightAuditStatusBadge = buildAuditStatusBadge(lightColors);
+export const darkAuditStatusBadge = buildAuditStatusBadge(darkColors);
+export const lightAuditAssetStatusBadge =
+  buildAuditAssetStatusBadge(lightColors);
+export const darkAuditAssetStatusBadge = buildAuditAssetStatusBadge(darkColors);
+
+/** Legacy helper — returns text color only */
+function buildStatusColors(c: Colors) {
+  return {
+    AVAILABLE: c.available,
+    IN_CUSTODY: c.inCustody,
+    CHECKED_OUT: c.checkedOut,
+  } as Record<string, string>;
+}
+
+export const lightStatusColors = buildStatusColors(lightColors);
+export const darkStatusColors = buildStatusColors(darkColors);
+
+// ────────────────────────────── Shadows ─────────────────────────────────────
+
+type ShadowDef = {
+  shadowColor: string;
+  shadowOffset: { width: number; height: number };
+  shadowOpacity: number;
+  shadowRadius: number;
+  elevation: number;
+};
+
+export type Shadows = { sm: ShadowDef; md: ShadowDef; lg: ShadowDef };
+
+export const lightShadows: Shadows = {
+  sm: {
+    shadowColor: "#101828",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  md: {
+    shadowColor: "#101828",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  lg: {
+    shadowColor: "#101828",
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.12,
+    shadowRadius: 12,
+    elevation: 8,
+  },
+};
+
+/** Dark mode: minimal shadows — rely on border + surface elevation */
+export const darkShadows: Shadows = {
+  sm: {
+    shadowColor: "#000000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.3,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  md: {
+    shadowColor: "#000000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  lg: {
+    shadowColor: "#000000",
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 12,
+    elevation: 8,
+  },
+};

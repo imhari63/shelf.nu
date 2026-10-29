@@ -1,0 +1,432 @@
+import { AuditStatus } from "@prisma/client";
+import { DateTime } from "luxon";
+import type {
+  ActionFunctionArgs,
+  LoaderFunctionArgs,
+  MetaFunction,
+  LinksFunction,
+} from "react-router";
+import {
+  data,
+  redirect,
+  useLoaderData,
+  Outlet,
+  useMatches,
+} from "react-router";
+import { z } from "zod";
+import { ActionsDropdown } from "~/components/audit/actions-dropdown";
+import CompleteAuditDialog from "~/components/audit/complete-audit-dialog";
+import { EditAuditSchema } from "~/components/audit/edit-audit-dialog";
+import { ErrorContent } from "~/components/errors";
+import Header from "~/components/layout/header";
+import HorizontalTabs from "~/components/layout/horizontal-tabs";
+import { Button } from "~/components/shared/button";
+import { db } from "~/database/db.server";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { completeAuditWithImages } from "~/modules/audit/complete-audit-with-images.server";
+import {
+  getAuditSessionDetails,
+  updateAuditSession,
+  cancelAuditSession,
+  archiveAuditSession,
+  deleteAuditSession,
+  requireAuditAssignee,
+} from "~/modules/audit/service.server";
+import type { RouteHandleWithName } from "~/modules/types";
+import actionsCss from "~/styles/actions-dropdown.css?url";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { getClientHint } from "~/utils/client-hints";
+import { DATE_TIME_FORMAT } from "~/utils/constants";
+import { resolveUserFormatPrefsById } from "~/utils/date-format.server";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import { error, getParams, payload } from "~/utils/http.server";
+import { parseData } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { userHasPermission } from "~/utils/permissions/permission.validator.client";
+import { requirePermission } from "~/utils/roles.server";
+
+const label = "Audit";
+
+export const links: LinksFunction = () => [
+  { rel: "stylesheet", href: actionsCss },
+];
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const { userId } = context.getSession();
+  const { auditId } = getParams(params, z.object({ auditId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const formData = await request.clone().formData();
+    const intent = formData.get("intent");
+
+    // Parse the intent first and derive the initial permission from it so
+    // delete-only callers aren't blocked by an `update` gate that isn't
+    // relevant to their action. (Today every delete-capable role also has
+    // update, but that alignment is not a guarantee we should lean on.)
+    const initialAction =
+      intent === "delete-audit"
+        ? PermissionAction.delete
+        : PermissionAction.update;
+
+    const { organizationId, access } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.audit,
+      action: initialAction,
+    });
+
+    if (intent === "edit-audit") {
+      // `audit:update` is held by every role that runs audits, so it does not
+      // decide who may change an audit's details. Editing (and reassigning)
+      // belongs to callers who manage others' audits, the same rule the
+      // actions menu applies before it offers Edit.
+      if (!access.policy.audits.manageOthers) {
+        throw new ShelfError({
+          cause: null,
+          title: "Not allowed",
+          message: "You are not allowed to edit this audit.",
+          additionalData: { userId, auditId },
+          label: "Audit",
+          status: 403,
+          shouldBeCaptured: false,
+        });
+      }
+
+      const parsedData = parseData(formData, EditAuditSchema);
+      const hints = getClientHint(request);
+
+      // Convert dueDate from the acting user's stored timezone preference to UTC.
+      // Parse against the SAME resolved timezone that date DISPLAY uses (the
+      // user's `timeZone` preference), NOT the browser hint — otherwise a
+      // browser/preference zone mismatch offsets the stored instant, and the
+      // edit path would store a different instant than the create path for the
+      // same typed wall-clock time. Resolve the preference lazily — only when a
+      // due date was actually submitted (no date → no parse → no DB lookup).
+      const dueDateString = formData.get("dueDate")?.toString();
+      const dueDateUTC = dueDateString
+        ? DateTime.fromFormat(dueDateString, DATE_TIME_FORMAT, {
+            zone: (await resolveUserFormatPrefsById(userId, hints)).timeZone,
+          }).toJSDate()
+        : null;
+
+      // Parse assignee from JSON (same pattern as create audit)
+      let assigneeUserId: string | null = null;
+      if (parsedData.assignee) {
+        try {
+          const parsed = JSON.parse(parsedData.assignee);
+          assigneeUserId = parsed.userId || null;
+        } catch {
+          assigneeUserId = parsedData.assignee || null;
+        }
+      }
+
+      await updateAuditSession({
+        id: auditId,
+        organizationId,
+        userId,
+        data: {
+          name: parsedData.name,
+          description: parsedData.description || null,
+          dueDate: dueDateUTC,
+          assigneeUserId,
+        },
+      });
+
+      return payload({ success: true });
+    }
+
+    if (intent === "complete-audit") {
+      // Assignee-gated: callers who see every audit may complete any audit,
+      // everyone else only when assigned.
+      await requireAuditAssignee({
+        auditSessionId: auditId,
+        organizationId,
+        userId,
+        assignedOnly: !access.audits.seeAll,
+      });
+
+      await completeAuditWithImages({
+        request,
+        auditSessionId: auditId,
+        organizationId,
+        userId,
+      });
+
+      return payload({ success: true });
+    }
+
+    if (intent === "cancel-audit") {
+      const hints = getClientHint(request);
+      await cancelAuditSession({
+        auditSessionId: auditId,
+        organizationId,
+        userId,
+        canManageOthers: access.policy.audits.manageOthers,
+        hints,
+      });
+
+      return payload({ success: true });
+    }
+
+    if (intent === "archive-audit") {
+      // Archiving requires `audit:archive`.
+      await requirePermission({
+        userId,
+        request,
+        entity: PermissionEntity.audit,
+        action: PermissionAction.archive,
+      });
+
+      await archiveAuditSession({
+        auditSessionId: auditId,
+        organizationId,
+        userId,
+      });
+
+      return payload({ success: true });
+    }
+
+    if (intent === "delete-audit") {
+      // The outer requirePermission already gated on `audit:delete` for
+      // this intent, so no inner re-check.
+
+      const { confirmation } = parseData(
+        formData,
+        z.object({ confirmation: z.string().min(1) })
+      );
+
+      // Name-match verification lives inside deleteAuditSession — it
+      // re-reads the audit for existence/status anyway, so folding the
+      // compare into the same query avoids a second round-trip and keeps
+      // the "never trust client-supplied names" guarantee in one place.
+      await deleteAuditSession({
+        auditSessionId: auditId,
+        organizationId,
+        userId,
+        expectedName: confirmation,
+      });
+
+      // Audit no longer exists — return the redirect so React Router
+      // navigates. `throw redirect(...)` here would be caught by the
+      // surrounding try/catch and turned into an error JSON response.
+      return redirect("/audits");
+    }
+
+    throw new ShelfError({
+      cause: null,
+      message: "Invalid action intent",
+      additionalData: { intent },
+      label,
+      status: 400,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, auditId });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  {
+    title: data ? appendToMetaTitle(data.session.name) : "Audit",
+  },
+];
+
+export const handle = {
+  breadcrumb: () => "single",
+};
+
+export async function loader({ context, request, params }: LoaderFunctionArgs) {
+  const { userId } = context.getSession();
+  const { auditId } = getParams(params, z.object({ auditId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const permissionResult = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.audit,
+      action: PermissionAction.read,
+    });
+
+    const { organizationId, userOrganizations, access } = permissionResult;
+
+    const { session } = await getAuditSessionDetails({
+      // Reads `session` only, so no photo is signed here.
+      refreshExpectedAssetImages: false,
+      id: auditId,
+      organizationId,
+      userOrganizations,
+      request,
+    });
+
+    // Calculate stats for dynamic button text
+    const scanCount = await db.auditScan.count({
+      where: { auditSessionId: auditId },
+    });
+    const hasScans = scanCount > 0;
+
+    const stats = {
+      expectedCount: session.expectedAssetCount,
+      foundCount: session.foundAssetCount,
+      missingCount: session.missingAssetCount,
+      unexpectedCount: session.unexpectedAssetCount,
+    };
+
+    // Callers limited to assigned audits may open only those.
+    if (!access.audits.seeAll) {
+      const isAssignee = session.assignments.some(
+        (assignment) => assignment.userId === userId
+      );
+
+      if (!isAssignee) {
+        throw new ShelfError({
+          cause: null,
+          title: "Access denied",
+          message: "You are not assigned to this audit.",
+          additionalData: { auditId, userId },
+          status: 403,
+          label,
+        });
+      }
+    }
+    const header = { title: `${session.name} · Overview` };
+
+    // Fetch team members for audit assignment (used in edit dialog)
+    const teamMembers = await db.teamMember.findMany({
+      where: {
+        organizationId,
+        deletedAt: null,
+        userId: { not: null }, // Only team members with user accounts
+      },
+      select: {
+        id: true,
+        name: true,
+        userId: true,
+      },
+      orderBy: { name: "asc" },
+    });
+
+    return data(
+      payload({
+        header,
+        session,
+        canSeeAllAudits: access.audits.seeAll,
+        canManageOthersAudits: access.policy.audits.manageOthers,
+        hasScans,
+        stats,
+        userId,
+        teamMembers,
+      })
+    );
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, auditId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export default function AuditDetailsPage() {
+  const {
+    session,
+    canSeeAllAudits,
+    canManageOthersAudits,
+    hasScans,
+    stats,
+    userId,
+  } = useLoaderData<typeof loader>();
+  const roles = useOrganizationRoles();
+
+  const isCompleted = session.status === AuditStatus.COMPLETED;
+  const isCancelled = session.status === AuditStatus.CANCELLED;
+  const isArchived = session.status === AuditStatus.ARCHIVED;
+  const isCreator = session.createdById === userId;
+
+  // Check if current user is assigned to this audit
+  const isAssignee = session.assignments.some(
+    (assignment) => assignment.userId === userId
+  );
+
+  // Members whose audit scope covers every audit can scan and complete any of
+  // them; everyone else only the audits assigned to them.
+  const canScanAndComplete = isAssignee || canSeeAllAudits;
+
+  // The activity loader requires `auditNote:read` and 403s without it, so the
+  // tab follows the same gate rather than routing the user into an error.
+  const items = [
+    { to: "overview", content: "Overview" },
+    ...(userHasPermission({
+      roles,
+      entity: PermissionEntity.auditNote,
+      action: PermissionAction.read,
+    })
+      ? [{ to: "activity", content: "Activity" }]
+      : []),
+  ];
+
+  const matches = useMatches();
+
+  /**
+   * When we are on the audit.scan route OR any descendant of it (e.g. the
+   * /scan/:auditAssetId/details overlay), we want a bare <Outlet /> without
+   * the parent header/tabs. Walking ALL matches — not just the leaf — keeps
+   * the suppression in place for nested routes the leaf may sit beneath.
+   */
+  const isInAuditScanRoute = matches.some(
+    (match): match is typeof match & { handle: { name: string } } =>
+      (match as RouteHandleWithName)?.handle?.name === "audit.scan"
+  );
+
+  return isInAuditScanRoute ? (
+    <Outlet />
+  ) : (
+    <div className="relative">
+      <Header
+        title={session.name}
+        subHeading={
+          session.description ? (
+            <div className="mt-1">{session.description}</div>
+          ) : undefined
+        }
+      >
+        {/* Action Buttons */}
+        <div className="flex flex-wrap gap-2">
+          {/* Show actions dropdown to anyone who can view the audit (for PDF download) */}
+          {(canManageOthersAudits || isCreator || isAssignee) && (
+            <ActionsDropdown />
+          )}
+
+          {!isCompleted &&
+            !isCancelled &&
+            !isArchived &&
+            canScanAndComplete && (
+              <Button
+                to={`/audits/${session.id}/scan`}
+                variant={"secondary"}
+                type={"button"}
+              >
+                {hasScans ? "Continue scanning" : "Start scanning"}
+              </Button>
+            )}
+
+          {!isCompleted &&
+            !isCancelled &&
+            !isArchived &&
+            canScanAndComplete && (
+              <CompleteAuditDialog auditName={session.name} stats={stats} />
+            )}
+        </div>
+      </Header>
+      <HorizontalTabs items={items} />
+      <div>
+        <Outlet />
+      </div>
+    </div>
+  );
+}
+
+export const ErrorBoundary = () => <ErrorContent />;

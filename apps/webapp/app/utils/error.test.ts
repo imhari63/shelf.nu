@@ -1,0 +1,916 @@
+import { createId } from "@paralleldrive/cuid2";
+import { Prisma } from "@prisma/client";
+import type { PrismaClientKnownRequestError } from "@prisma/client/runtime/library";
+import type { ValidationError } from "./http";
+
+/**
+ * The goal of this custom error class is to normalize our errors.
+ */
+
+type SerializableValue = string | number | boolean | object | null | undefined;
+
+export const VALIDATION_ERROR = "validationErrors";
+
+/**
+ * Additional data to help us debug.
+ */
+export type AdditionalData =
+  | {
+      [key: string]: SerializableValue;
+    }
+  | {
+      [VALIDATION_ERROR]?: ValidationError<any> | undefined;
+      [key: string]: SerializableValue;
+    };
+
+/**
+ * @param message The message intended for the user.
+ * @param title The title of the error, if any, for a modal, a toast, etc.
+ *
+ * Other params are for logging purposes and help us debug.
+ * @param label A label to help us debug and filter logs.
+ * @param cause The error that caused the rejection.
+ * @param additionalData Additional data to help us debug.
+ * @param shouldBeCaptured Whether we should capture this error or not.
+ *
+ */
+export type FailureReason = {
+  /**
+   * The error that caused the rejection, if any.
+   */
+  cause: unknown | null;
+  /**
+   * A label to help us debug and filter logs.
+   */
+  label:
+    | "Unknown"
+    // Related to our modules
+    | "Admin dashboard"
+    | "App layout"
+    | "Assets"
+    | "Asset Import"
+    | "Asset Index Settings"
+    | "Auth"
+    | "Barcode"
+    | "Booking"
+    | "Booking Settings"
+    | "Category"
+    | "Crop image"
+    | "CSV"
+    | "Custody"
+    | "Custom fields"
+    | "Dashboard"
+    | "Email"
+    | "Healthcheck"
+    | "Image"
+    | "Invite"
+    | "User onboarding"
+    | "Location"
+    | "Notification"
+    | "Push"
+    | "Organization"
+    | "Permission"
+    | "QR"
+    | "Report"
+    | "Settings"
+    | "Working hours"
+    | "File storage"
+    | "Scan"
+    | "Scheduler"
+    | "Stripe"
+    | "Stripe webhook"
+    | "Subscription"
+    | "Tag"
+    | "Team"
+    | "Team Member"
+    | "Tier"
+    | "User"
+    | "User Contact"
+    | "Scanner"
+    | "SCIM"
+    | "SSO"
+    | "Kit"
+    | "Note"
+    | "Team Member Note"
+    | "Audit Image"
+    // Other kinds of errors
+    | "DB"
+    | "Request validation"
+    | "Request aborted"
+    | "Rate limit" // A server-side rate limiter rejected the request (429)
+    | "DB constrain violation"
+    | "Dev error" // Error that should never happen in production because it's a developer mistake
+    | "Environment" // Related to the environment setup
+    | "Image Import"
+    | "Image Cache"
+    | "Asset Model"
+    | "Asset Reminder"
+    | "Asset Scheduler" // Error related to the image import
+    | "Audit"
+    | "Activity"
+    | "Consumption Log"
+    | "Update"
+    | "Analytics";
+  /**
+   * The message intended for the user.
+   * You can add new lines using \n which will be parsed into paragraphs in the html
+   * Moveoer, you can add html to highlight strings
+   */
+  message: string;
+  /**
+   * The title of the error, if any, for a modal, a toast, etc.
+   */
+  title?: string;
+  /**
+   * Additional data to help us debug.
+   *
+   * **Do not put sensitive data here.** It will be logged and could be sent to Sentry.
+   */
+  additionalData?: AdditionalData;
+  /**
+   * Whether we should capture this error or not.
+   *
+   * If not, it will be logged but not sent to Sentry.
+   *
+   * **Default is true**
+   */
+  shouldBeCaptured?: boolean;
+  /**
+   * The traceId is a unique identifier for the error.
+   *
+   * It can be the Stripe event id or an random generated id.
+   */
+  traceId?: string;
+  /**
+   * The HTTP status code to return.
+   *
+   * Add more status codes as needed: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status
+   */
+  status?:
+    | 200 // ok
+    | 204 // no content
+    | 400 // bad request
+    | 401 // unauthorized
+    | 403 // forbidden
+    | 404 // not found
+    | 405 // method not allowed
+    | 409 // conflict
+    | 429 // too many requests
+    | 499 // client closed request
+    | 500 // internal server error
+    | 503; // service unavailable
+};
+
+export type ErrorLabel = FailureReason["label"];
+
+/**
+ * A custom error class to normalize the error handling in our app.
+ */
+export class ShelfError extends Error {
+  readonly cause: FailureReason["cause"];
+  readonly label: FailureReason["label"];
+  readonly title: FailureReason["title"];
+  readonly additionalData: FailureReason["additionalData"];
+  readonly shouldBeCaptured: FailureReason["shouldBeCaptured"];
+  readonly status: FailureReason["status"];
+
+  traceId: FailureReason["traceId"];
+
+  constructor({
+    cause,
+    label,
+    message,
+    title,
+    additionalData,
+    shouldBeCaptured,
+    status,
+    traceId,
+  }: FailureReason) {
+    super();
+    this.name = "ShelfError";
+    this.cause = cause;
+    this.label = label;
+    this.message = message;
+    this.title = isLikeShelfError(cause) ? title || cause.title : title;
+    this.additionalData = additionalData;
+    this.shouldBeCaptured =
+      (isLikeShelfError(cause)
+        ? shouldBeCaptured ?? cause.shouldBeCaptured
+        : shouldBeCaptured) ?? true;
+    this.status = isLikeShelfError(cause)
+      ? status || cause.status || 500
+      : isNotFoundError(cause)
+      ? 404
+      : status || 500;
+    this.traceId = traceId || createId();
+  }
+}
+
+/**
+ * Re-throws `cause` unchanged when it is a deliberate CLIENT-error ShelfError.
+ *
+ * Service wrappers typically catch everything and re-throw with a friendly
+ * "something went wrong, try again later" message. That is right for an
+ * internal fault, and wrong for a 4xx someone chose deliberately: it hands the
+ * user a 400 telling them to retry a request that can never succeed.
+ *
+ * 4xx means a human wrote that message for a user; 5xx means something broke.
+ * `status` is optional on ShelfError, so an unset status is treated as 500.
+ *
+ * @param cause - The caught value
+ * @throws The original error when it is a client-error ShelfError
+ */
+export function rethrowIfClientError(cause: unknown): void {
+  if (cause instanceof ShelfError && (cause.status ?? 500) < 500) {
+    throw cause;
+  }
+}
+
+/**
+ * This helper function is used to check if an error is an instance of `ShelfError` or an object that looks like an `ShelfError`.
+ */
+export function isLikeShelfError(cause: unknown): cause is ShelfError {
+  return (
+    cause instanceof ShelfError ||
+    (typeof cause === "object" &&
+      cause !== null &&
+      "label" in cause &&
+      "message" in cause)
+  );
+}
+
+/**
+ * A "handled client error": a `ShelfError` whose HTTP status is in the 4xx
+ * range. These are expected, user-facing outcomes (failed validation, business
+ * rule violations, not-found, forbidden) — not server faults. We deliberately
+ * keep them OUT of the Sentry error pipeline (they'd burn the small error
+ * quota and alert on non-issues) and instead record them as low-severity
+ * Sentry **logs** (separate quota) so there's still a searchable trail.
+ *
+ * Note: `ShelfError.status` defaults to 500, so anything without an explicit
+ * 4xx status is treated as a server error (captured normally).
+ *
+ * @see {@link file://./../../server/instrument.server.ts} beforeSend — drops these from errors
+ * @see {@link file://./logger.ts} Logger.handledClientError — emits the log trail
+ */
+export function isHandledClientError(cause: unknown): boolean {
+  if (!isLikeShelfError(cause)) {
+    return false;
+  }
+  const status = cause.status ?? 500;
+  return status >= 400 && status < 500;
+}
+
+/**
+ * Detects whether an error (or any error in its `cause` chain) represents a
+ * cancelled / aborted request. Used to suppress noise from client disconnects
+ * and stream-handler aborts both in `makeShelfError` and in the Sentry
+ * `beforeSend` hook on the server.
+ */
+export function isAbortError(cause: unknown) {
+  if (!cause) {
+    return false;
+  }
+
+  if (cause instanceof Error) {
+    const name = cause.name?.toLowerCase?.() ?? "";
+    const message = cause.message?.toLowerCase?.() ?? "";
+    // Read `code` by narrowing from `unknown` rather than `any` — some error
+    // shapes (Node `ECONNRESET`, AbortSignal, etc.) carry it as a sibling
+    // field. Other browser-side AbortError variants surface their reason via
+    // `message` ("The operation was aborted", "Fetch is aborted") and are
+    // already covered by the message checks below.
+    const codeCandidate: unknown = (cause as { code?: unknown }).code;
+    const code = typeof codeCandidate === "string" ? codeCandidate : "";
+
+    if (name === "aborterror") {
+      return true;
+    }
+
+    if (
+      message.includes("call aborted") ||
+      message.includes("request aborted") ||
+      message.includes("the operation was aborted") ||
+      message.includes("fetch is aborted") ||
+      message === "aborted" ||
+      code === "ECONNRESET"
+    ) {
+      return true;
+    }
+
+    if (typeof cause.cause === "string") {
+      return cause.cause.toLowerCase().includes("aborted");
+    }
+
+    if (cause.cause instanceof Error) {
+      return isAbortError(cause.cause);
+    }
+  }
+
+  if (typeof cause === "string") {
+    return cause.toLowerCase().includes("aborted");
+  }
+
+  return false;
+}
+
+/**
+ * This helper function is used to check if an error is an instance of `ShelfError` or an object that looks like an `ShelfError`.
+ */
+export function isNotFoundError(
+  cause: unknown
+): cause is PrismaClientKnownRequestError {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    cause.code === "P2025"
+  );
+}
+
+/**
+ * Prisma error codes that indicate transient/connection issues
+ * rather than actual data problems.
+ */
+export const PRISMA_TRANSIENT_ERROR_CODES = new Set([
+  "P2024", // Timed out fetching a new connection from the connection pool
+  "P1001", // Can't reach database server
+  "P1002", // The database server was reached but timed out
+  "P1008", // Operations timed out
+  "P1017", // Server has closed the connection
+]);
+
+/**
+ * Checks if an error is a Prisma transient/connection error
+ * that should NOT be reported as a domain-specific "not found" error.
+ */
+export function isPrismaTransientError(cause: unknown): boolean {
+  if (typeof cause !== "object" || cause === null) return false;
+  if ("code" in cause && typeof cause.code === "string") {
+    return PRISMA_TRANSIENT_ERROR_CODES.has(cause.code);
+  }
+  if (cause instanceof Error && typeof cause.message === "string") {
+    const msg = cause.message.toLowerCase();
+    return (
+      msg.includes("timed out fetching a new connection") ||
+      msg.includes("can't reach database server")
+    );
+  }
+  return false;
+}
+
+/**
+ * Substring shared by BOTH quantity over-allocation trigger exceptions.
+ *
+ * Two DB triggers enforce `sum(pivot.quantity) <= Asset.quantity` for
+ * QUANTITY_TRACKED assets and raise (via `RAISE EXCEPTION`) when the invariant
+ * is violated:
+ *
+ *   - `AssetKit total % exceeds Asset.quantity % for asset %`
+ *     ({@link file://./../../../../packages/database/prisma/migrations/20260514100000_drop_asset_kit_unique_add_triggers/migration.sql})
+ *   - `AssetLocation total % exceeds Asset.quantity % for asset %`
+ *     ({@link file://./../../../../packages/database/prisma/migrations/20260519143054_add_asset_location_pivot/migration.sql})
+ *
+ * Both surface at runtime as a `PrismaClientUnknownRequestError` whose message
+ * contains this substring. It is intentionally NARROW — it appears only in
+ * these two trigger messages, so matching on it never swallows unrelated
+ * `PrismaClientUnknownRequestError`s.
+ */
+export const ASSET_QUANTITY_OVER_ALLOCATION_MARKER = "exceeds Asset.quantity";
+
+/**
+ * Detects the "assigning more of a QUANTITY_TRACKED asset than `Asset.quantity`
+ * allows" DB-trigger violation anywhere in an error's `cause` chain.
+ *
+ * The raw trigger error is a `PrismaClientUnknownRequestError`, but a
+ * service-layer `try/catch` may already have re-wrapped it inside a
+ * `ShelfError` (with the original as `.cause`) by the time we inspect it — so
+ * we walk the chain, mirroring {@link hasTransientCause} / {@link hasNotFoundCause}.
+ *
+ * @param cause - Any thrown value (error, wrapper, or unknown).
+ * @returns `true` when the over-allocation trigger message is present in the
+ * error or any nested `cause`; otherwise `false`.
+ */
+export function isAssetQuantityOverAllocationError(cause: unknown): boolean {
+  return causeChainIncludesMessage(
+    cause,
+    ASSET_QUANTITY_OVER_ALLOCATION_MARKER
+  );
+}
+
+/**
+ * Cycle-safe walk of an error's `cause` chain, returning `true` when any node's
+ * `message` contains `marker`. A DB-trigger error is frequently nested inside a
+ * service-layer `ShelfError` wrapper by the time we inspect it, so we walk the
+ * chain (mirroring {@link hasTransientCause} / {@link hasNotFoundCause}). A
+ * `visited` set makes the walk cycle-safe: a self- or mutually-referential
+ * `.cause` graph terminates and returns `false` instead of recursing into a
+ * stack overflow.
+ *
+ * @param cause - Any thrown value (error, wrapper, or unknown).
+ * @param marker - Narrow substring to look for in each node's `message`.
+ * @returns `true` when `marker` is present on any node of the cause chain.
+ */
+function causeChainIncludesMessage(cause: unknown, marker: string): boolean {
+  const visited = new Set<object>();
+  let current = cause;
+  while (typeof current === "object" && current !== null) {
+    if (visited.has(current)) {
+      return false;
+    }
+    visited.add(current);
+    const error = current as { message?: unknown; cause?: unknown };
+    if (typeof error.message === "string" && error.message.includes(marker)) {
+      return true;
+    }
+    current = error.cause;
+  }
+  return false;
+}
+
+/**
+ * Translates the quantity over-allocation DB-trigger violation into a
+ * user-facing `ShelfError` and throws it. No-ops (returns) for every other
+ * error so the caller's existing error wrapping runs unchanged.
+ *
+ * This is a user-input validation failure (the user asked to assign more units
+ * than exist), so the thrown error is a **400** with `shouldBeCaptured: false`:
+ * per repo convention (see {@link isHandledClientError}) these are recorded as
+ * low-severity Sentry LOGS, not paged as Sentry ISSUES.
+ *
+ * Wire this in as the FIRST line of a `catch (cause)` block at any service path
+ * that writes `AssetKit` / `AssetLocation` rows and can trip the triggers.
+ *
+ * @param cause - The caught error to inspect.
+ * @param options.label - The `ShelfError` label for the throwing surface
+ * (e.g. `"Kit"`, `"Location"`, `"Assets"`).
+ * @param options.additionalData - Debugging context (asset/kit/location ids)
+ * preserved on the thrown error.
+ * @throws {ShelfError} A 400, non-captured error when `cause` is the
+ * over-allocation trigger violation.
+ */
+export function throwIfAssetQuantityOverAllocation(
+  cause: unknown,
+  {
+    label,
+    additionalData,
+  }: { label: ErrorLabel; additionalData?: AdditionalData }
+): void {
+  if (!isAssetQuantityOverAllocationError(cause)) {
+    return;
+  }
+  throw new ShelfError({
+    cause,
+    label,
+    message:
+      "You're trying to assign more of this asset than are available. Lower the quantity and try again.",
+    status: 400,
+    shouldBeCaptured: false,
+    additionalData,
+  });
+}
+
+/**
+ * Substring unique to the "INDIVIDUAL asset already placed at a location"
+ * DB-trigger exception.
+ *
+ * `enforce_individual_asset_single_location` caps an INDIVIDUAL asset at one
+ * `AssetLocation` row and raises (via `RAISE EXCEPTION … USING ERRCODE =
+ * 'check_violation'`) when a second placement is attempted — e.g. adding a kit
+ * (or asset) to a location while one of its INDIVIDUAL members is still placed
+ * at another location.
+ * ({@link file://./../../../../packages/database/prisma/migrations/20260519143054_add_asset_location_pivot/migration.sql})
+ *
+ * Surfaces at runtime as a `PrismaClientUnknownRequestError` whose message
+ * contains this substring. Intentionally NARROW so it never swallows unrelated
+ * errors (the sibling single-kit trigger uses different wording).
+ */
+export const INDIVIDUAL_ASSET_ALREADY_PLACED_MARKER =
+  "already placed at a location";
+
+/**
+ * Detects the "INDIVIDUAL asset already placed at a location" DB-trigger
+ * violation anywhere in an error's `cause` chain (the raw trigger error is
+ * frequently re-wrapped inside a service-layer `ShelfError` before we inspect
+ * it).
+ *
+ * @param cause - Any thrown value (error, wrapper, or unknown).
+ * @returns `true` when the trigger message is present in the error or any
+ * nested `cause`; otherwise `false`.
+ */
+export function isIndividualAssetAlreadyPlacedError(cause: unknown): boolean {
+  return causeChainIncludesMessage(
+    cause,
+    INDIVIDUAL_ASSET_ALREADY_PLACED_MARKER
+  );
+}
+
+/**
+ * Translates the "INDIVIDUAL asset already placed at a location" DB-trigger
+ * violation into a user-facing `ShelfError` and throws it. No-ops (returns) for
+ * every other error so the caller's existing error wrapping runs unchanged.
+ *
+ * Like {@link throwIfAssetQuantityOverAllocation}, this is a user-input
+ * validation failure (an individual asset can only be in one location at a
+ * time), so the thrown error is a **400** with `shouldBeCaptured: false` —
+ * recorded as a low-severity Sentry LOG, not paged as an ISSUE. Wire it in
+ * alongside `throwIfAssetQuantityOverAllocation` at any service path that writes
+ * `AssetLocation` rows and can trip the single-location trigger. See
+ * SHELF-WEBAPP-1P4.
+ *
+ * @param cause - The caught error to inspect.
+ * @param options.label - The `ShelfError` label for the throwing surface
+ * (e.g. `"Location"`).
+ * @param options.additionalData - Debugging context (asset/kit/location ids)
+ * preserved on the thrown error.
+ * @throws {ShelfError} A 400, non-captured error when `cause` is the
+ * single-location trigger violation.
+ */
+export function throwIfIndividualAssetAlreadyPlaced(
+  cause: unknown,
+  {
+    label,
+    additionalData,
+  }: { label: ErrorLabel; additionalData?: AdditionalData }
+): void {
+  if (!isIndividualAssetAlreadyPlacedError(cause)) {
+    return;
+  }
+  throw new ShelfError({
+    cause,
+    label,
+    message:
+      "An individual asset can only be in one location at a time, and one of these assets is already placed at another location. Remove it from its current location first, then try again.",
+    status: 400,
+    shouldBeCaptured: false,
+    additionalData,
+  });
+}
+
+/**
+ * Substring embedded verbatim in the Prisma error message when Postgres raises
+ * SQLSTATE `53200` (`out_of_memory`) because its **cluster-wide shared lock
+ * table is full** — the "You might need to increase max_locks_per_transaction"
+ * hint. Prisma surfaces this as a `P2010` (raw query failed), a code far too
+ * broad to key off (a genuinely broken raw query is *also* `P2010`), so we
+ * match NARROWLY on this hint text, which appears only in this one condition.
+ *
+ * @see SHELF-WEBAPP-227 — the `/assets` advanced-filter raw query trips this on
+ * large workspaces under the per-request query fan-out.
+ */
+export const DB_LOCK_EXHAUSTION_MARKER = "max_locks_per_transaction";
+
+/**
+ * Detects Postgres shared-lock-table exhaustion (SQLSTATE `53200` /
+ * `max_locks_per_transaction`) anywhere in an error's `cause` chain — even when
+ * a service-layer `try/catch` already re-wrapped the raw Prisma error inside a
+ * generic `ShelfError` (as the assets query does before it reaches the route
+ * boundary). Mirrors the cause-chain walk used by the DB-trigger detectors.
+ *
+ * This is a **transient, load-dependent** resource exhaustion, not a bug in the
+ * query and not a connectivity failure: the statement failed while acquiring
+ * its locks under contention, before touching any row. It is therefore safe to
+ * present as a retryable 503 (see {@link makeShelfError}) and safe to re-run a
+ * READ against (see `withPrismaRetry` in `@shelf/database`).
+ *
+ * @param cause - Any thrown value (error, wrapper, or unknown).
+ * @returns `true` when the lock-exhaustion hint is present on any node of the
+ * cause chain; otherwise `false`.
+ */
+export function isDbResourceExhaustionError(cause: unknown): boolean {
+  return causeChainIncludesMessage(cause, DB_LOCK_EXHAUSTION_MARKER);
+}
+
+/**
+ * Walks the cause chain of an error to detect if a transient
+ * Prisma error is buried inside ShelfError wrappers.
+ */
+function hasTransientCause(error: unknown): boolean {
+  if (isPrismaTransientError(error)) return true;
+  if (typeof error === "object" && error !== null && "cause" in error) {
+    return hasTransientCause((error as { cause: unknown }).cause);
+  }
+  return false;
+}
+
+/**
+ * Walks the cause chain of an error to detect if a Prisma `P2025`
+ * (record-not-found) error is buried inside ShelfError wrappers. Used by
+ * `makeShelfError` so that a `prisma.x.update()` failure on a
+ * deleted-since-load record collapses to a 404 even when a service-layer
+ * `try/catch` already re-wrapped it as a generic 5xx ShelfError.
+ */
+function hasNotFoundCause(error: unknown): boolean {
+  if (isNotFoundError(error)) return true;
+  if (typeof error === "object" && error !== null && "cause" in error) {
+    return hasNotFoundCause((error as { cause: unknown }).cause);
+  }
+  return false;
+}
+
+/** The serialized error a thrown `data(error(reason), { status })` carries. */
+type ClientErrorPayload = Partial<
+  Pick<FailureReason, "message" | "title" | "label" | "additionalData">
+>;
+
+/**
+ * Reads a thrown React Router `data()` response with a 4xx status.
+ *
+ * `getParams` and a few route helpers throw such a response rather than a
+ * `ShelfError`; this lets {@link makeShelfError} keep its status and message.
+ *
+ * @param cause - The caught value
+ * @returns The status and serialized error, or `null` when `cause` is not a 4xx data response
+ */
+function asClientErrorResponse(cause: unknown): {
+  status: NonNullable<FailureReason["status"]>;
+  error: ClientErrorPayload | undefined;
+} | null {
+  if (
+    typeof cause !== "object" ||
+    cause === null ||
+    (cause as { type?: unknown }).type !== "DataWithResponseInit"
+  ) {
+    return null;
+  }
+  const { data: body, init } = cause as {
+    data?: { error?: ClientErrorPayload | null };
+    init?: { status?: number } | null;
+  };
+  const status = init?.status;
+  if (typeof status !== "number" || status < 400 || status >= 500) {
+    return null;
+  }
+  // Statuses outside the ShelfError union (422, 410...) keep their meaning as
+  // a client error by reporting as a plain 400.
+  const known: NonNullable<FailureReason["status"]>[] = [
+    400, 401, 403, 404, 405, 409, 429, 499,
+  ];
+  return {
+    status: known.find((code) => code === status) ?? 400,
+    error: body?.error ?? undefined,
+  };
+}
+
+/**
+ * This function is used to check if the error is a zod validation error.
+ */
+export function isZodValidationError(cause: unknown) {
+  if (!isLikeShelfError(cause)) {
+    return false;
+  }
+
+  return cause.additionalData && "validationErrors" in cause.additionalData;
+}
+
+export function makeShelfError(
+  cause: unknown,
+  additionalData?: AdditionalData,
+  shouldBeCaptured?: boolean
+) {
+  if (isAbortError(cause)) {
+    return new ShelfError({
+      cause,
+      label: "Request aborted",
+      message: "The request was cancelled before it could complete.",
+      shouldBeCaptured: false,
+      status: 499,
+    });
+  }
+
+  // Detect transient DB errors buried in ShelfError wrappers.
+  // This prevents misleading messages like "User not found" when the
+  // real issue is a connection pool timeout (P2024).
+  if (hasTransientCause(cause)) {
+    // Merge the wrapper's additionalData (a service catch may have attached
+    // context like organizationId before re-throwing) so it survives into the
+    // logged/Sentry payload, mirroring the not-found + generic branches below.
+    const wrapper = isLikeShelfError(cause) ? cause : null;
+    return new ShelfError({
+      cause,
+      message:
+        "We're experiencing temporary database connectivity issues. Please try again in a moment.",
+      label: "DB",
+      additionalData: {
+        ...(wrapper?.additionalData ?? {}),
+        ...additionalData,
+      },
+      shouldBeCaptured: true,
+      status: 503,
+    });
+  }
+
+  // Detect Postgres shared-lock-table exhaustion (SQLSTATE 53200 /
+  // max_locks_per_transaction) anywhere in the cause chain — even when a
+  // service catch block already re-wrapped it as a generic 5xx ShelfError
+  // (the assets advanced-filter query does exactly that). This is a transient,
+  // load-dependent overload on a READ, so it collapses to a friendly retryable
+  // 503 instead of a hard 500 crash screen. Kept captured (503 ≥ 500 so it
+  // stays in the Sentry error pipeline) so we can watch it recede as the
+  // durable per-request fan-out fix lands. See SHELF-WEBAPP-227.
+  if (isDbResourceExhaustionError(cause)) {
+    // Merge the wrapper's additionalData: on the assets path the cause is the
+    // "Failed to fetch…" ShelfError carrying { organizationId, paramsValues },
+    // which is exactly the load-dependent context (which workspace / which
+    // filters) needed to watch this recede. Mirrors the not-found branch.
+    const wrapper = isLikeShelfError(cause) ? cause : null;
+    return new ShelfError({
+      cause,
+      message:
+        "The server is temporarily overloaded and couldn't load this. Please try again in a moment.",
+      label: "DB",
+      additionalData: {
+        ...(wrapper?.additionalData ?? {}),
+        ...additionalData,
+      },
+      shouldBeCaptured: true,
+      status: 503,
+    });
+  }
+
+  // Detect Prisma `P2025` (record not found) anywhere in the cause chain —
+  // even when a service-layer `try/catch` already re-wrapped it as a generic
+  // 5xx ShelfError. Race conditions like "asset deleted between form load
+  // and submit" surface here, and they belong as 404s, not as paged 5xxs.
+  // We preserve the wrapper's user-facing message + label when present so
+  // the toast still says "Booking not found, are you sure …" rather than
+  // a generic message; only the status and capture decision change.
+  // Callers can force capture with an explicit `shouldBeCaptured: true`.
+  if (hasNotFoundCause(cause)) {
+    const wrapper = isLikeShelfError(cause) ? cause : null;
+    return new ShelfError({
+      cause,
+      message: wrapper?.message ?? "The requested resource could not be found.",
+      label: wrapper?.label ?? "Unknown",
+      additionalData: {
+        ...(wrapper?.additionalData ?? {}),
+        ...additionalData,
+      },
+      status: 404,
+      shouldBeCaptured: shouldBeCaptured ?? false,
+    });
+  }
+
+  // A thrown client-error response, such as the 400 `getParams` throws for a
+  // missing or malformed request param. Routes catch it with this function, so
+  // without this branch it would fall through to the unknown-error default and
+  // turn a bad request into a captured 500.
+  const clientErrorResponse = asClientErrorResponse(cause);
+  if (clientErrorResponse) {
+    const { status, error: payload } = clientErrorResponse;
+    return new ShelfError({
+      cause: null,
+      message: payload?.message ?? "The request is invalid.",
+      title: payload?.title,
+      label: payload?.label ?? "Request validation",
+      additionalData: {
+        ...(payload?.additionalData ?? {}),
+        ...additionalData,
+      },
+      status,
+      shouldBeCaptured: false,
+    });
+  }
+
+  if (isLikeShelfError(cause)) {
+    // copy the original error and fill in the maybe missing fields like status or traceId
+    return new ShelfError({
+      ...cause,
+      additionalData: {
+        ...cause.additionalData,
+        ...additionalData,
+      },
+      shouldBeCaptured:
+        "shouldBeCaptured" in cause ? cause.shouldBeCaptured : shouldBeCaptured,
+    });
+  }
+
+  // 🤷‍♂️ We don't know what this error is, so we create a new default one.
+  // Default to `true` for the unknown-error path: an unrecognised throw
+  // really should reach Sentry unless a caller explicitly opts out.
+  return new ShelfError({
+    cause,
+    message: "Sorry, something went wrong.",
+    additionalData,
+    label: "Unknown",
+    shouldBeCaptured: shouldBeCaptured ?? true,
+  });
+}
+
+/* --------------------------------------------------------------------------- */
+/*                               Pre made errors                               */
+/* --------------------------------------------------------------------------- */
+
+export type Options = Partial<
+  Pick<
+    FailureReason,
+    "additionalData" | "message" | "title" | "shouldBeCaptured"
+  >
+>;
+
+/**
+ * Error for when a method is not allowed.
+ *
+ * **By default, the error will not be captured.**
+ *
+ * If you want to capture the error, you can set the `shouldBeCaptured` option to `true`.
+ */
+export function notAllowedMethod(method: string, options?: Options) {
+  return new ShelfError({
+    shouldBeCaptured: false,
+    ...options,
+    // Must come after the spread so that callers who pass
+    // `{ message: undefined }` (e.g. `assertIsPost(request)` with no message
+    // argument) don't clobber the default via spread semantics.
+    message: options?.message ?? `"${method}" method is not allowed.`,
+    cause: null,
+    status: 405,
+    label: "Request validation",
+  });
+}
+
+/**
+ * Error for when a resource is not found.
+ *
+ * **By default, the error will not be captured.**
+ *
+ * If you want to capture the error, you can set the `shouldBeCaptured` option to `true`.
+ */
+export function badRequest(
+  message: string,
+  options?: Omit<Options, "message">
+) {
+  return new ShelfError({
+    shouldBeCaptured: false,
+    ...options,
+    cause: null,
+    message,
+    status: 400,
+    label: "Request validation",
+  });
+}
+
+/**
+ * Error for when a you could suspect a unique constraint violation.
+ *
+ * **By default, the error will not be captured if it is a constrain violation**
+ *
+ * If you want to capture all errors, you can set the `shouldBeCaptured` option to `true`.
+ */
+export function maybeUniqueConstraintViolation(
+  cause: unknown,
+  modelName: string,
+  options?: Options
+) {
+  let message = `We could not create or update this ${modelName}. Please try again or contact support.`;
+  let shouldBeCaptured = false;
+  const validationErrors = {} as ValidationError<any>;
+
+  if (
+    cause instanceof Prisma.PrismaClientKnownRequestError &&
+    cause.code === "P2002"
+  ) {
+    shouldBeCaptured = false;
+
+    // Extract the target field(s) from the Prisma error
+    const target = cause.meta?.target as string[] | undefined;
+
+    // Filter out organizational fields and clean up function-wrapped fields
+    const relevantFields = target
+      ?.filter((field) => {
+        // Remove organizational/scoping fields
+        if (
+          field === "organizationId" ||
+          field === "userId" ||
+          field === "teamId"
+        ) {
+          return false;
+        }
+        return true;
+      })
+      .map((field) => {
+        // Clean up function-wrapped fields like 'lower(name)' -> 'name'
+        const match = field.match(/^[a-zA-Z_]+\(([^)]+)\)$/);
+        return match ? match[1] : field;
+      });
+
+    const failedField = relevantFields?.[0] || "name"; // Get the first relevant field or default to "name"
+
+    // Generate dynamic message based on the actual failed field
+    message = `${modelName} ${failedField} is already taken. Please choose a different ${failedField}.`;
+    validationErrors[failedField] = { message };
+  }
+
+  return new ShelfError({
+    cause,
+    shouldBeCaptured,
+    ...options,
+    message,
+    additionalData: {
+      modelName,
+      ...(options && options.additionalData),
+      validationErrors,
+    },
+    label: "DB constrain violation",
+  });
+}

@@ -1,0 +1,219 @@
+import { CustomFieldType } from "@prisma/client";
+import { useAtomValue } from "jotai";
+import type {
+  ActionFunctionArgs,
+  MetaFunction,
+  LoaderFunctionArgs,
+} from "react-router";
+import { data, useLoaderData } from "react-router";
+import { z } from "zod";
+import { dynamicTitleAtom } from "~/atoms/dynamic-title-atom";
+import {
+  CustomFieldForm,
+  CustomFieldSubmissionSchema,
+  MISSING_OPTIONS_MESSAGE,
+  optionFieldIsMissingOptions,
+} from "~/components/custom-fields/form";
+import Header from "~/components/layout/header";
+import type { HeaderData } from "~/components/layout/header/types";
+import { getCategoriesForCreateAndEdit } from "~/modules/asset/service.server";
+import {
+  getCustomField,
+  getOptionUsageCounts,
+  updateCustomField,
+} from "~/modules/custom-field/service.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { FIELD_TYPE_NAME } from "~/utils/custom-fields";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import { payload, error, getParams, parseData } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { assertUserCanCreateMoreCustomFields } from "~/utils/subscription.server";
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: data ? appendToMetaTitle(data.header.title) : "" },
+];
+
+export const handle = {
+  breadcrumb: () => <span>Edit</span>,
+};
+
+export async function loader({ context, request, params }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { fieldId: id } = getParams(params, z.object({ fieldId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const { organizationId, userOrganizations } = await requirePermission({
+      userId: authSession.userId,
+      request,
+      entity: PermissionEntity.customField,
+      action: PermissionAction.update,
+    });
+
+    const customField = await getCustomField({
+      organizationId,
+      id,
+      userOrganizations,
+      request,
+      include: { categories: { select: { id: true } } },
+    });
+
+    const [{ categories, totalCategories }, optionUsage] = await Promise.all([
+      getCategoriesForCreateAndEdit({
+        organizationId,
+        request,
+        defaultCategory: customField.categories.map((c) => c.id),
+      }),
+      customField.type === CustomFieldType.OPTION
+        ? getOptionUsageCounts({
+            customFieldId: customField.id,
+            organizationId,
+          })
+        : {},
+    ]);
+
+    const header: HeaderData = {
+      title: `Edit | ${customField.name}`,
+      subHeading: FIELD_TYPE_NAME[customField.type],
+    };
+
+    return payload({
+      customField,
+      header,
+      categories,
+      totalCategories,
+      optionUsage,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, id });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { fieldId: id } = getParams(params, z.object({ fieldId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const { organizationId, organizations } = await requirePermission({
+      userId: authSession.userId,
+      request,
+      entity: PermissionEntity.customField,
+      action: PermissionAction.update,
+    });
+
+    const parsedData = parseData(
+      await request.formData(),
+      CustomFieldSubmissionSchema
+    );
+
+    const {
+      name,
+      helpText,
+      active,
+      required,
+      options,
+      optionRenames,
+      categories,
+    } = parsedData;
+
+    const field = await getCustomField({ organizationId, id });
+
+    /**
+     * The submitted `type` is not used below: a field's type is immutable once it
+     * exists. So the schema's version of this rule, which can only see what was
+     * posted, is not enough here. Re-check against the type the field actually
+     * has, or a post claiming a different type would strip an OPTION field's
+     * options and leave a dropdown nobody can pick from.
+     */
+    if (optionFieldIsMissingOptions(field.type, options)) {
+      throw new ShelfError({
+        cause: null,
+        title: "Options required",
+        message: MISSING_OPTIONS_MESSAGE,
+        additionalData: { id, organizationId, userId: authSession.userId },
+        label: "Custom fields",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    /** If they are activating a field, we have to make sure that they are not already at the limit */
+    const isActivatingField = !field.active && active !== field.active;
+
+    if (isActivatingField) {
+      await assertUserCanCreateMoreCustomFields({
+        organizationId,
+        organizations,
+      });
+    }
+
+    await updateCustomField({
+      id,
+      name,
+      helpText,
+      active,
+      required,
+      options,
+      optionRenames,
+      categories,
+      organizationId,
+      userId,
+    });
+
+    sendNotification({
+      title: "Custom field updated",
+      message: "Your custom field  has been updated successfully",
+      icon: { name: "success", variant: "success" },
+      senderId: authSession.userId,
+    });
+
+    return payload(null);
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, id });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export default function CustomFieldEditPage() {
+  const name = useAtomValue(dynamicTitleAtom);
+  const hasName = name !== "";
+  const { customField, optionUsage } = useLoaderData<typeof loader>();
+
+  return (
+    <>
+      <Header
+        hideBreadcrumbs
+        title={hasName ? name : customField.name}
+        classNames="-mt-5"
+      />
+      <div className=" items-top flex justify-between">
+        {/* Keyed by the save time so a successful save restarts the form
+            from what was stored: the option builder's rows remember the
+            saved spelling each one came from. */}
+        <CustomFieldForm
+          key={String(customField.updatedAt)}
+          isEdit
+          name={customField.name || name}
+          helpText={customField.helpText}
+          required={customField.required}
+          type={customField.type}
+          active={customField.active}
+          options={customField.options}
+          optionUsage={optionUsage}
+          categories={customField.categories.map((c) => c.id)}
+        />
+      </div>
+    </>
+  );
+}

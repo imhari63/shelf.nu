@@ -1,0 +1,1015 @@
+import { ASSET_STATUS_LABELS } from "@shelf/labels";
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  View,
+  Text,
+  FlatList,
+  TextInput,
+  TouchableOpacity,
+  ActivityIndicator,
+  RefreshControl,
+  ScrollView,
+  Animated,
+} from "react-native";
+import * as Haptics from "expo-haptics";
+import { Image } from "expo-image";
+import { useRouter, useLocalSearchParams } from "expo-router";
+import { useFocusEffect, useScrollToTop } from "@react-navigation/native";
+import { Ionicons } from "@expo/vector-icons";
+import { api, type AssetListItem } from "@/lib/api";
+import { useOrg } from "@/lib/org-context";
+import { userHasPermission } from "@/lib/permissions";
+import {
+  formatStatus,
+  fontSize,
+  spacing,
+  borderRadius,
+  hitSlop,
+} from "@/lib/constants";
+import { useTheme } from "@/lib/theme-context";
+import { createStyles } from "@/lib/create-styles";
+import { ErrorBoundary } from "@/components/error-boundary";
+import { QuantityBadge } from "@/components/quantity-badge";
+import { AssetListSkeleton } from "@/components/skeleton-loader";
+import { useSwipeFilters } from "@/lib/use-swipe-filters";
+import { announce } from "@/lib/a11y";
+import { InventorySegment } from "@/components/kits/inventory-segment";
+import { isQuantityTracked, formatQuantity } from "@/lib/quantity-format";
+import { createLatestRequest } from "@/lib/latest-request";
+import { assetChangeVersion } from "@/lib/asset-refresh";
+import { listErrorView, planFocusRefresh } from "@/lib/asset-list-refresh";
+
+const PAGE_SIZE = 20;
+const keyExtractor = (item: AssetListItem) => item.id;
+
+/** Filter config — supports status filters and the special "My Custody" filter */
+type FilterConfig = { label: string; status: string; myCustody?: boolean };
+const FILTERS: FilterConfig[] = [
+  { label: "All", status: "" },
+  // why: sentence case ("My custody", not "My Custody") to sit consistently
+  // beside the @shelf/labels chips below, which are sentence case. This one has
+  // no package entry — it is not a status, it is a custodian filter.
+  { label: "My custody", status: "", myCustody: true },
+  // why: read from @shelf/labels, not hand-typed. The chips said "In Custody"
+  // and "Checked Out" while the badge on the very same row said "In custody"
+  // and "Checked out", because badges go through formatStatus and these did not.
+  { label: ASSET_STATUS_LABELS.AVAILABLE, status: "AVAILABLE" },
+  { label: ASSET_STATUS_LABELS.IN_CUSTODY, status: "IN_CUSTODY" },
+  { label: ASSET_STATUS_LABELS.CHECKED_OUT, status: "CHECKED_OUT" },
+];
+const MY_CUSTODY_INDEX = 1;
+
+export default function AssetsListScreen() {
+  return (
+    <ErrorBoundary screenName="Assets">
+      <AssetsListContent />
+    </ErrorBoundary>
+  );
+}
+
+function AssetsListContent() {
+  const router = useRouter();
+  const { myCustody: myCustodyParam } = useLocalSearchParams<{
+    myCustody?: string;
+  }>();
+  const {
+    currentOrg,
+    isLoading: orgLoading,
+    error: orgError,
+    refresh: refreshOrg,
+  } = useOrg();
+  // Server enforces asset:create; hide create affordances for roles
+  // (BASE/SELF_SERVICE) that would only get a 403.
+  const canCreate = userHasPermission({
+    roles: currentOrg?.roles,
+    entity: "asset",
+    action: "create",
+  });
+  const { colors, statusBadge } = useTheme();
+  const styles = useStyles();
+  const [assets, setAssets] = useState<AssetListItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [searchInput, setSearchInput] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [activeFilter, setActiveFilter] = useState(
+    myCustodyParam === "true" ? MY_CUSTODY_INDEX : 0
+  );
+  const [totalPages, setTotalPages] = useState(0);
+  const nextPage = useRef(1);
+  const latestRequest = useRef(createLatestRequest()).current;
+  const listRef = useRef<FlatList>(null);
+  useScrollToTop(listRef);
+
+  // Swipe-to-filter gesture (Instagram-style horizontal swipe between filters)
+  const {
+    panHandlers: swipePanHandlers,
+    animatedStyle: swipeAnimatedStyle,
+    syncIndex,
+  } = useSwipeFilters(FILTERS.length, (newIndex) => {
+    Haptics.selectionAsync();
+    setActiveFilter(newIndex);
+  });
+
+  // Keep swipe hook in sync + auto-scroll pills to keep active one visible
+  const filterScrollRef = useRef<ScrollView>(null);
+  useEffect(() => {
+    syncIndex(activeFilter);
+    // ~80px avg pill width — scroll to rough center of active pill
+    filterScrollRef.current?.scrollTo({
+      x: Math.max(0, activeFilter * 80 - 40),
+      animated: true,
+    });
+  }, [activeFilter, syncIndex]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(searchInput.trim()), 400);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
+  /** Requests one page of assets for the current search and filter. */
+  const requestPage = useCallback(
+    (orgId: string, pageNum: number, signal: AbortSignal) => {
+      const filter = FILTERS[activeFilter];
+      return api.assets(
+        orgId,
+        {
+          search: debouncedSearch || undefined,
+          page: pageNum,
+          perPage: PAGE_SIZE,
+          status: filter.status || undefined,
+          myCustody: filter.myCustody || undefined,
+        },
+        { signal }
+      );
+    },
+    [debouncedSearch, activeFilter]
+  );
+
+  /**
+   * Loads one page of assets for the current query.
+   *
+   * @returns true when the rows were applied; false when the request failed,
+   *   was aborted, or was superseded by a newer query.
+   */
+  const fetchAssets = useCallback(
+    async (
+      pageNum: number,
+      reset: boolean,
+      signal: AbortSignal
+    ): Promise<boolean> => {
+      if (!currentOrg) return false;
+      const { data, error: fetchErr } = await requestPage(
+        currentOrg.id,
+        pageNum,
+        signal
+      );
+      // Refused two ways. An abort answers with neither data nor error, and a
+      // response that landed before the abort but after this request was
+      // superseded still carries rows for a query the operator has moved past.
+      if (signal.aborted || (!data && !fetchErr)) return false;
+      if (fetchErr || !data) {
+        setError(fetchErr || "Failed to load assets");
+        return false;
+      }
+      setError(null);
+      setTotalPages(data.totalPages);
+      nextPage.current = pageNum + 1;
+      if (reset) setAssets(data.assets);
+      else
+        setAssets((prev) => {
+          const existingIds = new Set(prev.map((a) => a.id));
+          const newItems = data.assets.filter((a) => !existingIds.has(a.id));
+          return [...prev, ...newItems];
+        });
+      return true;
+    },
+    [currentOrg, requestPage]
+  );
+
+  /**
+   * Reloads pages 1 to `pageCount` together and replaces the rows only when
+   * every page answers, so the list keeps its depth and never mixes old and
+   * new pages.
+   *
+   * @returns true when the rows were applied; false when any page failed,
+   *   or the request was aborted or superseded.
+   */
+  const reloadLoadedPages = useCallback(
+    async (pageCount: number, signal: AbortSignal): Promise<boolean> => {
+      if (!currentOrg) return false;
+      const orgId = currentOrg.id;
+      const answers = await Promise.all(
+        Array.from({ length: pageCount }, (_, i) =>
+          requestPage(orgId, i + 1, signal)
+        )
+      );
+      if (signal.aborted) return false;
+      const failed = answers.find((answer) => !answer.data);
+      if (failed) {
+        // An answer with neither data nor error was aborted mid-flight.
+        if (failed.error) setError(failed.error);
+        return false;
+      }
+      const seen = new Set<string>();
+      const rows: AssetListItem[] = [];
+      for (const answer of answers) {
+        for (const row of answer.data?.assets ?? []) {
+          // Rows can shift between pages while they load; keep the first.
+          if (seen.has(row.id)) continue;
+          seen.add(row.id);
+          rows.push(row);
+        }
+      }
+      setError(null);
+      setTotalPages(answers[answers.length - 1].data?.totalPages ?? 0);
+      nextPage.current = pageCount + 1;
+      setAssets(rows);
+      return true;
+    },
+    [currentOrg, requestPage]
+  );
+
+  // Track whether we've done the initial load so we can skip the skeleton
+  // on subsequent tab-focus revisits (stale-while-revalidate pattern)
+  const hasFetchedAssets = useRef(false);
+  const lastFetchedAt = useRef(0);
+
+  // Reset cache when org changes so useFocusEffect refetches
+  useEffect(() => {
+    // An answer about the workspace being left must not land afterwards and
+    // refill the list with another workspace's assets.
+    latestRequest.cancel();
+    lastFetchedAt.current = 0;
+    hasFetchedAssets.current = false;
+    setAssets([]);
+    setError(null);
+    nextPage.current = 1;
+  }, [currentOrg?.id, latestRequest]);
+
+  // Refresh on search/filter change — resets the stale timer so useFocusEffect picks it up
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    if (!currentOrg) return;
+    setIsLoading(true);
+    nextPage.current = 1;
+    lastFetchedAt.current = 0; // force fresh fetch
+    const signal = latestRequest.beginReset();
+    let applied = false;
+    fetchAssets(1, true, signal)
+      .then((ok) => {
+        applied = ok;
+      })
+      .finally(() => {
+        latestRequest.endReset(signal);
+        // The signal identifies this request. An abandoned one must not stamp
+        // freshness or clear the spinner: the request that replaced it is still
+        // running and will do both when it answers.
+        if (signal.aborted) return;
+        setIsLoading(false);
+        if (applied) {
+          lastFetchedAt.current = Date.now();
+          return;
+        }
+        // The rows on screen answer the previous search or filter. Clearing
+        // them shows the error view instead of passing them off as results
+        // for the new query; the list stays unfresh, so the next focus retries.
+        setAssets([]);
+        nextPage.current = 1;
+      });
+    // why: search/filter changes intentionally re-fetch; fetchAssets and currentOrg are
+    // captured stably via useOrg context so we do not want them in deps (would cause loops)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch, activeFilter]);
+
+  // The asset-change version the list reflects (see lib/asset-refresh.ts):
+  // an asset edited elsewhere bypasses the freshness gate below.
+  const seenChangeVersion = useRef(assetChangeVersion());
+
+  // Refresh on tab focus. The rules (skip fresh rows, keep the scroll depth
+  // after an edit elsewhere) live in lib/asset-list-refresh.ts.
+  useFocusEffect(
+    useCallback(() => {
+      if (!currentOrg) return;
+      // Recorded as seen only once fresh rows land, so a failed refetch
+      // after an edit is retried on the next focus.
+      const changeVersion = assetChangeVersion();
+      const loadedPages = nextPage.current - 1;
+      const plan = planFocusRefresh({
+        hasFetched: hasFetchedAssets.current,
+        ageMs: Date.now() - lastFetchedAt.current,
+        assetChanged: changeVersion !== seenChangeVersion.current,
+        loadedPages,
+      });
+      if (plan === "skip") return;
+      if (!hasFetchedAssets.current) {
+        setIsLoading(true);
+      }
+      if (plan === "reset") nextPage.current = 1;
+      const isFirstLoad = !hasFetchedAssets.current;
+      const signal = latestRequest.beginReset();
+      let applied = false;
+      const load =
+        plan === "reload-loaded"
+          ? reloadLoadedPages(loadedPages, signal)
+          : fetchAssets(1, true, signal);
+      load
+        .then((ok) => {
+          applied = ok;
+        })
+        .finally(() => {
+          latestRequest.endReset(signal);
+          // The signal identifies this request. An abandoned one must not stamp
+          // freshness or clear the spinner: the request that replaced it is still
+          // running and will do both when it answers.
+          if (signal.aborted) return;
+          setIsLoading(false);
+          // A failed load leaves the list unfresh, so the next focus retries.
+          if (applied) {
+            lastFetchedAt.current = Date.now();
+            seenChangeVersion.current = changeVersion;
+          }
+          if (isFirstLoad) {
+            hasFetchedAssets.current = true;
+            setAssets((current) => {
+              announce(
+                current.length === 0
+                  ? "No assets found"
+                  : current.length + " assets loaded"
+              );
+              return current;
+            });
+          }
+        });
+      // why: depend on org id (not full object) to avoid re-runs on identity-only changes
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentOrg?.id, fetchAssets, reloadLoadedPages, latestRequest])
+  );
+
+  const onRefresh = async () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setIsRefreshing(true);
+    nextPage.current = 1;
+    const signal = latestRequest.beginReset();
+    await fetchAssets(1, true, signal);
+    latestRequest.endReset(signal);
+    // The operator pulled this spinner, so it stops either way.
+    setIsRefreshing(false);
+    // The shared skeleton belongs to whichever request is still current. A
+    // newer one is mid-flight and will clear it when it answers; clearing it
+    // here would show the empty state until then. Nothing supersedes the
+    // newest request, so it is always the one that gets here unaborted.
+    if (!signal.aborted) {
+      setIsLoading(false);
+      announce("Content refreshed");
+    }
+  };
+
+  const onEndReached = async () => {
+    if (isLoadingMore || nextPage.current > totalPages) return;
+    // The rows on screen are about to be replaced, so there is nothing
+    // meaningful to add a page to. Claiming the slot here would also abandon
+    // that reset and leave both queries' rows on screen together.
+    if (latestRequest.isResetPending()) return;
+    setIsLoadingMore(true);
+    const signal = latestRequest.begin();
+    await fetchAssets(nextPage.current, false, signal);
+    setIsLoadingMore(false);
+    if (!signal.aborted) setIsLoading(false);
+  };
+
+  const renderAsset = useCallback(
+    ({ item }: { item: AssetListItem }) => {
+      const badge = statusBadge[item.status] ?? {
+        bg: colors.backgroundTertiary,
+        text: colors.muted,
+      };
+
+      // Quantity indicator (additive) — only for QUANTITY_TRACKED assets that
+      // actually carry a quantity. INDIVIDUAL assets and pre-quantity servers
+      // resolve to null here, so the row renders exactly as before.
+      const quantityLabel = isQuantityTracked(item)
+        ? formatQuantity(item.quantity, item.unitOfMeasure)
+        : null;
+
+      // Memberships beyond the one the row names. `item.kit` is the primary
+      // kit of possibly several — a quantity-tracked asset can sit in more
+      // than one — so without this the row passes it off as the only one. A
+      // server that sends no `kitCount` knows of no others, hence the 1.
+      const knownKitCount = item.kitCount ?? (item.kit ? 1 : 0);
+      const extraKitCount = Math.max(0, knownKitCount - 1);
+      // The count reaches a screen reader as words, so it carries the same
+      // fact the "+N" beside the name gives a sighted user.
+      const kitSuffix =
+        extraKitCount > 0
+          ? ` and ${extraKitCount} more kit${extraKitCount === 1 ? "" : "s"}`
+          : "";
+      const kitAccessibilityLabel = item.kit
+        ? `, kit ${item.kit.name}${kitSuffix}`
+        : "";
+      // The server resolves WHICH identifier this workspace shows; the SAM id
+      // is the fallback for servers that predate that.
+      const rowCode = item.displayCode?.value
+        ? item.displayCode
+        : item.sequentialId
+        ? { value: item.sequentialId, label: "SAM ID" }
+        : null;
+
+      return (
+        <TouchableOpacity
+          style={styles.assetCard}
+          onPress={() => router.push(`/(tabs)/assets/${item.id}`)}
+          activeOpacity={0.6}
+          accessibilityLabel={`${item.title}, ${formatStatus(item.status)}${
+            rowCode ? `, ${rowCode.label} ${rowCode.value}` : ""
+          }${quantityLabel ? `, quantity ${quantityLabel}` : ""}${
+            item.category ? `, ${item.category.name}` : ""
+          }${
+            item.location ? `, ${item.location.name}` : ""
+          }${kitAccessibilityLabel}`}
+          accessibilityRole="button"
+        >
+          {item.thumbnailImage || item.mainImage ? (
+            <Image
+              source={{ uri: item.thumbnailImage || item.mainImage! }}
+              style={styles.assetImage}
+              contentFit="cover"
+            />
+          ) : (
+            <View style={[styles.assetImage, styles.assetImagePlaceholder]}>
+              <Ionicons name="cube-outline" size={22} color={colors.gray300} />
+            </View>
+          )}
+
+          <View style={styles.assetInfo}>
+            <Text style={styles.assetTitle} numberOfLines={1}>
+              {item.title}
+            </Text>
+            <View style={styles.assetMeta}>
+              {/* The identifier the workspace labels its assets with, so a row
+                  can be matched against a physical label without opening it.
+                  Falls back to the SAM ID on older servers that send no
+                  resolved code. */}
+              {rowCode ? (
+                <Text style={styles.assetSequentialId} numberOfLines={1}>
+                  {rowCode.value}
+                </Text>
+              ) : null}
+              {item.category && (
+                <Text style={styles.assetCategory} numberOfLines={1}>
+                  {item.category.name}
+                </Text>
+              )}
+              {item.location && (
+                <View style={styles.locationRow}>
+                  <Ionicons
+                    name="location-outline"
+                    size={11}
+                    color={colors.mutedLight}
+                  />
+                  <Text style={styles.assetLocation} numberOfLines={1}>
+                    {item.location.name}
+                  </Text>
+                </View>
+              )}
+              {/* Which kit to look in. A quantity-tracked asset can belong
+                  to several kits at once, so the row names the primary one —
+                  the same one the website names — and counts the rest rather
+                  than passing it off as the only kit. */}
+              {item.kit && (
+                <View style={styles.locationRow}>
+                  <Ionicons
+                    name="albums-outline"
+                    size={11}
+                    color={colors.mutedLight}
+                  />
+                  <Text
+                    style={[styles.assetLocation, styles.assetKitName]}
+                    numberOfLines={1}
+                  >
+                    {item.kit.name}
+                  </Text>
+                  {extraKitCount > 0 && (
+                    <Text style={styles.assetKitOverflow}>
+                      +{extraKitCount}
+                    </Text>
+                  )}
+                </View>
+              )}
+              {/* Quantity chip — shared QuantityBadge (QUANTITY_TRACKED only).
+                  The number here is workspace stock. */}
+              {quantityLabel && (
+                <QuantityBadge
+                  value={item.quantity}
+                  unitOfMeasure={item.unitOfMeasure}
+                />
+              )}
+            </View>
+          </View>
+
+          <View style={[styles.statusBadge, { backgroundColor: badge.bg }]}>
+            <View style={[styles.statusDot, { backgroundColor: badge.text }]} />
+            <Text style={[styles.statusText, { color: badge.text }]}>
+              {formatStatus(item.status)}
+            </Text>
+          </View>
+        </TouchableOpacity>
+      );
+    },
+    [router, colors, statusBadge, styles]
+  );
+
+  if (orgLoading) {
+    return (
+      <View style={styles.centered}>
+        <ActivityIndicator
+          size="large"
+          color={colors.muted}
+          accessibilityLabel="Loading assets"
+        />
+      </View>
+    );
+  }
+
+  if (orgError) {
+    return (
+      <View style={styles.centered}>
+        <Ionicons
+          name="cloud-offline-outline"
+          size={48}
+          color={colors.mutedLight}
+        />
+        <Text style={styles.emptyText}>{orgError}</Text>
+        <TouchableOpacity
+          style={styles.retryButton}
+          onPress={() => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+            refreshOrg();
+          }}
+          activeOpacity={0.7}
+          accessibilityLabel="Retry loading"
+          accessibilityRole="button"
+        >
+          <Ionicons name="refresh" size={16} color={colors.primaryForeground} />
+          <Text style={styles.retryText}>Retry</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const errorView = listErrorView(error, assets.length);
+
+  return (
+    <View style={styles.container}>
+      {/* Assets | Kits switcher */}
+      <InventorySegment active="assets" />
+
+      {/* Search bar */}
+      <View style={styles.searchContainer}>
+        <Ionicons name="search" size={16} color={colors.mutedLight} />
+        <TextInput
+          style={styles.searchInput}
+          value={searchInput}
+          onChangeText={setSearchInput}
+          placeholder="Search assets..."
+          placeholderTextColor={colors.placeholderText}
+          returnKeyType="search"
+          autoCorrect={false}
+          accessibilityLabel="Search assets"
+        />
+        {searchInput.trim() !== debouncedSearch && searchInput.length > 0 && (
+          <ActivityIndicator size="small" color={colors.mutedLight} />
+        )}
+        {searchInput.length > 0 && (
+          <TouchableOpacity
+            onPress={() => setSearchInput("")}
+            hitSlop={hitSlop.md}
+            accessibilityLabel="Clear search"
+            accessibilityRole="button"
+          >
+            <Ionicons name="close-circle" size={16} color={colors.mutedLight} />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {/* Filter pills — auto-scrolls to keep active pill visible during swipe */}
+      <ScrollView
+        ref={filterScrollRef}
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.filterScroll}
+        contentContainerStyle={styles.filterRow}
+        accessibilityRole="tablist"
+      >
+        {FILTERS.map((f, i) => (
+          <TouchableOpacity
+            key={f.myCustody ? "myCustody" : f.status || "all"}
+            style={[
+              styles.filterPill,
+              activeFilter === i && styles.filterPillActive,
+            ]}
+            onPress={() => {
+              Haptics.selectionAsync();
+              setActiveFilter(i);
+            }}
+            hitSlop={hitSlop.sm}
+            accessibilityLabel={`Filter: ${f.label}`}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: activeFilter === i }}
+          >
+            <Text
+              style={[
+                styles.filterPillText,
+                activeFilter === i && styles.filterPillTextActive,
+              ]}
+            >
+              {f.label}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+
+      {/* Swipeable content area — swipe left/right to cycle filter pills */}
+      <View style={styles.flexFill} {...swipePanHandlers}>
+        <Animated.View style={[styles.flexFill, swipeAnimatedStyle]}>
+          {/* A failed refresh or load-more keeps rows already on screen and
+              shows the error as a banner above them; the error view is for a
+              list that has nothing to show. */}
+          {errorView === "screen" ? (
+            <View style={styles.centered}>
+              <Ionicons
+                name="alert-circle-outline"
+                size={48}
+                color={colors.error}
+              />
+              <Text style={styles.emptyText}>{error}</Text>
+              <TouchableOpacity
+                style={styles.retryButton}
+                onPress={onRefresh}
+                accessibilityLabel="Retry loading assets"
+                accessibilityRole="button"
+              >
+                <Text style={styles.retryText}>Retry</Text>
+              </TouchableOpacity>
+            </View>
+          ) : isLoading && assets.length === 0 ? (
+            <AssetListSkeleton />
+          ) : assets.length === 0 ? (
+            <View style={styles.centered}>
+              <Ionicons name="cube-outline" size={48} color={colors.border} />
+              <Text style={styles.emptyTitle}>
+                {debouncedSearch
+                  ? "No results found"
+                  : // why: the custodian filter needs its own sentence — running
+                  // its label through the status template yields "No my custody
+                  // assets". The kits list already branches this way.
+                  FILTERS[activeFilter].myCustody
+                  ? "No assets in your custody"
+                  : activeFilter > 0
+                  ? `No ${FILTERS[activeFilter].label.toLowerCase()} assets`
+                  : "No assets yet"}
+              </Text>
+              <Text style={styles.emptyText}>
+                {debouncedSearch
+                  ? "Try a different search term or clear filters"
+                  : activeFilter > 0
+                  ? "Try selecting a different status filter"
+                  : "Create your first asset to start tracking"}
+              </Text>
+              {!debouncedSearch && activeFilter === 0 && canCreate && (
+                <TouchableOpacity
+                  style={styles.emptyAction}
+                  onPress={() => router.push("/(tabs)/assets/new")}
+                >
+                  <Ionicons
+                    name="add-circle-outline"
+                    size={18}
+                    color={colors.primaryForeground}
+                  />
+                  <Text style={styles.emptyActionText}>Create Asset</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          ) : (
+            <FlatList
+              ref={listRef}
+              data={assets}
+              renderItem={renderAsset}
+              keyExtractor={keyExtractor}
+              contentContainerStyle={styles.list}
+              keyboardDismissMode="on-drag"
+              removeClippedSubviews
+              maxToRenderPerBatch={10}
+              windowSize={5}
+              initialNumToRender={10}
+              refreshControl={
+                <RefreshControl
+                  refreshing={isRefreshing}
+                  onRefresh={onRefresh}
+                  tintColor={colors.muted}
+                  accessibilityLabel="Pull to refresh"
+                />
+              }
+              onEndReached={onEndReached}
+              onEndReachedThreshold={0.5}
+              ListHeaderComponent={
+                errorView === "banner" ? (
+                  <View
+                    style={styles.errorBanner}
+                    accessibilityRole="alert"
+                    accessibilityLiveRegion="polite"
+                  >
+                    <Ionicons
+                      name="alert-circle-outline"
+                      size={18}
+                      color={colors.error}
+                    />
+                    <Text style={styles.errorBannerText}>{error}</Text>
+                    <TouchableOpacity
+                      onPress={onRefresh}
+                      hitSlop={hitSlop.md}
+                      accessibilityLabel="Retry loading assets"
+                      accessibilityRole="button"
+                    >
+                      <Text style={styles.errorBannerRetry}>Retry</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : null
+              }
+              ListFooterComponent={
+                isLoadingMore ? (
+                  <ActivityIndicator
+                    style={styles.footer}
+                    color={colors.muted}
+                    accessibilityLabel="Loading more assets"
+                  />
+                ) : null
+              }
+            />
+          )}
+        </Animated.View>
+      </View>
+
+      {/* FAB — Quick Asset Create */}
+      {canCreate && (
+        <TouchableOpacity
+          style={styles.fab}
+          onPress={() => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+            router.push("/(tabs)/assets/new");
+          }}
+          activeOpacity={0.85}
+          accessibilityLabel="Create new asset"
+          accessibilityRole="button"
+        >
+          <Ionicons name="add" size={28} color={colors.primaryForeground} />
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+}
+
+const useStyles = createStyles((colors, shadows) => ({
+  flexFill: {
+    flex: 1,
+  },
+  container: {
+    flex: 1,
+    backgroundColor: colors.backgroundSecondary,
+  },
+  centered: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+
+  // Search
+  searchContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.white,
+    marginHorizontal: spacing.lg,
+    marginTop: spacing.xs,
+    marginBottom: spacing.sm,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: borderRadius.sm,
+    borderWidth: 1,
+    borderColor: colors.gray300,
+    gap: spacing.sm,
+    ...shadows.sm,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: fontSize.lg,
+    color: colors.foreground,
+  },
+
+  // Filter pills
+  filterScroll: {
+    flexGrow: 0,
+  },
+  filterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    gap: spacing.sm,
+  },
+  filterPill: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 16,
+    height: 34,
+    borderRadius: borderRadius.pill,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  filterPillActive: {
+    backgroundColor: colors.filterPillActiveBg,
+    borderColor: colors.filterPillActiveBg,
+  },
+  filterPillText: {
+    fontSize: fontSize.sm,
+    fontWeight: "500",
+    color: colors.muted,
+  },
+  filterPillTextActive: {
+    color: colors.filterPillActiveText,
+  },
+
+  // List
+  list: {
+    paddingHorizontal: spacing.lg,
+    paddingBottom: 100, // extra space to prevent FAB overlapping last items
+  },
+  assetCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.white,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: spacing.md,
+  },
+  assetImage: {
+    width: 44,
+    height: 44,
+    borderRadius: borderRadius.sm,
+  },
+  assetImagePlaceholder: {
+    backgroundColor: colors.backgroundTertiary,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  assetInfo: {
+    flex: 1,
+    gap: 3,
+  },
+  assetTitle: {
+    fontSize: fontSize.base,
+    fontWeight: "600",
+    color: colors.foreground,
+  },
+  assetMeta: {
+    gap: 2,
+  },
+  assetCategory: {
+    fontSize: fontSize.sm,
+    color: colors.muted,
+  },
+  locationRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 2,
+  },
+  assetLocation: {
+    fontSize: fontSize.xs,
+    color: colors.mutedLight,
+  },
+  // Only the kit name shrinks: it shares its row with the "+N" count, which
+  // must stay legible even when the name is long enough to truncate.
+  assetKitName: {
+    flexShrink: 1,
+  },
+  assetKitOverflow: {
+    fontSize: fontSize.xs,
+    color: colors.mutedLight,
+    flexShrink: 0,
+  },
+  assetSequentialId: {
+    fontSize: fontSize.xs,
+    color: colors.mutedLight,
+    // Tabular so a column of SAM ids lines up while scanning the list.
+    fontVariant: ["tabular-nums"],
+  },
+
+  // Status badge — pill shape like webapp
+  statusBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: borderRadius.pill,
+    gap: 4,
+  },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  statusText: {
+    fontSize: fontSize.xs,
+    fontWeight: "500",
+  },
+
+  // Empty / error states
+  emptyTitle: {
+    fontSize: fontSize.lg,
+    fontWeight: "600",
+    color: colors.foreground,
+    textAlign: "center",
+  },
+  emptyText: {
+    fontSize: fontSize.base,
+    color: colors.muted,
+    textAlign: "center",
+    paddingHorizontal: spacing.xxxl,
+  },
+  emptyAction: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.primary,
+    paddingHorizontal: spacing.xl,
+    paddingVertical: 10,
+    borderRadius: borderRadius.md,
+    marginTop: spacing.xs,
+    gap: spacing.sm,
+  },
+  emptyActionText: {
+    color: colors.primaryForeground,
+    fontWeight: "600",
+    fontSize: fontSize.base,
+  },
+  retryButton: {
+    backgroundColor: colors.primary,
+    paddingHorizontal: spacing.xxl,
+    paddingVertical: 10,
+    borderRadius: borderRadius.md,
+    marginTop: spacing.sm,
+  },
+  retryText: {
+    color: colors.primaryForeground,
+    fontWeight: "600",
+    fontSize: fontSize.base,
+  },
+  footer: {
+    paddingVertical: spacing.lg,
+  },
+  errorBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginBottom: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: colors.error,
+    backgroundColor: colors.white,
+  },
+  errorBannerText: {
+    flex: 1,
+    fontSize: fontSize.sm,
+    color: colors.foreground,
+  },
+  errorBannerRetry: {
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.primary,
+  },
+
+  // FAB
+  fab: {
+    position: "absolute",
+    bottom: 24,
+    right: 20,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: colors.primary,
+    justifyContent: "center",
+    alignItems: "center",
+    ...shadows.md,
+  },
+}));

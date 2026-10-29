@@ -1,0 +1,917 @@
+import type { ITXClientDenyList } from "@prisma/client/runtime/library";
+import type { ExtendedPrismaClient } from "~/database/db.server";
+import { stripMarkdocDelimiters } from "~/utils/markdoc-sanitize";
+import {
+  wrapAssetsWithDataForNote,
+  wrapUserLinkForNote,
+} from "~/utils/markdoc-wrappers";
+import type { UserNameFields } from "~/utils/user";
+import { buildAuditImagesNoteContent } from "./note-content.server";
+
+/**
+ * Creates an automatic note when an audit is created.
+ * This note records who created the audit and how many assets are expected.
+ */
+export async function createAuditCreationNote({
+  auditSessionId,
+  createdById,
+  expectedAssetCount,
+  tx,
+}: {
+  auditSessionId: string;
+  createdById: string;
+  expectedAssetCount: number;
+  tx: any; // Prisma transaction client
+}) {
+  const creator = await tx.user.findUnique({
+    where: { id: createdById },
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      displayName: true,
+    },
+  });
+
+  if (!creator) {
+    return; // Skip note creation if user not found
+  }
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: creator.id,
+      type: "UPDATE",
+      content: `${wrapUserLinkForNote({
+        ...creator,
+      })} created audit with **${expectedAssetCount}** expected asset${
+        expectedAssetCount === 1 ? "" : "s"
+      }.`,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when an asset is scanned during an audit.
+ * This note records who scanned the asset and whether it was expected or unexpected.
+ */
+export async function createAssetScanNote({
+  auditSessionId,
+  assetId,
+  organizationId,
+  userId,
+  isExpected,
+  tx,
+  prefetchedUser,
+}: {
+  auditSessionId: string;
+  assetId: string;
+  /** Caller's organization — scopes the asset lookup to prevent cross-org IDOR */
+  organizationId: string;
+  userId: string;
+  isExpected: boolean;
+  tx: any; // Prisma transaction client
+  prefetchedUser?: (UserNameFields & { id: string }) | null;
+}) {
+  // why: the asset is ALWAYS fetched org-scoped here (no prefetch shortcut) so
+  // a caller that prefetched an asset without org scoping cannot feed a
+  // foreign-org asset through this note path (cross-org IDOR). The user is not
+  // org-scoped data for this note, so prefetchedUser remains a safe shortcut.
+  const [asset, scanner] = await Promise.all([
+    tx.asset.findFirst({
+      // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: title lookup for an audit note; an archived asset in the audit must still be named
+      where: { id: assetId, organizationId },
+      select: { id: true, title: true },
+    }),
+    prefetchedUser ??
+      tx.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          displayName: true,
+        },
+      }),
+  ]);
+
+  if (!asset || !scanner) {
+    return; // Skip note creation if asset or user not found
+  }
+
+  const assetStatus = isExpected ? "expected" : "unexpected";
+  const assetLink = wrapAssetsWithDataForNote(asset, "scanned");
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: scanner.id,
+      type: "UPDATE",
+      content: `${wrapUserLinkForNote({
+        ...scanner,
+      })} scanned ${assetStatus} asset ${assetLink}.`,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when a scanned asset is removed from an audit.
+ */
+export async function createAssetScanRemovedNote({
+  auditSessionId,
+  assetId,
+  organizationId,
+  userId,
+  tx,
+}: {
+  auditSessionId: string;
+  assetId: string;
+  /** Caller's organization — scopes the asset lookup to prevent cross-org IDOR */
+  organizationId: string;
+  userId: string;
+  tx: any; // Prisma transaction client
+}) {
+  const [asset, remover] = await Promise.all([
+    tx.asset.findFirst({
+      // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: title lookup for an audit note; an archived asset in the audit must still be named
+      where: { id: assetId, organizationId },
+      select: { id: true, title: true },
+    }),
+    tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+  ]);
+
+  if (!asset || !remover) {
+    return; // Skip note creation if asset or user not found
+  }
+
+  const assetLink = wrapAssetsWithDataForNote(asset, "removed");
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: remover.id,
+      type: "UPDATE",
+      content: `${wrapUserLinkForNote({
+        ...remover,
+      })} removed scanned asset ${assetLink}.`,
+    },
+  });
+}
+
+/** The actor fields a lifecycle note needs, when fetched outside the transaction. */
+type PrefetchedNoteActor = (UserNameFields & { id: string }) | null;
+
+/**
+ * Writes one audit-lifecycle UPDATE note attributed to the acting user.
+ *
+ * Shared by the start / resume wrappers below: they differ only in the sentence
+ * that follows the user link, so the user lookup, the missing-user early return
+ * and the note write live here once.
+ *
+ * @param auditSessionId - The audit the note belongs to
+ * @param userId - The user who performed the action
+ * @param sentence - Predicate appended after the user link, e.g. "started the audit."
+ * @param tx - Prisma transaction client, so the note commits with the status change
+ * @param prefetchedUser - Optional actor fetched outside the transaction
+ */
+async function createAuditLifecycleNote({
+  auditSessionId,
+  userId,
+  sentence,
+  tx,
+  prefetchedUser,
+}: {
+  auditSessionId: string;
+  userId: string;
+  sentence: string;
+  // why: narrowed to the transaction-client shape (mirrors the precedent in
+  // modules/user/service.server.ts) rather than the `tx: any` this file's older
+  // exports use. The exported wrappers keep `any` to match their siblings;
+  // migrating all of them is a file-wide change, not this one's business.
+  tx: Omit<ExtendedPrismaClient, ITXClientDenyList>;
+  prefetchedUser?: PrefetchedNoteActor;
+}) {
+  // Use pre-fetched data if available, otherwise fetch inside the transaction
+  const actor =
+    prefetchedUser ??
+    (await tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }));
+
+  if (!actor) {
+    return; // Skip note creation if user not found
+  }
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: actor.id,
+      type: "UPDATE",
+      content: `${wrapUserLinkForNote({
+        ...actor,
+      })} ${sentence}`,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when an audit is started (activated from PENDING status).
+ * This note records who performed the first scan that activated the audit.
+ */
+export async function createAuditStartedNote({
+  auditSessionId,
+  userId,
+  tx,
+  prefetchedUser,
+}: {
+  auditSessionId: string;
+  userId: string;
+  tx: any; // Prisma transaction client
+  prefetchedUser?: PrefetchedNoteActor;
+}) {
+  await createAuditLifecycleNote({
+    auditSessionId,
+    userId,
+    sentence: "started the audit.",
+    tx,
+    prefetchedUser,
+  });
+}
+
+/**
+ * Creates an automatic note when a previously-started audit is brought back to
+ * ACTIVE by a scan.
+ *
+ * Distinct from {@link createAuditStartedNote}: the audit already has a
+ * `startedAt` and that moment is never rewritten, so the feed must say the
+ * audit was resumed rather than claim a second start.
+ *
+ * @param auditSessionId - The audit being resumed
+ * @param userId - The user whose scan resumed it
+ * @param tx - Prisma transaction client, so the note commits with the status change
+ * @param prefetchedUser - Optional user record fetched outside the transaction
+ */
+export async function createAuditResumedNote({
+  auditSessionId,
+  userId,
+  tx,
+  prefetchedUser,
+}: {
+  auditSessionId: string;
+  userId: string;
+  tx: any; // Prisma transaction client
+  prefetchedUser?: PrefetchedNoteActor;
+}) {
+  await createAuditLifecycleNote({
+    auditSessionId,
+    userId,
+    sentence: "resumed the audit.",
+    tx,
+    prefetchedUser,
+  });
+}
+
+/**
+ * Creates a COMMENT note when an audit is completed.
+ * The note includes completion stats, receipt link, and any user-provided note/images.
+ * Using COMMENT type for better layout (header with user info, content below without indentation).
+ */
+export async function createAuditCompletedNote({
+  auditSessionId,
+  userId,
+  expectedCount,
+  foundCount,
+  missingCount,
+  unexpectedCount,
+  completionNote,
+  tx,
+}: {
+  auditSessionId: string;
+  userId: string;
+  expectedCount: number;
+  foundCount: number;
+  missingCount: number;
+  unexpectedCount: number;
+  completionNote?: string | null;
+  tx: any; // Prisma transaction client
+}) {
+  const completer = await tx.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      displayName: true,
+    },
+  });
+
+  if (!completer) {
+    return; // Skip note creation if user not found
+  }
+
+  // Calculate completion percentage
+  const percentage =
+    expectedCount > 0 ? Math.round((foundCount / expectedCount) * 100) : 0;
+
+  // Build the note content starting with completion stats
+  let content = `Audit completed. Found **${foundCount}/${expectedCount}** expected assets (**${percentage}%**), **${missingCount}** missing, **${unexpectedCount}** unexpected. [View receipt](/audits/${auditSessionId}/overview?receipt=1)`;
+
+  // Append user's completion note if provided. The note is untrusted text
+  // spliced into a body the feed renders through Markdoc, so its delimiters
+  // are stripped before it becomes literal blockquote content — otherwise a
+  // completer could forge the `{% audit_images %}` tag appended below and
+  // pull evidence from an audit they are not on.
+  if (completionNote && completionNote.trim()) {
+    const safeCompletionNote = stripMarkdocDelimiters(completionNote.trim());
+    content += `\n\n**Completion note:**\n\n> ${safeCompletionNote.replace(
+      /\n/g,
+      "\n> "
+    )}`;
+  }
+
+  // Fetch and append audit images if any were uploaded during completion
+  const auditImages = await tx.auditImage.findMany({
+    where: {
+      auditSessionId,
+      auditAssetId: null, // Only general audit images, not asset-specific
+    },
+    select: { id: true },
+    orderBy: { createdAt: "asc" },
+  });
+
+  if (auditImages.length > 0) {
+    const imageIds = auditImages.map((img: { id: string }) => img.id).join(",");
+    content += `\n\n{% audit_images count=${auditImages.length} ids="${imageIds}" /%}`;
+  }
+
+  // Create a single COMMENT note for better layout
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: completer.id,
+      type: "COMMENT",
+      content,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when audit details are updated.
+ * Tracks changes to name and/or description.
+ */
+export async function createAuditUpdateNote({
+  auditSessionId,
+  userId,
+  changes,
+  tx,
+}: {
+  auditSessionId: string;
+  userId: string;
+  changes: Array<{ field: string; from: string; to: string }>;
+  tx: any; // Prisma transaction client
+}) {
+  const updater = await tx.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      displayName: true,
+    },
+  });
+
+  if (!updater || changes.length === 0) {
+    return; // Skip note creation if user not found or no changes
+  }
+
+  // Build the content describing the changes
+  const changeDescriptions = changes.map((change) => {
+    const fieldLabel = change.field === "name" ? "audit name" : change.field;
+    // `from`/`to` are user-supplied values (the audit name, for one) rendered
+    // as literal text in a Markdoc note.
+    return `- **${fieldLabel}**: "${stripMarkdocDelimiters(
+      String(change.from ?? "")
+    )}" → "${stripMarkdocDelimiters(String(change.to ?? ""))}"`;
+  });
+
+  const content = `${wrapUserLinkForNote({
+    ...updater,
+  })} updated audit details:\n\n${changeDescriptions.join("\n\n")}`;
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: updater.id,
+      type: "UPDATE",
+      content,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when images are added to a specific audit asset.
+ * This note includes an embedded preview of the uploaded images.
+ */
+export async function createAuditAssetImagesAddedNote({
+  auditSessionId,
+  auditAssetId,
+  userId,
+  imageIds,
+  tx,
+}: {
+  auditSessionId: string;
+  auditAssetId: string;
+  userId: string;
+  imageIds: string[];
+  tx: any; // Prisma transaction client
+}) {
+  const [uploader, asset] = await Promise.all([
+    tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+    // SECURITY (cross-audit IDOR): scoped to the session the note is being
+    // written for. `auditSessionId` was already a parameter here and simply
+    // went unused, so an id-only lookup matched any `AuditAsset` in the table
+    // — including another organization's, since `AuditAsset` inherits its
+    // tenant through `auditSession` and carries no `organizationId` of its
+    // own. The result was a note in one audit naming an asset from another,
+    // which then flows into the PDF report. (detail.dev D050)
+    tx.auditAsset.findFirst({
+      where: { id: auditAssetId, auditSessionId },
+      include: {
+        asset: {
+          select: { id: true, title: true },
+        },
+      },
+    }),
+  ]);
+
+  if (!uploader || !asset) {
+    return; // Skip note creation if user or asset not found
+  }
+
+  const imageCount = imageIds.length;
+  const imageWord = imageCount === 1 ? "image" : "images";
+
+  // Build content with image preview
+  let content = `${wrapUserLinkForNote({
+    ...uploader,
+  })} added ${imageCount} ${imageWord} to ${wrapAssetsWithDataForNote(
+    asset.asset
+  )}.`;
+
+  // Add the audit_images tag for rendering
+  const imageIdsStr = imageIds.join(",");
+  content += `\n\n{% audit_images count=${imageCount} ids="${imageIdsStr}" /%}`;
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      auditAssetId, // Associate with specific asset
+      userId: uploader.id,
+      type: "UPDATE",
+      content,
+    },
+  });
+}
+
+/**
+ * Records the evidence note that accompanies an image upload on a scanned
+ * asset, in the caller's transaction. Single source of truth shared by the
+ * webapp scan route and the mobile companion image route.
+ *
+ * - With user content: a `COMMENT` note whose body is the **sanitized**
+ *   user text followed by a single trusted `{% audit_images %}` tag
+ *   (Markdoc injection closed via {@link buildAuditImagesNoteContent}).
+ * - Without content: delegates to {@link createAuditAssetImagesAddedNote}
+ *   for the auto-generated `UPDATE` note.
+ *
+ * @param args.tx - Active Prisma transaction client
+ * @param args.auditSessionId - The audit session the note belongs to
+ * @param args.auditAssetId - The scanned AuditAsset this evidence is for
+ * @param args.userId - The author of the note / uploader
+ * @param args.imageIds - Ids of the AuditImage rows just uploaded
+ * @param args.content - Optional user note text (untrusted; sanitized)
+ * @returns Nothing; the note is written via `tx`
+ */
+export async function createAuditImageEvidenceNote({
+  tx,
+  auditSessionId,
+  auditAssetId,
+  userId,
+  imageIds,
+  content,
+}: {
+  tx: any; // Prisma transaction client (matches createAuditAssetImagesAddedNote)
+  auditSessionId: string;
+  auditAssetId: string;
+  userId: string;
+  imageIds: string[];
+  content?: string | null;
+}) {
+  if (content?.trim()) {
+    await tx.auditNote.create({
+      data: {
+        auditSessionId,
+        auditAssetId,
+        userId,
+        type: "COMMENT",
+        content: buildAuditImagesNoteContent({ content, imageIds }),
+      },
+    });
+    return;
+  }
+
+  await createAuditAssetImagesAddedNote({
+    auditSessionId,
+    auditAssetId,
+    userId,
+    imageIds,
+    tx,
+  });
+}
+
+/**
+ * Creates an automatic note when the audit due date is changed.
+ */
+export async function createDueDateChangedNote({
+  auditSessionId,
+  userId,
+  oldDate,
+  newDate,
+  tx,
+}: {
+  auditSessionId: string;
+  userId: string;
+  oldDate: Date | null;
+  newDate: Date | null;
+  tx: any; // Prisma transaction client
+}) {
+  const updater = await tx.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      displayName: true,
+    },
+  });
+
+  if (!updater) {
+    return; // Skip note creation if user not found
+  }
+
+  let content: string;
+
+  if (!oldDate && newDate) {
+    // Due date was set for the first time
+    content = `${wrapUserLinkForNote({
+      ...updater,
+    })} set due date to **${newDate.toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    })}**.`;
+  } else if (oldDate && !newDate) {
+    // Due date was cleared
+    content = `${wrapUserLinkForNote({
+      ...updater,
+    })} cleared the due date.`;
+  } else if (oldDate && newDate) {
+    // Due date was changed
+    content = `${wrapUserLinkForNote({
+      ...updater,
+    })} changed due date from **${oldDate.toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    })}** to **${newDate.toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    })}**.`;
+  } else {
+    return; // No change, skip note creation
+  }
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: updater.id,
+      type: "UPDATE",
+      content,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when an assignee is added to an audit.
+ */
+export async function createAssigneeAddedNote({
+  auditSessionId,
+  userId,
+  assigneeUserId,
+  tx,
+}: {
+  auditSessionId: string;
+  userId: string;
+  assigneeUserId: string;
+  tx: any; // Prisma transaction client
+}) {
+  const [updater, assignee] = await Promise.all([
+    tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+    tx.user.findUnique({
+      where: { id: assigneeUserId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+  ]);
+
+  if (!updater || !assignee) {
+    return; // Skip note creation if users not found
+  }
+
+  const content = `${wrapUserLinkForNote({
+    ...updater,
+  })} added assignee: ${wrapUserLinkForNote({
+    ...assignee,
+  })}.`;
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: updater.id,
+      type: "UPDATE",
+      content,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when an assignee is removed from an audit.
+ */
+export async function createAssigneeRemovedNote({
+  auditSessionId,
+  userId,
+  assigneeUserId,
+  tx,
+}: {
+  auditSessionId: string;
+  userId: string;
+  assigneeUserId: string;
+  tx: any; // Prisma transaction client
+}) {
+  const [updater, assignee] = await Promise.all([
+    tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+    tx.user.findUnique({
+      where: { id: assigneeUserId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+  ]);
+
+  if (!updater || !assignee) {
+    return; // Skip note creation if users not found
+  }
+
+  const content = `${wrapUserLinkForNote({
+    ...updater,
+  })} removed assignee: ${wrapUserLinkForNote({
+    ...assignee,
+  })}.`;
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: updater.id,
+      type: "UPDATE",
+      content,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when assets are added to an existing audit.
+ * Uses markdoc tags to show asset links/popovers.
+ */
+export async function createAssetsAddedToAuditNote({
+  auditSessionId,
+  userId,
+  addedAssetIds,
+  organizationId,
+  skippedCount,
+  tx,
+}: {
+  auditSessionId: string;
+  userId: string;
+  addedAssetIds: string[];
+  /** Caller's organization — scopes the asset lookup to prevent cross-org IDOR */
+  organizationId: string;
+  skippedCount: number;
+  tx: any; // Prisma transaction client
+}) {
+  const [adder, addedAssets] = await Promise.all([
+    tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+    tx.asset.findMany({
+      // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: title lookup for an audit note; archived assets in the audit must still be named
+      where: { id: { in: addedAssetIds }, organizationId },
+      select: { id: true, title: true },
+      orderBy: { title: "asc" },
+    }),
+  ]);
+
+  if (!adder || addedAssets.length === 0) {
+    return; // Skip note creation if user or assets not found
+  }
+
+  // Use wrapAssetsWithDataForNote to create proper asset links/popovers
+  const assetsMarkdoc = wrapAssetsWithDataForNote(addedAssets, "added");
+
+  let content = `${wrapUserLinkForNote({
+    ...adder,
+  })} added ${assetsMarkdoc} to audit.`;
+
+  if (skippedCount > 0) {
+    content += ` (**${skippedCount}** asset${
+      skippedCount === 1 ? "" : "s"
+    } skipped as already in audit)`;
+  }
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: adder.id,
+      type: "UPDATE",
+      content,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when a single asset is removed from an audit.
+ * Uses markdoc tags to show asset link.
+ */
+export async function createAssetRemovedFromAuditNote({
+  auditSessionId,
+  assetId,
+  organizationId,
+  userId,
+  tx,
+}: {
+  auditSessionId: string;
+  assetId: string;
+  /** Caller's organization — scopes the asset lookup to prevent cross-org IDOR */
+  organizationId: string;
+  userId: string;
+  tx: any; // Prisma transaction client
+}) {
+  const [remover, asset] = await Promise.all([
+    tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+    tx.asset.findFirst({
+      // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: title lookup for an audit note; an archived asset in the audit must still be named
+      where: { id: assetId, organizationId },
+      select: { id: true, title: true },
+    }),
+  ]);
+
+  if (!remover || !asset) {
+    return; // Skip note creation if user or asset not found
+  }
+
+  const assetMarkdoc = wrapAssetsWithDataForNote(asset, "removed");
+
+  const content = `${wrapUserLinkForNote({
+    ...remover,
+  })} removed ${assetMarkdoc} from audit.`;
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: remover.id,
+      type: "UPDATE",
+      content,
+    },
+  });
+}
+
+/**
+ * Creates an automatic note when multiple assets are removed from an audit (bulk).
+ * Uses markdoc tags to show asset links/popovers.
+ */
+export async function createAssetsRemovedFromAuditNote({
+  auditSessionId,
+  assetIds,
+  organizationId,
+  userId,
+  tx,
+}: {
+  auditSessionId: string;
+  assetIds: string[];
+  /** Caller's organization — scopes the asset lookup to prevent cross-org IDOR */
+  organizationId: string;
+  userId: string;
+  tx: any; // Prisma transaction client
+}) {
+  const [remover, assets] = await Promise.all([
+    tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    }),
+    tx.asset.findMany({
+      // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: title lookup for an audit note; archived assets in the audit must still be named
+      where: { id: { in: assetIds }, organizationId },
+      select: { id: true, title: true },
+      orderBy: { title: "asc" },
+    }),
+  ]);
+
+  if (!remover || assets.length === 0) {
+    return; // Skip note creation if user or assets not found
+  }
+
+  const assetsMarkdoc = wrapAssetsWithDataForNote(assets, "removed");
+
+  const content = `${wrapUserLinkForNote({
+    ...remover,
+  })} removed ${assetsMarkdoc} from audit.`;
+
+  await tx.auditNote.create({
+    data: {
+      auditSessionId,
+      userId: remover.id,
+      type: "UPDATE",
+      content,
+    },
+  });
+}

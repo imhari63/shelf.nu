@@ -1,0 +1,239 @@
+import type { JSX } from "react";
+import { CalendarIcon, RowsIcon } from "@radix-ui/react-icons";
+import {
+  Boxes,
+  CalendarCheck,
+  ClipboardList,
+  MapPinIcon,
+  MousePointerClick,
+  Package,
+  PackageCheck,
+  PackageMinus,
+  PackagePlus,
+  QrCode,
+  SlidersHorizontal,
+  Ungroup,
+} from "lucide-react";
+import { Spinner } from "./spinner";
+
+import {
+  ArchiveIcon,
+  CoinsIcon,
+  MailIcon,
+  PlusIcon,
+  RefreshIcon,
+  SearchIcon,
+  SuccessIcon,
+  TrashIcon,
+  XIcon,
+  BarCodeIcon,
+  PenIcon,
+  HomeIcon,
+  QuestionsIcon,
+  WriteIcon,
+  TagsIcon,
+  CategoriesIcon,
+  AssetsIcon,
+  DownloadIcon,
+  PrintIcon,
+  SettingsIcon,
+  SendIcon,
+  LogoutIcon,
+  HelpIcon,
+  Profile,
+  UserIcon,
+  GpsMarkerIcon,
+  DuplicateIcon,
+  GraphIcon,
+  ScanQRIcon,
+  SwitchIcon,
+  BookingsIcon,
+  CheckOutIcon,
+  CheckInIcon,
+  CheckIcon,
+  AssetLabel,
+  NoPermissionsIcon,
+  ActiveSwitchIcon,
+  ScanIcon,
+  MapIcon,
+  ToolIcon,
+  AddTagsIcon,
+  RemoveTagsIcon,
+  InstallIcon,
+  ColumnsIcon,
+  LockIcon,
+  ImageIcon,
+  FilterIcon,
+  SortIcon,
+  AvailableIcon,
+  UnavailableIcon,
+  ChangeIcon,
+} from "../icons/library";
+
+/** The possible options for icons to be rendered in the button */
+export type IconType =
+  | "check"
+  | "map"
+  | "plus"
+  | "trash"
+  | "archive"
+  | "reinstate"
+  | "mail"
+  | "search"
+  | "spinner"
+  | "x"
+  | "cancel"
+  | "refresh"
+  | "coins"
+  | "barcode"
+  | "pen"
+  | "success"
+  | "home"
+  | "question"
+  | "write"
+  | "tag"
+  | "tag-remove"
+  | "tag-add"
+  | "category"
+  | "location"
+  | "asset-model"
+  | "asset-model-remove"
+  | "gps"
+  | "duplicate"
+  | "asset"
+  | "download"
+  | "print"
+  | "settings"
+  | "logout"
+  | "help"
+  | "profile"
+  | "send"
+  | "user"
+  | "calendar"
+  | "graph"
+  | "scanQR"
+  | "switch"
+  | "kit"
+  | "bookings"
+  | "assign-custody"
+  | "release-custody"
+  | "partial-checkin"
+  | "asset-label"
+  // Bulk "Set min quantity". The bulk-dialog trigger renders <Icon icon={type} />,
+  // so every BulkDialogType must also be an IconType. Reuses the graph glyph:
+  // a reorder point is a line you draw across a level.
+  | "reorder-point"
+  | "lock"
+  | "activate"
+  | "deactivate"
+  | "start-audit"
+  | "add-to-audit"
+  | "delete-audit"
+  | "scan"
+  | "tool"
+  | "rows"
+  | "install"
+  | "columns"
+  | "no-permissions"
+  | "image"
+  | "filter"
+  | "sort"
+  | "available"
+  | "unavailable"
+  | "change"
+  | "booking-exist"
+  | "model-bookings"
+  | "model-booking-exist"
+  | "download-qr"
+  | "qr-code"
+  | "mouse-pointer-click"
+  | "add-to-kit"
+  | "remove-from-kit"
+  | "adjust-quantity";
+
+type IconsMap = {
+  [key in IconType]: JSX.Element;
+};
+
+export const iconsMap: IconsMap = {
+  check: <CheckIcon />,
+  map: <MapIcon />,
+  plus: <PlusIcon />,
+  trash: <TrashIcon />,
+  archive: <ArchiveIcon />,
+  reinstate: <RefreshIcon />,
+  mail: <MailIcon />,
+  search: <SearchIcon />,
+  spinner: <Spinner />,
+  x: <XIcon />,
+  cancel: <XIcon />,
+  refresh: <RefreshIcon />,
+  coins: <CoinsIcon />,
+  barcode: <BarCodeIcon />,
+  pen: <PenIcon />,
+  success: <SuccessIcon />,
+  home: <HomeIcon />,
+  question: <QuestionsIcon />,
+  write: <WriteIcon />,
+  tag: <TagsIcon />,
+  "tag-add": <AddTagsIcon />,
+  "tag-remove": <RemoveTagsIcon />,
+  category: <CategoriesIcon />,
+  location: <MapPinIcon />,
+  "asset-model": <Boxes />,
+  "asset-model-remove": <Ungroup />,
+  gps: <GpsMarkerIcon />,
+  duplicate: <DuplicateIcon />,
+  asset: <AssetsIcon />,
+  download: <DownloadIcon />,
+  print: <PrintIcon />,
+  settings: <SettingsIcon />,
+  help: <HelpIcon />,
+  profile: <Profile />,
+  logout: <LogoutIcon />,
+  send: <SendIcon />,
+  user: <UserIcon />,
+  calendar: <CalendarIcon className="size-5" />,
+  bookings: <BookingsIcon />,
+  graph: <GraphIcon />,
+  "reorder-point": <GraphIcon />,
+  scanQR: <ScanQRIcon />,
+  switch: <SwitchIcon />,
+  kit: <Package />,
+  "assign-custody": <CheckOutIcon />,
+  "release-custody": <CheckInIcon />,
+  "partial-checkin": <PackageCheck />,
+  "asset-label": <AssetLabel />,
+  "no-permissions": <NoPermissionsIcon />,
+  activate: <ActiveSwitchIcon />,
+  deactivate: <XIcon />,
+  scan: <ScanIcon />,
+  tool: <ToolIcon />,
+  rows: <RowsIcon />,
+  install: <InstallIcon />,
+  columns: <ColumnsIcon />,
+  lock: <LockIcon />,
+  image: <ImageIcon />,
+  filter: <FilterIcon />,
+  sort: <SortIcon />,
+  available: <AvailableIcon />,
+  unavailable: <UnavailableIcon />,
+  change: <ChangeIcon />,
+  "booking-exist": <CalendarCheck />,
+  // The model view's two booking entries do the same thing as the asset
+  // index's, so they carry the same icons. `Icon` resolves by dialog type, so
+  // a missing key here renders nothing at all beside the menu label.
+  "model-bookings": <BookingsIcon />,
+  "model-booking-exist": <CalendarCheck />,
+  "download-qr": <DownloadIcon />,
+  "qr-code": <QrCode />,
+  "mouse-pointer-click": <MousePointerClick />,
+  "add-to-kit": <PackagePlus />,
+  "remove-from-kit": <PackageMinus />,
+  "adjust-quantity": <SlidersHorizontal />,
+  "start-audit": <ClipboardList />,
+  "add-to-audit": <ClipboardList />,
+  "delete-audit": <TrashIcon />,
+};
+
+export default iconsMap;

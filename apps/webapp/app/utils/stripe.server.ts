@@ -1,0 +1,731 @@
+import type { OrganizationRoles, Prisma, Organization } from "@prisma/client";
+import { OrganizationType } from "@prisma/client";
+import { config } from "~/config/shelf.config";
+import { db } from "~/database/db.server";
+import { countActiveCustomFields } from "~/modules/custom-field/service.server";
+import {
+  REPORTS_PLAN_MESSAGE,
+  REPORTS_PLAN_TITLE,
+} from "~/modules/reports/plan-copy";
+import {
+  getOrganizationTierLimit,
+  getUserTierLimit,
+} from "~/modules/tier/service.server";
+import { getUserByID } from "~/modules/user/service.server";
+import type { ErrorLabel } from "./error";
+import { ShelfError } from "./error";
+import { Logger } from "./logger";
+import { isPersonalOrg } from "./organization";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "./permissions/permission.data";
+import { hasPermission } from "./permissions/permission.validator.server";
+
+const label: ErrorLabel = "Tier";
+export const premiumIsEnabled = config.enablePremiumFeatures;
+
+/**
+ * Utilities for checking weather the user can perform certain premium actions.
+ * We have 2 types:
+ * - Functions that return a boolean
+ * - Functions that throw an error if the user cannot perform the action. Those functions are named `assertUserCan...`
+ *
+ * */
+
+/** Export */
+export const canExportAssets = (
+  tierLimit: { canExportAssets: boolean } | null | undefined
+) => {
+  /** If the premium features are not enabled, just return true */
+  if (!premiumIsEnabled) return true;
+  if (tierLimit?.canExportAssets === null) return false;
+  return tierLimit?.canExportAssets || false;
+};
+
+/**
+ * Determines whether the current organization's tier allows hiding Shelf
+ * branding on printable labels.
+ *
+ * @param tierLimit - The tier limits associated with the organization.
+ * @returns `true` if branding can be hidden or premium features are disabled.
+ */
+export const canHideShelfBranding = (
+  tierLimit: { canHideShelfBranding: boolean } | null | undefined
+) => {
+  if (!premiumIsEnabled) return true;
+  if (!tierLimit) return false;
+  return tierLimit.canHideShelfBranding;
+};
+
+/**
+ * Determines whether an organization tier allows companion-app push
+ * notifications. Pass the tier limit of the organization's owner.
+ *
+ * @param tierLimit - The tier limits associated with the organization.
+ * @returns `true` if push is included in the tier or premium features are disabled.
+ */
+export const canUsePushNotifications = (
+  tierLimit: { canUsePushNotifications: boolean } | null | undefined
+) => {
+  if (!premiumIsEnabled) return true;
+  if (!tierLimit) return false;
+  return tierLimit.canUsePushNotifications;
+};
+
+/**
+ * Keeps the organizations whose owner's tier allows push. One rule for the
+ * push sender and for the settings screens that tell a person whether push
+ * can reach them. Reads every owner's tier in a single query; an owner with
+ * no limit row counts as a tier without push.
+ *
+ * @param organizationIds - Organizations to check
+ * @returns The ones with push, in their original order
+ * @throws {ShelfError} If the database read fails
+ */
+export async function filterOrganizationsWithPush(
+  organizationIds: string[]
+): Promise<string[]> {
+  if (!premiumIsEnabled) return organizationIds;
+  if (organizationIds.length === 0) return [];
+
+  try {
+    const organizations = await db.organization.findMany({
+      where: { id: { in: organizationIds } },
+      select: {
+        id: true,
+        owner: {
+          select: {
+            tierId: true,
+            tier: {
+              select: {
+                tierLimit: { select: { canUsePushNotifications: true } },
+              },
+            },
+            customTierLimit: { select: { canUsePushNotifications: true } },
+          },
+        },
+      },
+    });
+
+    const allowed = new Set(
+      organizations
+        .filter(({ owner }) =>
+          canUsePushNotifications(
+            owner.tierId === "custom"
+              ? owner.customTierLimit
+              : owner.tier.tierLimit
+          )
+        )
+        .map(({ id }) => id)
+    );
+    return organizationIds.filter((id) => allowed.has(id));
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while checking which plans include push.",
+      additionalData: { organizationIds },
+      label,
+    });
+  }
+}
+
+export async function assertUserCanExportAssets({
+  organizationId,
+  organizations,
+}: {
+  organizationId: Organization["id"];
+  organizations: {
+    id: string;
+    type: OrganizationType;
+    name: string;
+    imageId: string | null;
+    userId: string;
+  }[];
+}) {
+  /* Check the tier limit */
+  const tierLimit = await getOrganizationTierLimit({
+    organizationId,
+    organizations,
+  });
+
+  if (!canExportAssets(tierLimit)) {
+    throw new ShelfError({
+      cause: null,
+      title: "Not allowed",
+      message:
+        "Your user cannot export assets. Please update your subscription to unlock this feature.",
+      additionalData: { organizationId },
+      label,
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/** End Export */
+
+/** Reports */
+
+/**
+ * Whether a workspace's plan includes reports. Reports are part of the Plus
+ * and Team plans, and of every custom plan unless it is switched off there.
+ *
+ * Pass the WORKSPACE's tier limit (`getOrganizationTierLimit`, which reads the
+ * owner's tier), never the viewer's own: an administrator on a Free account
+ * keeps reports inside a Team workspace.
+ *
+ * @param tierLimit - The tier limit of the workspace owner
+ * @returns `true` when the plan includes reports, or when premium features are
+ *   off (self-hosted instances have every feature)
+ */
+export const canUseReports = (
+  tierLimit: { canUseReports: boolean } | null | undefined
+) => {
+  if (!premiumIsEnabled) return true;
+  if (!tierLimit) return false;
+  return tierLimit.canUseReports;
+};
+
+/** The caller's workspaces, as `requirePermission` returns them. */
+type ReportsPlanArgs = {
+  organizationId: Organization["id"];
+  organizations: {
+    id: string;
+    type: OrganizationType;
+    name: string;
+    imageId: string | null;
+    userId: string;
+  }[];
+};
+
+/**
+ * Resolves whether the active workspace's plan includes reports, from its
+ * owner's tier. Call it after `requirePermission`, so a role that may not see
+ * reports still gets the role error first.
+ *
+ * @param args.organizationId - The active workspace
+ * @param args.organizations - The caller's workspaces, as `requirePermission` returns them
+ * @returns `true` when the workspace may open reports
+ */
+export async function workspaceCanUseReports({
+  organizationId,
+  organizations,
+}: ReportsPlanArgs) {
+  // Self-hosted instances have every feature; skip the tier lookup.
+  if (!premiumIsEnabled) return true;
+
+  const tierLimit = await getOrganizationTierLimit({
+    organizationId,
+    organizations,
+  });
+
+  return canUseReports(tierLimit);
+}
+
+/**
+ * Refuses a request for report data when the workspace's plan does not include
+ * reports. Used by the download doors (CSV and PDF); the report pages send a
+ * Free workspace to the unlock page instead.
+ *
+ * @param args.organizationId - The active workspace
+ * @param args.organizations - The caller's workspaces, as `requirePermission` returns them
+ * @throws {ShelfError} 403 when the workspace's plan does not include reports
+ */
+export async function assertUserCanUseReports(args: ReportsPlanArgs) {
+  if (!(await workspaceCanUseReports(args))) {
+    throw new ShelfError({
+      cause: null,
+      title: REPORTS_PLAN_TITLE,
+      message: REPORTS_PLAN_MESSAGE,
+      additionalData: { organizationId: args.organizationId },
+      label,
+      // `ShelfError.status` defaults to 500; a plan limit is a refusal, not a fault.
+      status: 403,
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/** End Reports */
+
+/** Import */
+/** Important:
+ * For this to work properly it needs to receive the tierLimit of the organization owner not the current user
+ * This is because the owner is the one that has the premium package attached to their account
+ */
+export const canImportAssets = (
+  tierLimit: { canImportAssets: boolean } | null | undefined
+) => {
+  /** If the premium features are not enabled, just return true */
+  if (!premiumIsEnabled) return true;
+  if (!tierLimit?.canImportAssets) return false;
+  return tierLimit?.canImportAssets;
+};
+
+export async function assertUserCanImportAssets({
+  organizationId,
+  organizations,
+}: {
+  organizationId: Organization["id"];
+  organizations: {
+    id: string;
+    type: OrganizationType;
+    name: string;
+    imageId: string | null;
+    userId: string;
+  }[];
+}) {
+  const tierLimit = await getOrganizationTierLimit({
+    organizationId,
+    organizations,
+  });
+
+  if (!canImportAssets(tierLimit)) {
+    throw new ShelfError({
+      cause: null,
+      title: "Not allowed",
+      message: "You are not allowed to import assets",
+      additionalData: { organizationId },
+      label,
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/** Who is asking to import, and where: the inputs to every import gate. */
+export type ImportEligibilityArgs = {
+  organizationId: Organization["id"];
+  /** The member's workspaces, as `requirePermission` returns them */
+  organizations: Parameters<
+    typeof getOrganizationTierLimit
+  >[0]["organizations"];
+  userId: string;
+  /** The member's role in this workspace, as `requirePermission` returns it */
+  role: OrganizationRoles;
+};
+
+/**
+ * Whether a member may import assets into a workspace: the workspace's plan
+ * allows importing AND the member's role holds `asset: import`. The single
+ * answer behind every "Import" entry point (asset index, home checklist).
+ *
+ * It mirrors the gate on `/assets/import`, which runs
+ * `requirePermission(asset: import)` and then `assertUserCanImportAssets`.
+ * Both halves read the same primitives (`canImportAssets(tierLimit)` and the
+ * `@shelf/permissions` matrix), so a change to the gate belongs in those
+ * primitives, never in one side alone.
+ *
+ * @param args.organizationId - The workspace
+ * @param args.organizations - The member's workspaces, as `requirePermission` returns them
+ * @param args.userId - The member
+ * @param args.role - The member's role in this workspace, as `requirePermission` returns it
+ * @returns `true` when the import page would let this member in
+ */
+export async function resolveCanImportAssets({
+  organizationId,
+  organizations,
+  userId,
+  role,
+}: ImportEligibilityArgs): Promise<boolean> {
+  const [tierLimit, allowed] = await Promise.all([
+    getOrganizationTierLimit({ organizationId, organizations }),
+    hasPermission({
+      organizationId,
+      userId,
+      roles: [role],
+      entity: PermissionEntity.asset,
+      action: PermissionAction.import,
+    }),
+  ]);
+  return canImportAssets(tierLimit) && allowed;
+}
+
+/**
+ * {@link resolveCanImportAssets} for surfaces where the answer only decides
+ * whether to show a link, such as the home checklist. A failed lookup is
+ * logged and read as "cannot import", so it can never take the page down.
+ * The import page itself still enforces the real gate.
+ *
+ * @param args - Same as {@link resolveCanImportAssets}
+ * @returns `true` when the member may import, `false` when not or on failure
+ */
+export async function resolveCanImportAssetsOrFalse(
+  args: ImportEligibilityArgs
+): Promise<boolean> {
+  try {
+    return await resolveCanImportAssets(args);
+  } catch (cause) {
+    Logger.error(
+      new ShelfError({
+        cause,
+        message: "Failed to resolve import eligibility",
+        additionalData: {
+          userId: args.userId,
+          organizationId: args.organizationId,
+        },
+        label,
+      })
+    );
+    return false;
+  }
+}
+
+export const canImportNRM = (
+  tierLimit: { canImportNRM: boolean } | null | undefined
+) => {
+  /** If the premium features are not enabled, just return true */
+  if (!premiumIsEnabled) return true;
+  if (!tierLimit?.canImportNRM) return false;
+  return tierLimit?.canImportNRM;
+};
+
+export async function assertUserCanImportNRM({
+  organizationId,
+  organizations,
+}: {
+  organizationId: Organization["id"];
+  organizations: {
+    id: string;
+    type: OrganizationType;
+    name: string;
+    imageId: string | null;
+    userId: string;
+  }[];
+}) {
+  const tierLimit = await getOrganizationTierLimit({
+    organizationId,
+    organizations,
+  });
+
+  if (!canImportNRM(tierLimit)) {
+    throw new ShelfError({
+      cause: null,
+      title: "Not allowed",
+      message:
+        "You are not allowed to import Non-registered members due to your current plan. Please upgrade to unlock this feature.",
+      additionalData: { organizationId },
+      label,
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/** End Import */
+
+/** Custom Fields */
+export const canCreateMoreCustomFields = ({
+  tierLimit,
+  totalCustomFields,
+}: {
+  tierLimit: { maxCustomFields: number } | null | undefined;
+  totalCustomFields: number;
+}) => {
+  if (!premiumIsEnabled) return true;
+  if (!tierLimit?.maxCustomFields) return false;
+
+  return totalCustomFields < tierLimit?.maxCustomFields;
+};
+
+export const assertUserCanCreateMoreCustomFields = async ({
+  organizationId,
+  organizations,
+}: {
+  organizationId: Organization["id"];
+  organizations: {
+    id: string;
+    type: OrganizationType;
+    name: string;
+    imageId: string | null;
+    userId: string;
+  }[];
+}) => {
+  const [tierLimit, totalActiveCustomFields] = await Promise.all([
+    getOrganizationTierLimit({ organizationId, organizations }),
+    countActiveCustomFields({ organizationId }),
+  ]);
+
+  const canCreateMore = canCreateMoreCustomFields({
+    tierLimit,
+    totalCustomFields: totalActiveCustomFields,
+  });
+
+  if (!canCreateMore) {
+    throw new ShelfError({
+      cause: null,
+      title: "Not allowed",
+      message:
+        "You have reached your limit of active custom fields. Please upgrade your plan to add more.",
+      additionalData: { organizationId },
+      label,
+      shouldBeCaptured: false,
+    });
+  }
+};
+
+/**
+ * This function checks if the new activating custom fields will exceed the allowed limit or not
+ */
+export function willExceedCustomFieldLimit({
+  tierLimit,
+  currentCustomFields,
+  newActivatingFields,
+}: {
+  tierLimit: { maxCustomFields: number } | null | undefined;
+  currentCustomFields: number;
+  newActivatingFields: number;
+}) {
+  if (!premiumIsEnabled) {
+    return false;
+  }
+
+  if (!tierLimit?.maxCustomFields) {
+    return true;
+  }
+
+  return currentCustomFields + newActivatingFields > tierLimit.maxCustomFields;
+}
+
+export async function assertWillExceedCustomFieldLimit({
+  organizationId,
+  organizations,
+  newActivatingFields,
+}: {
+  organizationId: Organization["id"];
+  organizations: {
+    id: string;
+    type: OrganizationType;
+    name: string;
+    imageId: string | null;
+    userId: string;
+  }[];
+  newActivatingFields: number;
+}) {
+  const [tierLimit, totalActiveCustomFields] = await Promise.all([
+    getOrganizationTierLimit({ organizationId, organizations }),
+    countActiveCustomFields({ organizationId }),
+  ]);
+
+  const willExceedLimit = willExceedCustomFieldLimit({
+    tierLimit,
+    currentCustomFields: totalActiveCustomFields,
+    newActivatingFields,
+  });
+
+  if (willExceedLimit) {
+    throw new ShelfError({
+      cause: null,
+      message: `Activating these fields will exceed your allowed limit(${tierLimit.maxCustomFields}) of active custom fields . Try selecting a smaller number or fields or upgrade your plan to activate more.`,
+      shouldBeCaptured: false,
+      label: "Custom fields",
+    });
+  }
+}
+/** End Custom Fields */
+
+/** Organizations */
+export const canCreateMoreOrganizations = ({
+  tierLimit,
+  totalOrganizations,
+}: {
+  tierLimit: { maxOrganizations: number } | null | undefined;
+  totalOrganizations: number;
+}) => {
+  if (!premiumIsEnabled) return true;
+  if (!tierLimit?.maxOrganizations) return false;
+
+  return totalOrganizations < tierLimit?.maxOrganizations;
+};
+/**
+ * Fetches user and calls {@link canCreateMoreOrganizations};.
+ * Throws an error if the user cannot create more organizations.
+ */
+export async function assertUserCanCreateMoreOrganizations(userId: string) {
+  const [user, tierLimit] = await Promise.all([
+    getUserByID(userId, {
+      select: {
+        id: true,
+        userOrganizations: {
+          include: {
+            organization: {
+              select: {
+                userId: true,
+              },
+            },
+          },
+        },
+      } satisfies Prisma.UserSelect,
+    }),
+    getUserTierLimit(userId),
+  ]);
+
+  const organizations = user.userOrganizations
+    .map((o) => o.organization)
+    .filter((o) => o.userId === userId);
+
+  if (
+    !canCreateMoreOrganizations({
+      tierLimit: tierLimit,
+      totalOrganizations: organizations.length || 1,
+    })
+  ) {
+    throw new ShelfError({
+      cause: null,
+      title: "Not allowed",
+      message: "You cannot create more workspaces with your current plan.",
+      additionalData: { userId, tierLimit },
+      label,
+      shouldBeCaptured: false,
+    });
+  }
+}
+/** End Organizations */
+
+/** Team Features */
+export const canUseBookings = (
+  currentOrganization: Pick<Organization, "type">
+) => {
+  if (!premiumIsEnabled) return true;
+
+  if (currentOrganization.type !== OrganizationType.TEAM) return false;
+
+  return true;
+};
+
+/**
+ * This function checks if the user can use bookings in the current organization
+ * It simply checks the organization type
+ *
+ * Throws error of not allowed
+ */
+export function assertCanUseBookings(
+  currentOrganization: Pick<Organization, "type">
+) {
+  if (!canUseBookings(currentOrganization)) {
+    throw new ShelfError({
+      cause: null,
+      title: "Not allowed",
+      message:
+        "You cannot use bookings in a personal workspace. Please create a Team workspace.",
+      status: 403,
+      label,
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/**
+ * This validates if more users can be invited to organization
+ * It simply checks the organization type
+ */
+export async function assertUserCanInviteUsersToWorkspace({
+  organizationId,
+}: {
+  organizationId: Organization["id"];
+}) {
+  /** Get the tier limit and check if they can export */
+  // const tierLimit = await getUserTierLimit(userId);
+  const org = await db.organization
+    .findUniqueOrThrow({
+      where: { id: organizationId },
+      select: {
+        type: true,
+      },
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Failed to get organization",
+        additionalData: { organizationId },
+        label,
+      });
+    });
+
+  if (isPersonalOrg(org)) {
+    throw new ShelfError({
+      cause: null,
+      title: "Not allowed",
+      message:
+        "You cannot invite other users to a personal workspace. Please create a Team workspace.",
+      status: 403,
+      label,
+      shouldBeCaptured: false,
+    });
+  }
+}
+/** End Team Features */
+
+/** Recurring Reminders */
+
+/**
+ * Determines whether the current organization's tier allows recurring
+ * (auto-repeating) asset reminders. One-shot reminders are free and are
+ * never gated by this.
+ *
+ * @param tierLimit - The tier limits of the organization OWNER (see
+ *                    getOrganizationTierLimit).
+ * @returns `true` if recurrence can be used or premium features are disabled.
+ */
+export const canUseRecurringReminders = (
+  tierLimit: { canUseRecurringReminders: boolean } | null | undefined
+) => {
+  if (!premiumIsEnabled) return true;
+  if (!tierLimit) return false;
+  return tierLimit.canUseRecurringReminders;
+};
+
+/**
+ * Throws when the organization's tier does not include recurring reminders.
+ * Call this only when a mutation actually requests recurrence: creating or
+ * editing one-shot reminders must stay free.
+ *
+ * @param organizationId - The current organization id.
+ * @param organizations - The caller's organizations (from requirePermission);
+ *                        used to resolve the org OWNER whose tier applies.
+ * @throws {ShelfError} 403 "Not allowed" upgrade nudge.
+ */
+export async function assertUserCanUseRecurringReminders({
+  organizationId,
+  organizations,
+}: {
+  organizationId: Organization["id"];
+  organizations: {
+    id: string;
+    type: OrganizationType;
+    name: string;
+    imageId: string | null;
+    userId: string;
+  }[];
+}) {
+  const tierLimit = await getOrganizationTierLimit({
+    organizationId,
+    organizations,
+  });
+
+  if (!canUseRecurringReminders(tierLimit)) {
+    throw new ShelfError({
+      cause: null,
+      title: "Not allowed",
+      message:
+        "Recurring reminders are not available on your workspace's current plan. Please upgrade your subscription to unlock this feature, or set a one-time reminder instead.",
+      additionalData: { organizationId },
+      label,
+      status: 403,
+      shouldBeCaptured: false,
+    });
+  }
+}
+/** End Recurring Reminders */
+
+/** Audit Add-on */
+export const canUseAudits = (org: { auditsEnabled: boolean }) => {
+  if (!premiumIsEnabled) return true;
+  return org.auditsEnabled;
+};
+/** End Audit Add-on */
+
+/** Barcode Add-on */
+export const canUseBarcodes = (org: { barcodesEnabled: boolean }) => {
+  if (!premiumIsEnabled) return true;
+  return org.barcodesEnabled;
+};
+/** End Barcode Add-on */

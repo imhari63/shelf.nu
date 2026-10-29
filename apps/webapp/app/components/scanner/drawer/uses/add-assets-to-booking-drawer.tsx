@@ -1,0 +1,349 @@
+import type { CSSProperties } from "react";
+import { AssetStatus } from "@prisma/client";
+import { useAtomValue, useSetAtom } from "jotai";
+import { useLoaderData } from "react-router";
+import { z } from "zod";
+import {
+  clearScannedItemsAtom,
+  removeScannedItemAtom,
+  scannedAssetQuantitiesAtom,
+  scannedItemsAtom,
+  scannedItemIdsAtom,
+  removeScannedItemsByAssetIdAtom,
+  removeMultipleScannedItemsAtom,
+} from "~/atoms/qr-scanner";
+import { Button } from "~/components/shared/button";
+import { isQuantityTracked } from "~/modules/asset/utils";
+import { hasCustody } from "~/modules/custody/utils";
+import type { loader } from "~/routes/_layout+/kits.$kitId.scan-assets";
+import type {
+  AssetFromQr,
+  KitFromQr,
+} from "~/routes/api+/get-scanned-item.$qrId";
+import { tw } from "~/utils/tw";
+import {
+  assetLabelPresets,
+  createAvailabilityLabels,
+  kitLabelPresets,
+} from "../availability-label-factory";
+import { createBlockers } from "../blockers-factory";
+import ConfigurableDrawer from "../configurable-drawer";
+import { GenericItemRow, DefaultLoadingState } from "../generic-item-row";
+import { ScannedAssetQuantityInput } from "../scanned-asset-quantity-input";
+import { buildAddToKitBlockers } from "./kit-scan-blockers";
+
+// Export the schema so it can be reused
+export const addScannedAssetsToKitSchema = z.object({
+  assetIds: z.array(z.string()).min(1),
+  /**
+   * JSON-encoded `Record<assetId, quantity>` mirroring the kit
+   * picker's wire format. Missing entries fall back to "full pool"
+   * inside `updateKitAssets` (legacy default); existing-in-kit assets
+   * whose id is absent keep their current `AssetKit.quantity`
+   * unchanged (so the scanner only sets qty for *newly-scanned* rows).
+   */
+  assetQuantities: z.string().optional().default("{}"),
+});
+
+/** Extend the type so we can use it. This is based on the extra asset includes passed to the row */
+type AssetFromQrWithKit = AssetFromQr & {
+  assetKits: Array<{
+    kitId: string;
+    kit: {
+      id: string;
+      name: string;
+    };
+  }>;
+};
+
+/**
+ * Drawer component for managing scanned assets to be added to kits
+ */
+export default function AddAssetsToKitDrawer({
+  className,
+  style,
+  isLoading,
+  defaultExpanded = false,
+}: {
+  className?: string;
+  style?: CSSProperties;
+  isLoading?: boolean;
+  defaultExpanded?: boolean;
+}) {
+  const { kit } = useLoaderData<typeof loader>();
+  // The kit's members as this page loaded. Used only for the "already in this
+  // kit" blocker: it may be slightly behind, and the write does not depend on
+  // it.
+  const kitAssets = kit.assetKits?.map((ak) => ak.asset) ?? [];
+  // Get the scanned items from jotai
+  const items = useAtomValue(scannedItemsAtom);
+  const clearList = useSetAtom(clearScannedItemsAtom);
+  const removeItem = useSetAtom(removeScannedItemAtom);
+  const removeAssetsFromList = useSetAtom(removeScannedItemsByAssetIdAtom);
+  const removeItemsFromList = useSetAtom(removeMultipleScannedItemsAtom);
+
+  // Get asset IDs efficiently using the atom
+  const { assetIds } = useAtomValue(scannedItemIdsAtom);
+
+  // List of asset IDs for the form
+  const assetIdsForKit = Array.from(new Set([...assetIds]));
+
+  // Per-asset qty for QUANTITY_TRACKED scans, restricted to the ids actually
+  // submitted. An existing member's `AssetKit.quantity` is left alone because
+  // nothing about it is sent.
+  const assetQuantities = useAtomValue(scannedAssetQuantitiesAtom);
+  const assetQuantitiesJson = JSON.stringify(
+    Object.fromEntries(
+      Object.entries(assetQuantities).filter(([assetId]) =>
+        assetIdsForKit.includes(assetId)
+      )
+    )
+  );
+
+  const { blockerConfigs } = buildAddToKitBlockers({
+    items,
+    kitId: kit.id,
+    kitAssetIds: new Set(kitAssets.map((asset) => asset.id)),
+    removeAssetsFromList,
+    removeItemsFromList,
+  });
+
+  // Create blockers component
+  const [hasBlockers, Blockers] = createBlockers({
+    blockerConfigs,
+  });
+
+  // Render item row
+  const renderItemRow = (qrId: string, item: any) => (
+    <GenericItemRow
+      key={qrId}
+      qrId={qrId}
+      item={item}
+      onRemove={removeItem}
+      renderLoading={(qrId, error) => (
+        <DefaultLoadingState qrId={qrId} error={error} />
+      )}
+      renderItem={(data) => {
+        if (item?.type === "asset") {
+          return <AssetRow asset={data as AssetFromQrWithKit} kit={kit} />;
+        } else if (item?.type === "kit") {
+          return <KitRow kit={data as KitFromQr} />;
+        }
+        return null;
+      }}
+      assetExtraInclude={{
+        assetKits: {
+          select: {
+            kitId: true,
+            kit: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+        },
+      }}
+      // Kit context so the API attaches `pickerMeta` with the
+      // strict-available pool (matches the kit manage-assets picker's
+      // MAX formula).
+      searchParams={{
+        pickerContext: JSON.stringify({ type: "kit", id: kit.id }),
+      }}
+    />
+  );
+
+  return (
+    <ConfigurableDrawer
+      schema={addScannedAssetsToKitSchema}
+      /**
+       * Only the scanned assets. The route adds them to whatever the kit holds
+       * at write time, so sending the membership this page loaded with would
+       * describe a kit that may no longer exist — and anything a colleague added
+       * meanwhile would be missing from it.
+       */
+      formData={{
+        assetIds: assetIdsForKit,
+        assetQuantities: assetQuantitiesJson,
+      }}
+      items={items}
+      onClearItems={clearList}
+      title="Items scanned"
+      isLoading={isLoading}
+      renderItem={renderItemRow}
+      Blockers={Blockers}
+      disableSubmit={hasBlockers}
+      defaultExpanded={defaultExpanded}
+      className={className}
+      style={style}
+      formName="AddScannedAssetsToKit"
+    />
+  );
+}
+
+// Implement item renderers
+export function AssetRow({
+  asset,
+  kit,
+}: {
+  asset: AssetFromQrWithKit;
+  kit: { id: string; assetKits: Array<{ asset: { id: string } }> };
+}) {
+  const assetKitLink = asset.assetKits[0];
+  const assetKitId = assetKitLink?.kitId;
+  const assetKit = assetKitLink?.kit;
+
+  // Use a combination of standard presets and custom configurations
+  const availabilityConfigs = [
+    assetLabelPresets.archived(!!asset.archivedAt),
+    assetLabelPresets.inCustody(asset.status === AssetStatus.IN_CUSTODY),
+    assetLabelPresets.checkedOut(asset.status === AssetStatus.CHECKED_OUT),
+    // Custom preset for assets with custody (unavailable for kits)
+    {
+      condition: hasCustody(asset.custody) && assetKitId !== kit.id,
+      badgeText: "Has custody",
+      tooltipTitle: "Asset has custody",
+      tooltipContent:
+        "Assets with custody cannot be added to kits. Please release custody first.",
+      priority: 80,
+    },
+    // Custom preset for "already in this kit"
+    {
+      condition: kit.assetKits.some((ak) => ak.asset.id === asset.id),
+      badgeText: "Already added to this kit",
+      tooltipTitle: "Asset is part of kit",
+      tooltipContent: "This asset is already added to the current kit.",
+      priority: 70,
+    },
+    {
+      condition: !!assetKitId && assetKitId !== kit.id,
+      badgeText: "Part of another kit",
+      tooltipTitle: "Asset is part of another kit",
+      tooltipContent: (
+        <>
+          This asset is currently part of another kit
+          {assetKit ? (
+            <>
+              :{" "}
+              <Button
+                to={`/kits/${assetKit.id}`}
+                target="_blank"
+                variant="link-gray"
+                className={"text-xs"}
+              >
+                {assetKit.name}
+              </Button>
+              <br />
+            </>
+          ) : undefined}
+          You will still be able to add this asset to replace its current kit.
+        </>
+      ),
+      priority: 70,
+    },
+  ];
+
+  // Create the availability labels component
+  const [, AssetAvailabilityLabels] = createAvailabilityLabels(
+    availabilityConfigs,
+    { maxLabels: 5 }
+  );
+
+  const qtyTracked = isQuantityTracked(asset) && asset.quantity != null;
+  // Hide the qty input when the asset is already in this kit — the
+  // kit picker holds its current `AssetKit.quantity`, and the scanner
+  // submit deliberately omits this asset's id from `assetQuantities`
+  // to avoid clobbering that value. Showing an input would be
+  // misleading.
+  const alreadyInKit = kit.assetKits.some((ak) => ak.asset.id === asset.id);
+
+  // `pickerMeta` carries the kit picker's strict-available pool so
+  // the row + qty input match `kits/$kitId/assets/manage-assets`.
+  const pickerMeta = qtyTracked ? asset.pickerMeta ?? null : null;
+  const totalQty = qtyTracked ? (asset.quantity as number) : 0;
+  const maxAllowed = pickerMeta?.maxAllowed ?? totalQty;
+
+  return (
+    <div className="flex w-full items-start justify-between gap-3">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <p className="word-break whitespace-break-spaces font-medium">
+          {asset.title}
+          {qtyTracked ? (
+            <span className="ml-2 text-xs font-normal text-gray-500">
+              · {totalQty} {asset.unitOfMeasure || "units"}
+              {pickerMeta && pickerMeta.maxAllowed < totalQty ? (
+                <span className="ml-1 text-warning-700">
+                  · {pickerMeta.maxAllowed} available
+                </span>
+              ) : null}
+            </span>
+          ) : null}
+        </p>
+
+        <div className="flex flex-wrap items-center gap-1">
+          <span
+            className={tw(
+              "inline-block bg-gray-50 px-[6px] py-[2px]",
+              "rounded-md border border-gray-200",
+              "text-xs text-gray-700"
+            )}
+          >
+            asset
+          </span>
+          <AssetAvailabilityLabels />
+        </div>
+      </div>
+
+      {qtyTracked && !alreadyInKit && maxAllowed > 0 ? (
+        <ScannedAssetQuantityInput
+          assetId={asset.id}
+          max={maxAllowed}
+          unit={asset.unitOfMeasure || "units"}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+export function KitRow({ kit }: { kit: KitFromQr }) {
+  // Use preset configurations to define the availability labels
+  const availabilityConfigs = [
+    {
+      condition: true, // Always show this label for kits
+      badgeText: "Cannot add to kit",
+      tooltipTitle: "Kits cannot be added to other kits",
+      tooltipContent: "Only individual assets can be added to kits.",
+      priority: 100,
+    },
+    kitLabelPresets.inCustody(kit.status === AssetStatus.IN_CUSTODY),
+    kitLabelPresets.checkedOut(kit.status === AssetStatus.CHECKED_OUT),
+  ];
+
+  // Create the availability labels component with default options
+  const [, KitAvailabilityLabels] =
+    createAvailabilityLabels(availabilityConfigs);
+
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="word-break whitespace-break-spaces font-medium">
+        {kit.name}{" "}
+        <span className="text-[12px] font-normal text-gray-700">
+          ({kit._count.assetKits} assets)
+        </span>
+      </p>
+
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span
+          className={tw(
+            "inline-block bg-gray-50 px-[6px] py-[2px]",
+            "rounded-md border border-gray-200",
+            "text-xs text-gray-700"
+          )}
+        >
+          kit
+        </span>
+        <KitAvailabilityLabels />
+      </div>
+    </div>
+  );
+}

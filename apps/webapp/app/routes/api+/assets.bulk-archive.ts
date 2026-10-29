@@ -1,0 +1,209 @@
+import { data, type ActionFunctionArgs } from "react-router";
+import { BulkAssignCustodySchema } from "~/components/assets/bulk-assign-custody-dialog";
+import { lastAuditDateAccessFor } from "~/modules/asset/last-audit-date-access.server";
+import { resolveBookableListScope } from "~/modules/asset/list-scope.server";
+import { bulkCheckOutAssets } from "~/modules/asset/service.server";
+import { CurrentSearchParamsSchema } from "~/modules/asset/utils.server";
+import { getAssetIndexSettings } from "~/modules/asset-index-settings/service.server";
+import {
+  assertAssignableQuantities,
+  assignQuantities,
+  QUANTITY_CUSTODIAN_SELECT,
+  quantityRefusalsError,
+  splitQuantityAssetIds,
+} from "~/modules/custody/quantity-custody.server";
+import {
+  getTeamMember,
+  scopeCustodianFilterIds,
+} from "~/modules/team-member/service.server";
+import { getClientHint } from "~/utils/client-hints";
+import { resolveUserFormatPrefsById } from "~/utils/date-format.server";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import {
+  isLikeShelfError,
+  isNotFoundError,
+  makeShelfError,
+  ShelfError,
+} from "~/utils/error";
+import { assertIsPost, payload, error, parseData } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+
+export async function action({ context, request }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const userId = authSession.userId;
+
+  try {
+    assertIsPost(request);
+
+    const {
+      organizationId,
+      role,
+      canUseBarcodes,
+      access,
+      currentOrganization,
+    } = await requirePermission({
+      request,
+      userId,
+      entity: PermissionEntity.asset,
+      action: PermissionAction.custody,
+    });
+
+    // Fetch asset index settings to determine mode
+    const settings = await getAssetIndexSettings({
+      userId,
+      organizationId,
+      canUseBarcodes,
+      role,
+    });
+
+    const formData = await request.formData();
+
+    const {
+      assetIds,
+      custodian,
+      currentSearchParams,
+      quantities,
+      sourceLocations,
+    } = parseData(
+      formData,
+      BulkAssignCustodySchema.and(CurrentSearchParamsSchema)
+    );
+
+    /**
+     * Units per quantity-tracked asset, sent only by the scanner.
+     *
+     * Bulk custody skips quantity-tracked assets because selecting rows on the
+     * assets index gives no way to say how many units each hand-over covers.
+     * The scanner does: it shows one row per scan with its own quantity input.
+     * So an asset named here is assigned unit by unit, the way the asset page
+     * does it, and the bulk call below never sees it. An index submission
+     * sends no quantities and is unchanged.
+     */
+    const { quantityAssetIds, bulkAssetIds } = splitQuantityAssetIds(
+      assetIds,
+      quantities
+    );
+
+    /**
+     * Validate the custodian belongs to the same organization (early 404).
+     * The "assign only to yourself" guard (`access.custody.assign`) lives in
+     * the services, not here.
+     * The name fields are what the per-unit audit notes render.
+     */
+    const custodianRecord = await getTeamMember({
+      id: custodian.id,
+      organizationId,
+      select: QUANTITY_CUSTODIAN_SELECT,
+    }).catch((cause) => {
+      throw new ShelfError({
+        cause,
+        title: "Team member not found",
+        message: "The selected team member could not be found.",
+        additionalData: { userId, assetIds, custodian },
+        label: "Assets",
+        status: 404,
+        // `getTeamMember` already classifies its errors — forward that
+        // decision so DB / connectivity failures inside it still reach
+        // Sentry. Fall back to the Prisma not-found check otherwise.
+        shouldBeCaptured: isLikeShelfError(cause)
+          ? cause.shouldBeCaptured
+          : !isNotFoundError(cause),
+      });
+    });
+
+    /**
+     * The caller's custody scope is enforced inside the services themselves:
+     * `bulkCheckOutAssets` for whole assets and `checkOutQuantity` for the
+     * per-unit path, so web and mobile share one source of truth. The route
+     * passes `access.custody.assign` through to both.
+     */
+    // Acting user's timezone: when "select all" is active the affected set is
+    // resolved from the current date filters, which must truncate the day in
+    // the user's tz (avoids an off-by-one for non-UTC users).
+    const { timeZone } = await resolveUserFormatPrefsById(
+      userId,
+      getClientHint(request)
+    );
+
+    // Every per-unit assignment is checked before anything is written,
+    // including the "assign only to yourself" rule and, for a pool placed at
+    // two or more locations, what the scanner's chosen location has left.
+    await assertAssignableQuantities({
+      quantityAssetIds,
+      quantities,
+      sourceLocations,
+      organizationId,
+      custodian: custodianRecord,
+      custodyAssign: access.custody.assign,
+      userId,
+    });
+
+    /**
+     * The whole-asset call runs before the per-unit writes: it validates and
+     * writes in one transaction, so if it refuses, nothing has been written.
+     * The per-unit writes after it were checked above; a refusal there can
+     * only come from a concurrent change, and is reported by asset.
+     */
+    const { skippedQuantityTracked } = bulkAssetIds.length
+      ? await bulkCheckOutAssets({
+          userId,
+          custodyAssign: access.custody.assign,
+          assetIds: bulkAssetIds,
+          custodianId: custodian.id,
+          custodianName: custodian.name,
+          organizationId,
+          currentSearchParams,
+          settings,
+          lastAuditDateAccess: lastAuditDateAccessFor(
+            access,
+            currentOrganization
+          ),
+          bookableScope: resolveBookableListScope({ access, userId }),
+          timeZone,
+          // `asset: custody` is a SELF_SERVICE permission, so narrow the
+          // select-all custodian filter to the caller's own custody, otherwise a
+          // self-service user could act on exactly the set a colleague holds.
+          allowedTeamMemberIds: await scopeCustodianFilterIds({
+            teamMemberIds: new URLSearchParams(
+              currentSearchParams ?? ""
+            ).getAll("teamMember"),
+            canSeeAllCustody: access.custody.seeAll,
+            userId,
+            organizationId,
+          }),
+        })
+      : { skippedQuantityTracked: 0 };
+
+    const refusals = await assignQuantities({
+      quantityAssetIds,
+      quantities,
+      sourceLocations,
+      custodian: custodianRecord,
+      userId,
+      organizationId,
+      custodyAssign: access.custody.assign,
+    });
+    if (refusals.length) throw quantityRefusalsError("assigned", refusals);
+
+    const skippedNote =
+      skippedQuantityTracked > 0
+        ? ` ${skippedQuantityTracked} quantity-tracked asset(s) were skipped. Assign custody individually.`
+        : "";
+
+    sendNotification({
+      title: `Assets are now in custody of ${custodian.name}`,
+      message: `Remember, these assets will be unavailable until custody is manually released.${skippedNote}`,
+      icon: { name: "success", variant: "success" },
+      senderId: userId,
+    });
+
+    return data(payload({ success: true }));
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+}

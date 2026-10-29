@@ -1,0 +1,520 @@
+import { useEffect, useId, useReducer } from "react";
+import type { User } from "@prisma/client";
+import type { OrganizationRoles } from "@prisma/client";
+import {
+  Popover,
+  PopoverContent,
+  PopoverPortal,
+  PopoverTrigger,
+} from "@radix-ui/react-popover";
+import { useFetcher } from "react-router";
+import { ChevronRight, SuccessIcon } from "~/components/icons/library";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { isFormProcessing } from "~/utils/form";
+import { handleActivationKeyPress } from "~/utils/keyboard";
+import {
+  canAssignRole,
+  roleChangeTransfers,
+} from "~/utils/permissions/membership-access";
+import type { OrganizationRole } from "~/utils/permissions/role-access";
+import {
+  INVITABLE_ROLES,
+  ROLE_DESCRIPTIONS,
+  ROLE_LABELS,
+} from "~/utils/permissions/role-access";
+import { tw } from "~/utils/tw";
+import { RolesHelpLink } from "../settings/roles-help-link";
+import { Button } from "../shared/button";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "../shared/modal";
+
+interface EntityCounts {
+  assets: number;
+  categories: number;
+  tags: number;
+  locations: number;
+  customFields: number;
+  kits: number;
+  assetReminders: number;
+  images: number;
+  /** Bookings the user created for a different custodian, reassigned by the change. */
+  bookings: number;
+  total: number;
+  /** What the proposed change moves; the dialog shows the transfer step only when something does. */
+  transfers: { ownership: boolean; bookingsCreatedForOthers: boolean };
+}
+
+interface TransferRecipient {
+  id: string;
+  name: string;
+  email: string;
+  isOwner: boolean;
+}
+
+/**
+ * Consolidated UI state for {@link ChangeRoleDialog}.
+ *
+ * Replaces five parallel `useState` hooks to satisfy `prefer-useReducer` and
+ * to allow atomic transitions (e.g. selecting a role *and* closing its popover
+ * in a single dispatch) that previously required cascading `setState` calls —
+ * the root cause of the `no-cascading-set-state` diagnostic.
+ */
+interface DialogState {
+  selectedRole: string;
+  transferToUserId: string;
+  rolePopoverOpen: boolean;
+  recipientPopoverOpen: boolean;
+  isSuccess: boolean;
+}
+
+type DialogAction =
+  | { type: "selectRole"; role: string }
+  | { type: "selectRecipient"; userId: string }
+  | { type: "setDefaultRecipient"; userId: string }
+  | { type: "setRolePopover"; open: boolean }
+  | { type: "setRecipientPopover"; open: boolean }
+  | { type: "markSuccess" }
+  | { type: "reset"; currentRoleEnum: string };
+
+function dialogReducer(state: DialogState, action: DialogAction): DialogState {
+  switch (action.type) {
+    case "selectRole":
+      // Selecting a role and closing its popover are one state transition.
+      return {
+        ...state,
+        selectedRole: action.role,
+        rolePopoverOpen: false,
+      };
+    case "selectRecipient":
+      return {
+        ...state,
+        transferToUserId: action.userId,
+        recipientPopoverOpen: false,
+      };
+    case "setDefaultRecipient":
+      if (state.transferToUserId) return state;
+      return { ...state, transferToUserId: action.userId };
+    case "setRolePopover":
+      return { ...state, rolePopoverOpen: action.open };
+    case "setRecipientPopover":
+      return { ...state, recipientPopoverOpen: action.open };
+    case "markSuccess":
+      return { ...state, isSuccess: true };
+    case "reset":
+      return {
+        selectedRole: action.currentRoleEnum,
+        transferToUserId: "",
+        rolePopoverOpen: false,
+        recipientPopoverOpen: false,
+        isSuccess: false,
+      };
+    default:
+      return state;
+  }
+}
+
+/**
+ * Dialog for changing a member's role. When the chosen role moves any of the
+ * member's entities, it previews how many move and asks who receives them.
+ *
+ * @param props.userId - The member whose role changes
+ * @param props.currentRoleEnum - The member's effective role, the initial selection
+ * @param props.currentRoles - Every role the member holds, for the transfer preview
+ * @param props.open - Whether the dialog is open
+ * @param props.onOpenChange - Open state setter
+ */
+export function ChangeRoleDialog({
+  userId,
+  currentRoleEnum,
+  currentRoles,
+  open,
+  onOpenChange,
+}: {
+  userId: User["id"];
+  currentRoleEnum: OrganizationRoles;
+  /** The member's full membership, for the transfer preview. */
+  currentRoles: OrganizationRoles[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const fetcher = useFetcher<{ error?: { message: string } }>();
+  const countsFetcher = useFetcher<EntityCounts>();
+  const recipientsFetcher = useFetcher<TransferRecipient[]>();
+  const disabled = isFormProcessing(fetcher.state);
+  const { ownsWorkspace } = useRoleAccess();
+  /** Roles this member may grant; only the owner may grant an owner-only role. */
+  const grantableRoles = INVITABLE_ROLES.filter((role) =>
+    canAssignRole({ actorOwnsWorkspace: ownsWorkspace, role })
+  );
+
+  /** Per-instance prefix for the role options' label and description ids. */
+  const roleOptionIdPrefix = useId();
+
+  const [state, dispatch] = useReducer(dialogReducer, {
+    selectedRole: currentRoleEnum as string,
+    transferToUserId: "",
+    rolePopoverOpen: false,
+    recipientPopoverOpen: false,
+    isSuccess: false,
+  });
+  const {
+    selectedRole,
+    transferToUserId,
+    rolePopoverOpen,
+    recipientPopoverOpen,
+    isSuccess,
+  } = state;
+
+  const isSameRole = selectedRole === currentRoleEnum;
+  // Whether the change moves anything: the same function the server and the
+  // count preview use, so the dialog asks for a recipient exactly when needed.
+  const preview = roleChangeTransfers({
+    fromRoles: currentRoles,
+    to: selectedRole as OrganizationRole,
+  });
+  const showDemotion =
+    !isSameRole && (preview.ownership || preview.bookingsCreatedForOthers);
+
+  /** Load entity counts and recipients when the change moves entities */
+  useEffect(() => {
+    if (open && showDemotion) {
+      void countsFetcher.load(
+        `/api/user/entity-counts?userId=${userId}&role=${selectedRole}`
+      );
+      void recipientsFetcher.load(
+        `/api/user/transfer-recipients?excludeUserId=${userId}`
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, showDemotion, userId, selectedRole]);
+
+  /** Pre-select the owner as default transfer recipient */
+  useEffect(() => {
+    const recipients = recipientsFetcher.data;
+    if (recipients && recipients.length > 0 && !transferToUserId) {
+      const owner = recipients.find((r) => r.isOwner);
+      dispatch({
+        type: "setDefaultRecipient",
+        userId: owner?.id ?? recipients[0].id,
+      });
+    }
+  }, [recipientsFetcher.data, transferToUserId]);
+
+  /** Show success state on successful response */
+  useEffect(() => {
+    if (fetcher.data && !fetcher.data.error && fetcher.state === "idle") {
+      dispatch({ type: "markSuccess" });
+    }
+  }, [fetcher.data, fetcher.state]);
+
+  /** Reset state when dialog closes */
+  useEffect(() => {
+    if (!open) {
+      dispatch({ type: "reset", currentRoleEnum });
+    }
+  }, [open, currentRoleEnum]);
+
+  const entityCounts = countsFetcher.data;
+  const recipients = recipientsFetcher.data;
+  const isLoadingDemotionData =
+    countsFetcher.state === "loading" || recipientsFetcher.state === "loading";
+
+  const selectedRecipient = recipients?.find((r) => r.id === transferToUserId);
+
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent aria-describedby="change-role-description">
+        {isSuccess ? (
+          <>
+            <div className="flex flex-col items-center py-6 text-center">
+              <div className="mb-4 flex size-12 items-center justify-center rounded-full bg-success-50">
+                <SuccessIcon className="size-6 text-success-600" />
+              </div>
+              <AlertDialogHeader className="mb-0">
+                <AlertDialogTitle>Role updated successfully</AlertDialogTitle>
+                <AlertDialogDescription id="change-role-description">
+                  The user's role has been changed. The change takes effect
+                  immediately.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+            </div>
+            <AlertDialogFooter>
+              <Button
+                type="button"
+                variant="secondary"
+                width="full"
+                onClick={() => onOpenChange(false)}
+              >
+                Close
+              </Button>
+            </AlertDialogFooter>
+          </>
+        ) : (
+          <>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Change user role</AlertDialogTitle>
+              <AlertDialogDescription id="change-role-description">
+                Change this user's role in the workspace. This takes effect
+                immediately.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+
+            <fetcher.Form method="post">
+              <input type="hidden" name="intent" value="changeRole" />
+              <input type="hidden" name="userId" value={userId} />
+              <input type="hidden" name="role" value={selectedRole} />
+              {showDemotion && transferToUserId ? (
+                <input
+                  type="hidden"
+                  name="transferToUserId"
+                  value={transferToUserId}
+                />
+              ) : null}
+
+              <div className="py-3">
+                <label htmlFor="role-select" className="mb-1 block font-medium">
+                  Role
+                </label>
+                <Popover
+                  open={rolePopoverOpen}
+                  onOpenChange={(nextOpen) =>
+                    dispatch({ type: "setRolePopover", open: nextOpen })
+                  }
+                >
+                  <PopoverTrigger asChild>
+                    <Button
+                      id="role-select"
+                      type="button"
+                      variant="secondary"
+                      className="w-full justify-start font-normal [&_span]:max-w-full [&_span]:truncate"
+                    >
+                      <ChevronRight className="ml-[2px] inline-block rotate-90" />
+                      <span className="ml-2">
+                        {ROLE_LABELS[selectedRole as OrganizationRole] ??
+                          "Select role"}
+                      </span>
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverPortal>
+                    <PopoverContent
+                      align="start"
+                      className={tw(
+                        "z-[999999] mt-2 w-[var(--radix-popover-trigger-width)] overflow-hidden rounded-md border border-gray-200 bg-white"
+                      )}
+                    >
+                      {grantableRoles.map((k) => (
+                        <div
+                          key={k}
+                          role="option"
+                          aria-selected={selectedRole === k}
+                          aria-labelledby={`${roleOptionIdPrefix}-${k}-label`}
+                          aria-describedby={`${roleOptionIdPrefix}-${k}-description`}
+                          tabIndex={0}
+                          className={tw(
+                            "px-4 py-2 text-[14px] text-gray-600 hover:cursor-pointer hover:bg-gray-50",
+                            selectedRole === k && "bg-gray-50 font-medium"
+                          )}
+                          onClick={() =>
+                            dispatch({ type: "selectRole", role: k })
+                          }
+                          onKeyDown={handleActivationKeyPress(() =>
+                            dispatch({ type: "selectRole", role: k })
+                          )}
+                        >
+                          <span
+                            id={`${roleOptionIdPrefix}-${k}-label`}
+                            className="block text-gray-900"
+                          >
+                            {ROLE_LABELS[k]}
+                          </span>
+                          <span
+                            id={`${roleOptionIdPrefix}-${k}-description`}
+                            className="block text-xs font-normal text-gray-500"
+                          >
+                            {ROLE_DESCRIPTIONS[k]}
+                          </span>
+                        </div>
+                      ))}
+                    </PopoverContent>
+                  </PopoverPortal>
+                </Popover>
+                <RolesHelpLink />
+
+                {showDemotion ? (
+                  <div className="mt-4 rounded-md border border-warning-200 bg-warning-25 p-3">
+                    <p className="text-sm font-medium text-warning-700">
+                      Demotion — entities will be transferred
+                    </p>
+                    {isLoadingDemotionData ? (
+                      <p className="mt-2 text-sm text-gray-600">
+                        Loading entity counts...
+                      </p>
+                    ) : entityCounts && entityCounts.total > 0 ? (
+                      <>
+                        <p className="mt-2 text-sm text-gray-600">
+                          This user owns{" "}
+                          <strong>{entityCounts.total} entities</strong> that
+                          will be transferred to the selected recipient:
+                        </p>
+                        <ul className="mt-1 list-inside list-disc text-sm text-gray-600">
+                          {entityCounts.assets > 0 && (
+                            <li>{entityCounts.assets} assets</li>
+                          )}
+                          {entityCounts.categories > 0 && (
+                            <li>{entityCounts.categories} categories</li>
+                          )}
+                          {entityCounts.tags > 0 && (
+                            <li>{entityCounts.tags} tags</li>
+                          )}
+                          {entityCounts.locations > 0 && (
+                            <li>{entityCounts.locations} locations</li>
+                          )}
+                          {entityCounts.customFields > 0 && (
+                            <li>{entityCounts.customFields} custom fields</li>
+                          )}
+                          {entityCounts.kits > 0 && (
+                            <li>{entityCounts.kits} kits</li>
+                          )}
+                          {entityCounts.assetReminders > 0 && (
+                            <li>
+                              {entityCounts.assetReminders} asset reminders
+                            </li>
+                          )}
+                          {entityCounts.images > 0 && (
+                            <li>{entityCounts.images} images</li>
+                          )}
+                          {entityCounts.bookings > 0 && (
+                            <li>
+                              {entityCounts.bookings} bookings created for
+                              others
+                            </li>
+                          )}
+                        </ul>
+
+                        {recipients && recipients.length > 0 ? (
+                          <div className="mt-3">
+                            <label
+                              htmlFor="recipient-select"
+                              className="mb-1 block text-sm font-medium"
+                            >
+                              Transfer entities to
+                            </label>
+                            <Popover
+                              open={recipientPopoverOpen}
+                              onOpenChange={(nextOpen) =>
+                                dispatch({
+                                  type: "setRecipientPopover",
+                                  open: nextOpen,
+                                })
+                              }
+                            >
+                              <PopoverTrigger asChild>
+                                <Button
+                                  id="recipient-select"
+                                  type="button"
+                                  variant="secondary"
+                                  className="w-full justify-start font-normal [&_span]:max-w-full [&_span]:truncate"
+                                >
+                                  <ChevronRight className="ml-[2px] inline-block rotate-90" />
+                                  <span className="ml-2">
+                                    {selectedRecipient
+                                      ? `${selectedRecipient.name}${
+                                          selectedRecipient.isOwner
+                                            ? " (Owner)"
+                                            : ""
+                                        } — ${selectedRecipient.email}`
+                                      : "Select recipient"}
+                                  </span>
+                                </Button>
+                              </PopoverTrigger>
+                              <PopoverPortal>
+                                <PopoverContent
+                                  align="start"
+                                  className={tw(
+                                    "z-[999999] mt-2 max-h-[200px] w-[var(--radix-popover-trigger-width)] overflow-auto rounded-md border border-gray-200 bg-white"
+                                  )}
+                                >
+                                  {recipients.map((r) => (
+                                    <div
+                                      key={r.id}
+                                      role="option"
+                                      aria-selected={transferToUserId === r.id}
+                                      tabIndex={0}
+                                      className={tw(
+                                        "px-4 py-2 text-[14px] text-gray-600 hover:cursor-pointer hover:bg-gray-50",
+                                        transferToUserId === r.id &&
+                                          "bg-gray-50 font-medium"
+                                      )}
+                                      onClick={() =>
+                                        dispatch({
+                                          type: "selectRecipient",
+                                          userId: r.id,
+                                        })
+                                      }
+                                      onKeyDown={handleActivationKeyPress(() =>
+                                        dispatch({
+                                          type: "selectRecipient",
+                                          userId: r.id,
+                                        })
+                                      )}
+                                    >
+                                      {r.name}
+                                      {r.isOwner ? " (Owner)" : ""} — {r.email}
+                                    </div>
+                                  ))}
+                                </PopoverContent>
+                              </PopoverPortal>
+                            </Popover>
+                          </div>
+                        ) : null}
+                      </>
+                    ) : entityCounts && entityCounts.total === 0 ? (
+                      <p className="mt-2 text-sm text-gray-600">
+                        This user has no entities to transfer.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {fetcher.data?.error ? (
+                  <p className="mt-3 text-sm text-error-500">
+                    {fetcher.data.error.message}
+                  </p>
+                ) : null}
+              </div>
+
+              <AlertDialogFooter className="mt-2 flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  className="flex-1"
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => onOpenChange(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  className="flex-1"
+                  disabled={
+                    disabled ||
+                    isSameRole ||
+                    (showDemotion && isLoadingDemotionData)
+                  }
+                >
+                  {disabled ? "Changing..." : "Change role"}
+                </Button>
+              </AlertDialogFooter>
+            </fetcher.Form>
+          </>
+        )}
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}

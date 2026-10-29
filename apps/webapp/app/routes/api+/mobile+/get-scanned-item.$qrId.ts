@@ -1,0 +1,295 @@
+/**
+ * Mobile API route — kit detail.
+ *
+ * Serves full kit detail to the companion app's kit screen: status, custody,
+ * description, image, category, location, QR code, summed total value, and the
+ * contained assets. Org-scoped and gated by the mobile bearer auth +
+ * `kit:read` permission, mirroring the web kit-detail loader. Failures are
+ * caught and returned as `{ error }` responses, not thrown.
+ *
+ * @see {@link file://./assets.$assetId.ts} the asset twin of this route
+ */
+import { data, type LoaderFunctionArgs } from "react-router";
+import { z } from "zod";
+import { db } from "~/database/db.server";
+import {
+  getMobileUserContext,
+  requireMobileAuth,
+  requireMobilePermission,
+  requireOrganizationAccess,
+} from "~/modules/api/mobile-auth.server";
+import { viewerCanSeeLegacyCustody } from "~/modules/api/mobile-custody-visibility.server";
+import { serializeAssetImage } from "~/modules/asset/image-resolution";
+import { ASSET_MODEL_IMAGE_SELECT } from "~/modules/asset/image-select";
+import {
+  ASSET_IMAGE_RESIGN_LIMITS,
+  refreshExpiredAssetImages,
+} from "~/modules/asset/service.server";
+import {
+  BARCODE_CODES_ORDER_BY,
+  QR_CODES_ORDER_BY,
+  resolveDisplayCode,
+  serializeDisplayCode,
+} from "~/modules/barcode/display";
+import { refreshExpiredKitImages } from "~/modules/kit/service.server";
+import { makeShelfError } from "~/utils/error";
+import { getParams } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { canUseBarcodes } from "~/utils/subscription.server";
+
+/**
+ * GET /api/mobile/kits/:kitId?orgId=xxx
+ *
+ * Returns full kit detail for the companion app's kit screen: status,
+ * custody, description, image, and the contained assets (each tappable
+ * through to the asset detail screen). A kit image whose signed URL has
+ * lapsed is re-signed, and the new URL written back to the kit, before it is
+ * sent.
+ *
+ * @param args - React Router loader args.
+ * @param args.request - Incoming request; carries the mobile bearer auth and
+ *   the `?orgId=` that scopes the lookup.
+ * @param args.params - Route params; `kitId` identifies the kit.
+ * @returns A JSON response: the org-scoped kit detail on success, or an
+ *   `{ error }` payload with the appropriate status on failure (401/403 for
+ *   auth or `kit:read` failures, 404 for a foreign-org or missing kit id).
+ * @see {@link file://./assets.$assetId.ts} the asset twin of this route
+ */
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  try {
+    const { user } = await requireMobileAuth(request);
+    const organizationId = await requireOrganizationAccess(request, user.id);
+    const { access } = await getMobileUserContext(user.id, organizationId);
+
+    await requireMobilePermission({
+      userId: user.id,
+      organizationId,
+      entity: PermissionEntity.kit,
+      action: PermissionAction.read,
+    });
+
+    const { kitId } = getParams(params, z.object({ kitId: z.string() }));
+
+    const storedKit = await db.kit.findFirst({
+      // org-scoped lookup — a foreign-org kit id resolves to null (404)
+      where: { id: kitId, organizationId },
+      select: {
+        id: true,
+        // Scopes the write-back of a re-signed image below.
+        organizationId: true,
+        name: true,
+        description: true,
+        status: true,
+        image: true,
+        imageExpiration: true,
+        createdAt: true,
+        updatedAt: true,
+        category: { select: { id: true, name: true, color: true } },
+        location: { select: { id: true, name: true } },
+        // Ordered so the resolver below and the app, which both read the
+        // first entry, settle on the same code on every load.
+        qrCodes: { orderBy: QR_CODES_ORDER_BY, select: { id: true } },
+        // The kit's alternative codes, resolved into `displayCode` below so a
+        // workspace that labels its kits with Code 128 sees Code 128 rather
+        // than the Shelf QR. Kits carry no `sequentialId` or per-kit override,
+        // so a SAM_ID preference falls back to the QR — the resolver reports
+        // that as `isFallback`.
+        barcodes: {
+          orderBy: BARCODE_CODES_ORDER_BY,
+          select: { id: true, type: true, value: true },
+        },
+        organization: {
+          select: {
+            currency: true,
+            // Destructured out below; `kit.organization` keeps its
+            // `{ currency }` shape.
+            qrIdDisplayPreference: true,
+            barcodesEnabled: true,
+          },
+        },
+        custody: {
+          select: {
+            createdAt: true,
+            custodian: {
+              select: {
+                id: true,
+                name: true,
+                // why: needed to tell the viewer's OWN custody from a
+                // colleague's — without it the visibility check below cannot
+                // distinguish them and would have to hide both.
+                userId: true,
+                user: {
+                  select: {
+                    firstName: true,
+                    lastName: true,
+                    displayName: true,
+                    email: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+        // Kit ↔ Asset membership is the AssetKit pivot (see schema).
+        // Select through the pivot and synthesise the flat `kit.assets[]`
+        // array below, which is the shape the companion's kit screen reads.
+        assetKits: {
+          select: {
+            // AssetKit.quantity — units of THIS asset held by THIS kit (the
+            // correct kit-surface multiplier; NOT the asset's workspace
+            // stock). See .claude/rules/quantity-semantics-per-surface.md.
+            quantity: true,
+            asset: {
+              select: {
+                id: true,
+                title: true,
+                status: true,
+                // An archived member is out of service: it stays listed with
+                // an "Archived" badge, and it counts toward nothing (not the
+                // total value below, not the app's asset count).
+                archivedAt: true,
+                valuation: true,
+                // Workspace stock — kept for parity with other mobile asset
+                // payloads, but NOT used for this kit's totalValue math
+                // below (that uses the pivot's `quantity` above instead).
+                quantity: true,
+                unitOfMeasure: true,
+                type: true,
+                mainImage: true,
+                thumbnailImage: true,
+                // Lets the re-sign below tell a lapsed photo URL.
+                mainImageExpiration: true,
+                // Model cover image; collapsed into the flat image fields by
+                // `serializeAssetImage` below, so a member asset inheriting
+                // its model's photo is not blank on the kit detail screen.
+                ...ASSET_MODEL_IMAGE_SELECT,
+                category: { select: { id: true, name: true } },
+                // Placement lives on the `AssetLocation` pivot. Project the
+                // primary placement through it; it is flattened below into
+                // the single `location` field the mobile JSON contract
+                // carries.
+                assetLocations: {
+                  select: { location: { select: { id: true, name: true } } },
+                  take: 1,
+                },
+              },
+            },
+          },
+          orderBy: { asset: { title: "asc" } },
+        },
+      },
+    });
+
+    if (!storedKit) {
+      return data(
+        { error: { message: "Kit not found in this workspace." } },
+        { status: 404 }
+      );
+    }
+
+    // Re-sign the kit image and the member photos together; neither needs the
+    // other. `organizationId` only scopes the kit write-back, so it is dropped
+    // before the response. The member result lines up with `assetKits`.
+    const [[refreshedKit], refreshedMembers] = await Promise.all([
+      refreshExpiredKitImages([storedKit]),
+      refreshExpiredAssetImages(
+        storedKit.assetKits.map((ak) => ak.asset),
+        { organizationId, ...ASSET_IMAGE_RESIGN_LIMITS }
+      ),
+    ]);
+    const { organizationId: _organizationId, ...kit } = refreshedKit;
+
+    // Flatten the AssetKit pivot into the asset list the companion expects.
+    // Also flatten the `assetLocations[0]` pivot back into the singular
+    // `location` field the companion's kit screen still reads (preserves
+    // the existing mobile JSON contract).
+    const {
+      assetKits,
+      organization: kitOrganization,
+      barcodes: kitBarcodes,
+      ...kitData
+    } = kit;
+
+    // Same resolver, precedence and add-on gate as the asset detail endpoint —
+    // see that route for why the EFFECTIVE entitlement is passed rather than
+    // the raw column.
+    const barcodesAllowed = canUseBarcodes(kitOrganization);
+    const resolvedCode = resolveDisplayCode({
+      entity: { qrCodes: kit.qrCodes, barcodes: kitBarcodes },
+      organization: {
+        qrIdDisplayPreference: kitOrganization.qrIdDisplayPreference,
+        barcodesEnabled: barcodesAllowed,
+      },
+      entityKind: "kit",
+    });
+    const assets = assetKits.map((ak, index) => {
+      // `mainImageExpiration` only steers the re-sign above.
+      const {
+        assetLocations,
+        mainImageExpiration: _mainImageExpiration,
+        ...rest
+      } = refreshedMembers[index];
+      return {
+        // Resolves the model-image cascade and drops the nested `assetModel`,
+        // so the companion keeps one source of truth for the image.
+        ...serializeAssetImage(rest),
+        location: assetLocations[0]?.location ?? null,
+        // Per-membership units of this asset in this kit (AssetKit.quantity).
+        kitQuantity: ak.quantity,
+      };
+    });
+
+    // Kit total value = Σ per-unit valuation × units-in-this-kit. Uses the kit
+    // slice quantity (AssetKit.quantity), NOT the asset's workspace stock —
+    // see .claude/rules/quantity-semantics-per-surface.md. INDIVIDUAL members
+    // have AssetKit.quantity = 1 so the math is unchanged for them. Archived
+    // members are out of service, so they add nothing to the kit's value.
+    const totalValue = assets.reduce(
+      (sum, asset) =>
+        asset.archivedAt
+          ? sum
+          : sum + (asset.valuation ?? 0) * asset.kitQuantity,
+      0
+    );
+
+    /**
+     * `kit: read` is held by BASE and SELF_SERVICE, and this select reaches
+     * `custodian.user.email`. For a viewer who may not see the holder, null
+     * the whole custody object rather than emptying the custodian: that is the
+     * established shape on the mobile surface, and the mobile asset detail
+     * route does the same with its legacy custody field.
+     */
+    const visibleCustody =
+      kitData.custody &&
+      viewerCanSeeLegacyCustody({
+        custodianUserId: kitData.custody.custodian.userId,
+        viewerUserId: user.id,
+        canSeeAllCustody: access.custody.seeAll,
+      })
+        ? kitData.custody
+        : null;
+
+    return data({
+      kit: {
+        ...kitData,
+        custody: visibleCustody,
+        assets,
+        totalValue,
+        organization: { currency: kitOrganization.currency },
+        // The identifier to SHOW for this kit, already resolved — see the
+        // asset detail endpoint for the full contract.
+        displayCode: serializeDisplayCode(resolvedCode),
+        barcodes: barcodesAllowed ? kitBarcodes : [],
+      },
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    return data(
+      { error: { message: reason.message } },
+      { status: reason.status }
+    );
+  }
+}

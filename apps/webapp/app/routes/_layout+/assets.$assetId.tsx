@@ -1,0 +1,385 @@
+import { useMemo } from "react";
+import { TagUseFor } from "@prisma/client";
+import { archivedAssetBlockedReason } from "@shelf/labels";
+import { useAtomValue } from "jotai";
+import type {
+  ActionFunctionArgs,
+  LoaderFunctionArgs,
+  MetaFunction,
+} from "react-router";
+import { data, redirect, useLoaderData } from "react-router";
+import { z } from "zod";
+import { dynamicTitleAtom } from "~/atoms/dynamic-title-atom";
+import { AssetForm, NewAssetFormSchema } from "~/components/assets/form";
+
+import Header from "~/components/layout/header";
+import type { HeaderData } from "~/components/layout/header/types";
+import { Button } from "~/components/shared/button";
+import {
+  getAllEntriesForCreateAndEdit,
+  getAsset,
+  updateAsset,
+  updateAssetMainImage,
+} from "~/modules/asset/service.server";
+import { getPrimaryLocation } from "~/modules/asset/utils";
+import { getAssetModels } from "~/modules/asset-model/service.server";
+
+import { getActiveCustomFields } from "~/modules/custom-field/service.server";
+import { buildTagsSet } from "~/modules/tag/service.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { extractBarcodesFromFormData } from "~/utils/barcode-form-data.server";
+import {
+  extractCustomFieldValuesFromPayload,
+  mergedSchema,
+} from "~/utils/custom-fields";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError } from "~/utils/error";
+import {
+  assertIsPost,
+  payload,
+  error,
+  getCurrentSearchParams,
+  getParams,
+  getRefererPathExcludingSelf,
+  parseData,
+  safeRedirect,
+} from "~/utils/http.server";
+import { userCanReinstateAssets } from "~/utils/org-validation.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { slugify } from "~/utils/slugify";
+
+export type AssetEditLoaderData = typeof loader;
+
+export async function loader({ context, request, params }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { assetId: id } = getParams(params, z.object({ assetId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const { organizationId, currentOrganization, userOrganizations } =
+      await requirePermission({
+        userId,
+        request,
+        entity: PermissionEntity.asset,
+        action: PermissionAction.update,
+      });
+
+    const asset = await getAsset({
+      organizationId,
+      id,
+      include: {
+        tags: true,
+        customFields: true,
+        assetKits: {
+          select: {
+            kit: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+        },
+        // Pull the primary placement so the edit form can pre-fill the
+        // location picker.
+        assetLocations: {
+          select: { location: { select: { id: true } } },
+        },
+        barcodes: {
+          select: {
+            id: true,
+            type: true,
+            value: true,
+          },
+        },
+      },
+      userOrganizations,
+      request,
+    });
+
+    // An archived asset is read-only (issue #382), and Save would be refused.
+    // Say so before the form is filled in, and send the user back to the asset.
+    if (asset.archivedAt) {
+      sendNotification({
+        title: "Asset is archived",
+        message: archivedAssetBlockedReason({
+          canReinstate: await userCanReinstateAssets({
+            userId,
+            organizationId,
+          }),
+        }),
+        icon: { name: "trash", variant: "error" },
+        senderId: userId,
+      });
+      return redirect(`/assets/${id}/overview`);
+    }
+
+    const [
+      { categories, totalCategories, tags, locations, totalLocations },
+      { assetModels, totalAssetModels },
+    ] = await Promise.all([
+      getAllEntriesForCreateAndEdit({
+        request,
+        organizationId,
+        defaults: {
+          category: asset.categoryId,
+          location: getPrimaryLocation(asset)?.id ?? null,
+        },
+        tagUseFor: TagUseFor.ASSET,
+      }),
+      getAssetModels({ organizationId, page: 1, perPage: 100 }),
+    ]);
+
+    const searchParams = getCurrentSearchParams(request);
+
+    const customFields = await getActiveCustomFields({
+      organizationId,
+      category: searchParams.get("category") ?? asset.categoryId,
+    });
+
+    const header: HeaderData = {
+      title: `Edit | ${asset.title}`,
+      subHeading: asset.id,
+    };
+
+    return payload({
+      asset,
+      header,
+      categories,
+      totalCategories,
+      tags,
+      totalTags: tags.length,
+      locations,
+      totalLocations,
+      assetModels,
+      totalAssetModels,
+      currency: currentOrganization?.currency,
+      customFields,
+      referer: getRefererPathExcludingSelf(request),
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, id });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: data ? appendToMetaTitle(data.header.title) : "" },
+];
+
+export const handle = {
+  breadcrumb: () => "single",
+};
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { assetId: id } = getParams(params, z.object({ assetId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    assertIsPost(request);
+
+    const { organizationId, canUseBarcodes } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.asset,
+      action: PermissionAction.update,
+    });
+
+    const clonedRequest = request.clone();
+    const formData = await clonedRequest.formData();
+
+    const searchParams = getCurrentSearchParams(request);
+
+    const customFields = await getActiveCustomFields({
+      organizationId,
+      category:
+        searchParams.get("category") ?? String(formData.get("category")),
+    });
+
+    const FormSchema = mergedSchema({
+      baseSchema: NewAssetFormSchema,
+      customFields: customFields.map((cf) => ({
+        id: cf.id,
+        name: slugify(cf.name),
+        helpText: cf?.helpText || "",
+        required: cf.required,
+        type: cf.type.toLowerCase() as "text" | "number" | "date" | "boolean",
+        options: cf.options,
+      })),
+    });
+
+    const parsedData = parseData(formData, FormSchema, {
+      additionalData: { userId, organizationId },
+    });
+
+    const customFieldsValues = extractCustomFieldValuesFromPayload({
+      payload: parsedData,
+      customFieldDef: customFields,
+    });
+
+    const uploadedNewImage = await updateAssetMainImage({
+      request,
+      assetId: id,
+      userId: authSession.userId,
+      organizationId,
+    });
+
+    /**
+     * "Use the model's image instead" / "Remove image" — drops the asset's own
+     * image so `resolveAssetImage` falls through to its model's cover image,
+     * or to the placeholder when it has no model.
+     *
+     * Applied as part of the `updateAsset` payload below rather than as its own
+     * committed write: `updateAsset` can still reject (kit-managed location,
+     * quantity over pool, barcode gating, preferred-barcode membership), and a
+     * standalone clear would already have nulled the image while the action
+     * reports failure. The URL is a signed one-way pointer, so the user could
+     * not restore it — the edit must be all-or-nothing.
+     *
+     * Suppressed when this same submit uploaded a replacement, so "clear +
+     * upload" keeps the upload.
+     */
+    const shouldClearImage =
+      formData.get("clearMainImage") === "true" && !uploadedNewImage;
+
+    const {
+      title,
+      description,
+      category,
+      assetModelId,
+      newLocationId,
+      currentLocationId,
+      valuation,
+      preferredBarcodeId,
+      addAnother,
+      redirectTo,
+      quantity,
+      minQuantity,
+      consumptionType,
+      unitOfMeasure,
+    } = parsedData;
+
+    /** This checks if tags are passed and build the  */
+    const tags = buildTagsSet(parsedData.tags);
+
+    /**
+     * Barcodes are only read when the workspace holds the add-on. Without it
+     * the form has no barcode section, so `undefined` leaves the asset's
+     * existing barcodes untouched: `updateAsset` only reconciles a list it is
+     * given, and an empty list would read as "remove every barcode".
+     */
+    const barcodes = canUseBarcodes
+      ? extractBarcodesFromFormData(formData)
+      : undefined;
+
+    await updateAsset({
+      id,
+      title,
+      description,
+      categoryId: category ? category : "uncategorized",
+      assetModelId: assetModelId || null,
+      tags,
+      newLocationId,
+      currentLocationId,
+      userId: authSession.userId,
+      customFieldsValues,
+      barcodes,
+      // Only honor preferredBarcodeId when the org has the barcode add-on.
+      // The UI hides the selector otherwise; this is defense-in-depth.
+      preferredBarcodeId: canUseBarcodes ? preferredBarcodeId : undefined,
+      valuation,
+      organizationId,
+      request,
+      quantity,
+      minQuantity,
+      consumptionType,
+      unitOfMeasure,
+      // Nulled inside updateAsset's transaction — see `shouldClearImage`.
+      ...(shouldClearImage && {
+        mainImage: null,
+        mainImageExpiration: null,
+        thumbnailImage: null,
+      }),
+    });
+
+    sendNotification({
+      title: "Asset updated",
+      message: "Your asset has been updated successfully",
+      icon: { name: "success", variant: "success" },
+      senderId: authSession.userId,
+    });
+
+    if (addAnother) {
+      return redirect(`/assets/new`);
+    }
+
+    // If redirectTo is provided, redirect back to previous page
+    // Otherwise stay on current page (e.g., when opened in new tab)
+    if (redirectTo) {
+      return redirect(safeRedirect(redirectTo, `/assets/${id}`));
+    }
+
+    return payload({ success: true });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, id });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export default function AssetEditPage() {
+  const title = useAtomValue(dynamicTitleAtom);
+  const { asset, referer } = useLoaderData<typeof loader>();
+  const tags = useMemo(
+    () => asset.tags?.map((tag) => ({ label: tag.name, value: tag.id })) || [],
+    [asset.tags]
+  );
+
+  return (
+    <div className="relative">
+      <Header
+        title={
+          <Button to={`/assets/${asset.id}`} variant={"inherit"}>
+            {title !== "" ? title : asset.title}
+          </Button>
+        }
+      />
+      <div className=" items-top flex justify-between">
+        <AssetForm
+          id={asset.id}
+          sequentialId={asset.sequentialId}
+          mainImage={asset.mainImage}
+          thumbnailImage={asset.thumbnailImage}
+          mainImageExpiration={
+            asset.mainImageExpiration
+              ? new Date(asset.mainImageExpiration)
+              : null
+          }
+          title={asset.title}
+          categoryId={asset.categoryId}
+          assetModelId={asset.assetModelId}
+          locationId={getPrimaryLocation(asset)?.id ?? null}
+          description={asset.description}
+          valuation={asset.valuation}
+          type={asset.type}
+          quantity={asset.quantity}
+          minQuantity={asset.minQuantity}
+          consumptionType={asset.consumptionType}
+          unitOfMeasure={asset.unitOfMeasure}
+          tags={tags}
+          barcodes={asset.barcodes}
+          preferredBarcodeId={asset.preferredBarcodeId}
+          referer={referer}
+        />
+      </div>
+    </div>
+  );
+}

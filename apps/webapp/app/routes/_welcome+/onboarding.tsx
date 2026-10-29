@@ -1,0 +1,606 @@
+import { useMemo, useState } from "react";
+import type { Currency, Prisma } from "@prisma/client";
+import {
+  data,
+  redirect,
+  type LoaderFunctionArgs,
+  type MetaFunction,
+} from "react-router";
+import { useLoaderData } from "react-router";
+import { Form } from "~/components/custom-form";
+import { ShelfSymbolLogo } from "~/components/marketing/logos";
+import { Button } from "~/components/shared/button";
+import { Card } from "~/components/shared/card";
+import { GrayBadge } from "~/components/shared/gray-badge";
+import { Tag } from "~/components/shared/tag";
+import {
+  PersonalWorkspaceEscapeLink,
+  SelectPlanSubmitButtons,
+  selectPlanTrialCopy,
+} from "~/components/welcome/select-plan-intent";
+import { AUDIT_ADDON, BARCODE_ADDON } from "~/config/addon-copy";
+import { config } from "~/config/shelf.config";
+import { useSearchParams } from "~/hooks/search-params";
+import { getAuditAddonPrices } from "~/modules/audit/addon.server";
+import { getBarcodeAddonPrices } from "~/modules/barcode/addon.server";
+import { parsePlanIntentFromSearchParams } from "~/modules/signup-intent/schema";
+import { getUserByID } from "~/modules/user/service.server";
+import type { BillingInterval } from "~/utils/addon-price";
+import { resolveAddonPriceForInterval } from "~/utils/addon-price";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { formatCurrency } from "~/utils/currency";
+import { makeShelfError } from "~/utils/error";
+import { payload, error, getCurrentSearchParams } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import type { CustomerWithSubscriptions } from "~/utils/stripe.server";
+import {
+  getStripeCustomer,
+  getStripePricesForTrialPlanSelection,
+} from "~/utils/stripe.server";
+import { tw } from "~/utils/tw";
+
+export const meta: MetaFunction = () => [
+  { title: appendToMetaTitle("Welcome to shelf.nu") },
+];
+
+export async function loader({ context, request }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.subscription,
+      action: PermissionAction.read,
+    });
+
+    const user = await getUserByID(userId, {
+      select: {
+        id: true,
+        customerId: true,
+        sso: true,
+      } satisfies Prisma.UserSelect,
+    });
+
+    // SSO accounts never buy a plan here: billing is managed by the workspace
+    // owner. Redirect before any Stripe call.
+    if (user.sso) {
+      return redirect("/");
+    }
+
+    /** Get the Stripe customer */
+    const customer = user.customerId
+      ? ((await getStripeCustomer(
+          user.customerId
+        )) as CustomerWithSubscriptions)
+      : null;
+
+    /* Get the prices and products from Stripe */
+    const [prices, auditPrices, barcodePrices] = await Promise.all([
+      getStripePricesForTrialPlanSelection(),
+      getAuditAddonPrices(),
+      getBarcodeAddonPrices(),
+    ]);
+
+    // Onboarding hands a Team intent here as `?plan=team&trial=…`, the same
+    // vocabulary as the website's signup link. It orders the calls to action
+    // and offers the way back to a Personal workspace; nothing else reads it.
+    const planIntent = parsePlanIntentFromSearchParams(
+      getCurrentSearchParams(request)
+    );
+
+    return data(
+      payload({
+        title: "Subscription",
+        subTitle: "Pick an account plan that fits your workflow.",
+        /** Filter out the montly and yearly prices to only have prices for team plan */
+        prices,
+        customer,
+        auditPrices,
+        barcodePrices,
+        planIntent,
+      })
+    );
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+// react-doctor:no-giant-component — deferred for follow-up refactor
+export default function SelectPlan() {
+  const { prices, auditPrices, barcodePrices, planIntent } =
+    useLoaderData<typeof loader>();
+  const [searchParams] = useSearchParams();
+  // Someone sent here by their signup link never saw the Personal/Team
+  // question, so the page offers the way back and leads with what they asked
+  // for. Without a Team intent there is no escape link and one trial button.
+  const arrivedWithTeamIntent = planIntent?.plan === "team";
+  const leadsWithSubscribe = arrivedWithTeamIntent && !planIntent.trial;
+  const trialCopy = selectPlanTrialCopy({
+    planIntent,
+    freeTrialDays: config.freeTrialDays,
+  });
+  const planPrices = useMemo(() => {
+    const intervals: Partial<Record<BillingInterval, (typeof prices)[number]>> =
+      {};
+    prices.forEach((price) => {
+      const interval = price.recurring?.interval;
+      if (interval === "month" || interval === "year") {
+        intervals[interval] = price;
+      }
+    });
+    return intervals;
+  }, [prices]);
+
+  const [selectedPlan, setSelectedPlan] = useState<BillingInterval | null>(
+    () => (planPrices.month ? "month" : planPrices.year ? "year" : null)
+  );
+
+  // Initialize audit toggle from URL param (passed from welcome page)
+  const [wantsAudits, setWantsAudits] = useState(
+    () => searchParams.get("withAudits") === "true"
+  );
+
+  // Initialize barcode toggle from URL param (passed from welcome page)
+  const [wantsBarcodes, setWantsBarcodes] = useState(
+    () => searchParams.get("withBarcodes") === "true"
+  );
+
+  const activePrice = selectedPlan ? planPrices[selectedPlan] : null;
+
+  // Strictly the selected interval's price, never the other one's: the amount
+  // is rendered with the selected interval's suffix and submitted as the price
+  // to bill, so a substitute would misquote and then mischarge.
+  const activeAuditPrice = resolveAddonPriceForInterval(
+    auditPrices,
+    selectedPlan
+  );
+  const activeBarcodePrice = resolveAddonPriceForInterval(
+    barcodePrices,
+    selectedPlan
+  );
+
+  // An add-on with no price for this interval cannot be quoted or billed, so it
+  // is not offered while that interval is selected.
+  const hasAuditPrices = !!activeAuditPrice;
+  const hasBarcodePrices = !!activeBarcodePrice;
+
+  const fmtPrice = (amountInCents: number, currency: string) =>
+    formatCurrency({
+      value: amountInCents / 100,
+      currency: currency as Currency,
+      locale: "en-US",
+    });
+
+  // Generate dynamic plan copy from Stripe prices
+  const getPlanCopy = (
+    price: (typeof prices)[number]
+  ): { label: string; price: string; footnote: string } => {
+    const interval = price.recurring?.interval;
+    const amount = price.unit_amount ?? 0;
+    const formattedPrice = amount > 0 ? fmtPrice(amount, price.currency) : "$0";
+
+    let footnote = "";
+    if (interval === "year") {
+      footnote = "Billed annually per workspace";
+    } else if (interval === "month") {
+      footnote = "Billed monthly per workspace";
+    }
+
+    return {
+      label: interval === "year" ? "Annual" : "Monthly",
+      price: `${formattedPrice}/${interval === "year" ? "yr" : "mo"}`,
+      footnote,
+    };
+  };
+
+  // Build cost summary
+  const teamPriceAmount = activePrice?.unit_amount || 0;
+  const teamPriceCurrency = activePrice?.currency || "usd";
+  // What each add-on will actually cost, or null. A toggle survives a change of
+  // interval, so wanting an add-on is not the same as being able to have it, and
+  // one value for both questions keeps the quote, the total, the trial copy and
+  // the submitted price from disagreeing.
+  const auditPriceToBill = wantsAudits ? activeAuditPrice : null;
+  const barcodePriceToBill = wantsBarcodes ? activeBarcodePrice : null;
+  const auditPriceAmount = auditPriceToBill?.unit_amount || 0;
+  const barcodePriceAmount = barcodePriceToBill?.unit_amount || 0;
+  const totalAmount = teamPriceAmount + auditPriceAmount + barcodePriceAmount;
+  const isYearly = selectedPlan === "year";
+
+  const billingLabel = isYearly ? "yr" : "mo";
+
+  const selectedAddons = [
+    auditPriceToBill && "Audits",
+    barcodePriceToBill && "Barcodes",
+  ].filter(Boolean);
+  const trialText =
+    selectedAddons.length > 0
+      ? `You won't be charged during the trial. After ${
+          config.freeTrialDays
+        } days, continue on Team + ${selectedAddons.join(
+          " + "
+        )} or change plans.`
+      : `You won't be charged during the trial. After ${config.freeTrialDays} days, continue on Team or change plans.`;
+  const subscribeText = `Subscribe to start right away, or try Team free for ${config.freeTrialDays} days first.`;
+
+  return (
+    <div className="flex flex-col items-center p-4 sm:p-6">
+      <ShelfSymbolLogo className="my-4 size-8 md:mt-0" />
+      <div className="mb-8 text-center">
+        <h3 className="text-2xl font-semibold text-gray-900">
+          Select your payment plan
+        </h3>
+        <p className="mt-3 text-base text-gray-600">{trialCopy.subheading}</p>
+      </div>
+
+      <Form
+        method="post"
+        className="w-full max-w-3xl space-y-8"
+        action="/account-details/subscription"
+      >
+        <fieldset
+          className="flex items-center justify-between gap-2"
+          aria-label="Billing interval"
+        >
+          <legend className="sr-only">Choose billing interval</legend>
+          {(Object.keys(planPrices) as BillingInterval[]).map((interval) => {
+            const price = planPrices[interval];
+            if (!price) return null;
+            const display = getPlanCopy(price);
+            const id = `billing-${interval}`;
+            const isSelected = selectedPlan === interval;
+            return (
+              <label
+                key={interval}
+                htmlFor={id}
+                className="flex-1 cursor-pointer"
+              >
+                <input
+                  id={id}
+                  type="radio"
+                  name="billingInterval"
+                  value={interval}
+                  checked={isSelected}
+                  onChange={() => setSelectedPlan(interval)}
+                  className="sr-only"
+                />
+                <div
+                  className={tw(
+                    "relative flex flex-col gap-2 rounded border px-6 py-5 transition",
+                    isSelected
+                      ? "border-primary-400 bg-primary-50"
+                      : "border-gray-200 bg-white hover:border-gray-300"
+                  )}
+                >
+                  {interval === "year" ? (
+                    <Tag
+                      className={tw(
+                        "w-max",
+                        " absolute right-2 top-2 bg-orange-100 text-orange-700"
+                      )}
+                    >
+                      Save 54%
+                    </Tag>
+                  ) : null}
+                  <span className="text-sm font-semibold text-primary-700">
+                    {display.label}
+                  </span>
+                  <span className="text-2xl font-semibold text-gray-900">
+                    {display.price}
+                  </span>
+                  <span className="text-sm text-gray-600">
+                    {display.footnote}
+                  </span>
+                </div>
+              </label>
+            );
+          })}
+        </fieldset>
+
+        {arrivedWithTeamIntent ? <PersonalWorkspaceEscapeLink /> : null}
+
+        <section className="space-y-4">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">
+              Optional add-ons
+            </h3>
+            <p className="mt-1 text-sm text-gray-600">
+              Advanced capabilities for migrations & IT environments.
+            </p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            {/* Interactive Audit add-on card */}
+            {hasAuditPrices ? (
+              <article className="h-full">
+                <Card
+                  className={tw(
+                    "flex h-full cursor-pointer flex-col gap-3 p-0",
+                    "transition-shadow",
+                    wantsAudits ? "" : "hover:border-gray-300"
+                  )}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setWantsAudits((prev) => !prev)}
+                    className={tw(
+                      "flex size-full flex-col gap-3 rounded border border-transparent p-4 text-left",
+                      wantsAudits
+                        ? "border-primary-400 bg-primary-50"
+                        : "border-transparent"
+                    )}
+                  >
+                    <div className="flex items-start gap-3">
+                      <div
+                        className={tw(
+                          "mt-0.5 flex size-5 shrink-0 items-center justify-center rounded border-2",
+                          wantsAudits
+                            ? "border-primary-500 bg-primary-500"
+                            : "border-gray-300 bg-white"
+                        )}
+                        aria-hidden="true"
+                      >
+                        {wantsAudits ? (
+                          <svg
+                            className="size-3 text-white"
+                            viewBox="0 0 12 12"
+                            fill="none"
+                          >
+                            <path
+                              d="M10 3L4.5 8.5L2 6"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        ) : null}
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <h4 className="text-base font-semibold text-gray-900">
+                            {AUDIT_ADDON.label}
+                          </h4>
+                          {trialCopy.addonTrialTag ? (
+                            <Tag className="whitespace-nowrap bg-primary-50 text-primary-700">
+                              {trialCopy.addonTrialTag}
+                            </Tag>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                    <p className="text-sm text-gray-600">
+                      {AUDIT_ADDON.description}
+                    </p>
+                    {activeAuditPrice ? (
+                      <div className="mt-1">
+                        <span className="text-lg font-semibold text-gray-900">
+                          {fmtPrice(
+                            activeAuditPrice.unit_amount || 0,
+                            activeAuditPrice.currency
+                          )}
+                          /{isYearly ? "yr" : "mo"}
+                        </span>
+                        <p className="text-xs text-gray-500">
+                          Billed {isYearly ? "annually" : "monthly"} per
+                          workspace
+                        </p>
+                      </div>
+                    ) : null}
+                  </button>
+                </Card>
+              </article>
+            ) : null}
+
+            {/* Interactive Barcode add-on card */}
+            {hasBarcodePrices ? (
+              <article className="h-full">
+                <Card
+                  className={tw(
+                    "flex h-full cursor-pointer flex-col gap-3 p-0",
+                    "transition-shadow",
+                    wantsBarcodes ? "" : "hover:border-gray-300"
+                  )}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setWantsBarcodes((prev) => !prev)}
+                    className={tw(
+                      "flex size-full flex-col gap-3 rounded border border-transparent p-4 text-left",
+                      wantsBarcodes
+                        ? "border-primary-400 bg-primary-50"
+                        : "border-transparent"
+                    )}
+                  >
+                    <div className="flex items-start gap-3">
+                      <div
+                        className={tw(
+                          "mt-0.5 flex size-5 shrink-0 items-center justify-center rounded border-2",
+                          wantsBarcodes
+                            ? "border-primary-500 bg-primary-500"
+                            : "border-gray-300 bg-white"
+                        )}
+                        aria-hidden="true"
+                      >
+                        {wantsBarcodes ? (
+                          <svg
+                            className="size-3 text-white"
+                            viewBox="0 0 12 12"
+                            fill="none"
+                          >
+                            <path
+                              d="M10 3L4.5 8.5L2 6"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        ) : null}
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <h4 className="text-base font-semibold text-gray-900">
+                            {BARCODE_ADDON.label}
+                          </h4>
+                          {trialCopy.addonTrialTag ? (
+                            <Tag className="whitespace-nowrap bg-primary-50 text-primary-700">
+                              {trialCopy.addonTrialTag}
+                            </Tag>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                    <p className="text-sm text-gray-600">
+                      {BARCODE_ADDON.description}
+                    </p>
+                    {activeBarcodePrice ? (
+                      <div className="mt-1">
+                        <span className="text-lg font-semibold text-gray-900">
+                          {fmtPrice(
+                            activeBarcodePrice.unit_amount || 0,
+                            activeBarcodePrice.currency
+                          )}
+                          /{isYearly ? "yr" : "mo"}
+                        </span>
+                        <p className="text-xs text-gray-500">
+                          Billed {isYearly ? "annually" : "monthly"} per
+                          workspace
+                        </p>
+                      </div>
+                    ) : null}
+                  </button>
+                </Card>
+              </article>
+            ) : null}
+          </div>
+        </section>
+
+        {/* SSO — separate category, full width */}
+        <section className="space-y-4">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">
+              Enterprise integrations
+            </h3>
+          </div>
+          <Card className="flex flex-col gap-3">
+            <div>
+              <h4 className="text-base font-semibold text-gray-900">
+                SSO Integration (Team only)
+              </h4>
+              <div className="mt-1">
+                <GrayBadge className="whitespace-nowrap">Paid add-on</GrayBadge>
+              </div>
+            </div>
+            <p className="text-sm text-gray-600">
+              Single sign-on for your organization; centralized identity &
+              access.
+            </p>
+            <p className="text-xs text-gray-500">
+              Available for Team workspaces. Pricing provided during evaluation.
+            </p>
+          </Card>
+        </section>
+
+        {/* Cost summary */}
+        {activePrice && (
+          <section className="rounded-xl border border-gray-200 bg-gray-50 p-5">
+            <h3 className="mb-3 text-sm font-semibold text-gray-700">
+              Cost summary{" "}
+              <span className="font-normal text-gray-600">
+                {trialCopy.costSummaryNote}
+              </span>
+            </h3>
+            <div className="space-y-2 text-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-gray-600">
+                  Team ({isYearly ? "yearly" : "monthly"})
+                </span>
+                <span className="font-medium text-gray-900">
+                  {fmtPrice(teamPriceAmount, teamPriceCurrency)}/{billingLabel}
+                </span>
+              </div>
+              {auditPriceToBill ? (
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-600">
+                    Audits ({isYearly ? "yearly" : "monthly"})
+                  </span>
+                  <span className="font-medium text-gray-900">
+                    {fmtPrice(auditPriceAmount, auditPriceToBill.currency)}/
+                    {billingLabel}
+                  </span>
+                </div>
+              ) : null}
+              {barcodePriceToBill ? (
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-600">
+                    Barcodes ({isYearly ? "yearly" : "monthly"})
+                  </span>
+                  <span className="font-medium text-gray-900">
+                    {fmtPrice(barcodePriceAmount, barcodePriceToBill.currency)}/
+                    {billingLabel}
+                  </span>
+                </div>
+              ) : null}
+              <div className="border-t border-gray-200 pt-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-gray-900">Total</span>
+                  <span className="font-semibold text-gray-900">
+                    {fmtPrice(totalAmount, teamPriceCurrency)}/{billingLabel}
+                  </span>
+                </div>
+                {isYearly && (
+                  <p className="mt-1 text-right text-xs text-gray-500">
+                    {fmtPrice(Math.round(totalAmount / 12), teamPriceCurrency)}
+                    /mo effective rate
+                  </p>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
+
+        <p className="text-center text-sm text-gray-600">
+          {leadsWithSubscribe ? subscribeText : trialText}
+        </p>
+
+        <input type="hidden" name="priceId" value={activePrice?.id ?? ""} />
+        <input
+          type="hidden"
+          name="shelfTier"
+          value={activePrice?.product.metadata.shelf_tier}
+        />
+        {auditPriceToBill ? (
+          <input
+            type="hidden"
+            name="auditPriceId"
+            value={auditPriceToBill.id}
+          />
+        ) : null}
+        {barcodePriceToBill ? (
+          <input
+            type="hidden"
+            name="barcodePriceId"
+            value={barcodePriceToBill.id}
+          />
+        ) : null}
+
+        <SelectPlanSubmitButtons
+          planIntent={planIntent}
+          noPriceSelected={!activePrice}
+          freeTrialDays={config.freeTrialDays}
+        />
+      </Form>
+
+      <Button variant="link" to="/welcome" className="mt-4">
+        Back
+      </Button>
+    </div>
+  );
+}

@@ -1,0 +1,2202 @@
+import { useState } from "react";
+import type { RenderableTreeNode } from "@markdoc/markdoc";
+import { AssetStatus, CustomFieldType } from "@prisma/client";
+import { BookingStatus } from "@prisma/client";
+import type {
+  MetaFunction,
+  ActionFunctionArgs,
+  LoaderFunctionArgs,
+} from "react-router";
+import { data, useFetcher, useLoaderData } from "react-router";
+import { useZorm } from "react-zorm";
+import { z } from "zod";
+import { CustodyCard } from "~/components/assets/asset-custody-card";
+import {
+  AssetLastAuditCard,
+  LAST_AUDIT_CARD_RECENT_LIMIT,
+} from "~/components/assets/asset-last-audit-card";
+import { AssetReminderCards } from "~/components/assets/asset-reminder-cards";
+import { AssetsFilterLink } from "~/components/assets/assets-filter-link";
+import { CategoryBadge } from "~/components/assets/category-badge";
+import { MoveUnitsDialog } from "~/components/assets/move-units-dialog";
+import { QuantityCustodyList } from "~/components/assets/quantity-custody-list";
+import { QuantityOverviewCard } from "~/components/assets/quantity-overview-card";
+import { BarcodeCard } from "~/components/barcode/barcode-card";
+import { UnlockBarcodesBanner } from "~/components/barcode/unlock-barcodes-banner";
+import { CodePreview } from "~/components/code-preview/code-preview";
+import DynamicSelect from "~/components/dynamic-select/dynamic-select";
+import Input from "~/components/forms/input";
+import { Switch } from "~/components/forms/switch";
+import Icon from "~/components/icons/icon";
+import ContextualModal from "~/components/layout/contextual-modal";
+import type { HeaderData } from "~/components/layout/header/types";
+import { LocationBadge } from "~/components/location/location-badge";
+import { LocationSelect } from "~/components/location/location-select";
+import { ScanDetails } from "~/components/location/scan-details";
+import { MarkdownViewer } from "~/components/markdown/markdown-viewer";
+import { Button } from "~/components/shared/button";
+import { Card } from "~/components/shared/card";
+import { DateS } from "~/components/shared/date";
+import { DateTimePicker } from "~/components/shared/date-time-picker";
+import { InfoTooltip } from "~/components/shared/info-tooltip";
+import { InlineEditableField } from "~/components/shared/inline-editable-field";
+import { Tag } from "~/components/shared/tag";
+import TextualDivider from "~/components/shared/textual-divider";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "~/components/shared/tooltip";
+import When from "~/components/when/when";
+import { db } from "~/database/db.server";
+import { useAssetCustodySources } from "~/hooks/use-asset-custody-sources";
+import { useDateFormatter } from "~/hooks/use-date-formatter";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { usePosition } from "~/hooks/use-position";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { getAssetAvailability } from "~/modules/asset/availability.server";
+import { getAssetOverviewFields } from "~/modules/asset/fields";
+import { lastAuditDateAccessFor } from "~/modules/asset/last-audit-date-access.server";
+import {
+  MOVE_UNITS_INTENT_FIELD,
+  type MoveAxis,
+} from "~/modules/asset/move-units.types";
+import { resolveOverCommitment } from "~/modules/asset/over-commitment";
+import {
+  buildQuantityData,
+  type QuantityData,
+} from "~/modules/asset/quantity-overview.server";
+import {
+  getActiveCustomFieldsForAsset,
+  getAsset,
+  getCategoriesForCreateAndEdit,
+  getLocationsForCreateAndEdit,
+  moveAssetLocationUnits,
+  parseAssetValuation,
+  placeUnplacedUnits,
+  updateAsset,
+  updateAssetBookingAvailability,
+} from "~/modules/asset/service.server";
+import type { ShelfAssetCustomFieldValueType } from "~/modules/asset/types";
+import {
+  getPrimaryKit,
+  getPrimaryLocation,
+  isQuantityTracked,
+} from "~/modules/asset/utils";
+import { getRemindersForOverviewPage } from "~/modules/asset-reminder/service.server";
+import { getAssetAuditHistory } from "~/modules/audit/asset-audit-history.server";
+import { getCustodyCardHolderUserId } from "~/modules/custody/utils";
+import { getActiveCustomFields } from "~/modules/custom-field/service.server";
+import { moveAssetKitUnits } from "~/modules/kit/service.server";
+import { generateQrObj } from "~/modules/qr/utils.server";
+import { getLastScanForViewer } from "~/modules/scan/service.server";
+import { getTeamMembersForQuantityCustody } from "~/modules/team-member/service.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { assetDescriptionSchema } from "~/utils/asset-description";
+import { formatAssetValueWithBreakdown } from "~/utils/asset-value";
+import { canSeeBooking } from "~/utils/booking-authorization.server";
+import { checkExhaustiveSwitch } from "~/utils/check-exhaustive-switch";
+import { getClientHint } from "~/utils/client-hints";
+import { ASSET_DESCRIPTION_MAX_LENGTH } from "~/utils/constants";
+import { formatCurrency } from "~/utils/currency";
+import { redactCustodianForViewer } from "~/utils/custody-visibility.server";
+import { buildCustomFieldLinkHref } from "~/utils/custom-field-link";
+import {
+  buildAssetOverviewCustomFields,
+  buildCustomFieldValue,
+  getCustomFieldDisplayValue,
+} from "~/utils/custom-fields";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import { isFormProcessing } from "~/utils/form";
+import { error, getParams, payload, parseData } from "~/utils/http.server";
+import { isLink } from "~/utils/misc";
+import {
+  userCanViewSpecificCustody,
+  userHasCustodyViewPermission,
+} from "~/utils/permissions/custody-and-bookings-permissions.validator.client";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { userHasPermission } from "~/utils/permissions/permission.validator.client";
+import { hasPermission } from "~/utils/permissions/permission.validator.server";
+import { useBarcodePermissions } from "~/utils/permissions/use-barcode-permissions";
+import { requirePermission } from "~/utils/roles.server";
+import { tw } from "~/utils/tw";
+
+type AssetWithOptionalBarcodes = ReturnType<
+  typeof useLoaderData<typeof loader>
+>["asset"] & {
+  barcodes?: Array<{
+    id: string;
+    type: any;
+    value: string;
+  }>;
+  _count?: {
+    barcodes: number;
+  };
+};
+
+export const AvailabilityForBookingFormSchema = z.object({
+  availableToBook: z
+    .string()
+    .transform((val) => val === "on")
+    .default("false"),
+});
+
+export async function loader({ context, request, params }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  const { assetId: id } = getParams(params, z.object({ assetId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const {
+      organizationId,
+      userOrganizations,
+      currentOrganization,
+      canUseBarcodes,
+      access,
+    } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.asset,
+      action: PermissionAction.read,
+    });
+
+    const { locale, timeZone } = getClientHint(request);
+
+    /**
+     * The caller's roles in the active org. Derived once here and reused by
+     * every server-side `hasPermission` check in this loader (scan gating
+     * below, edit gating further down) — passing `roles` explicitly avoids
+     * the validator's DB fallback lookup on each call.
+     */
+    const roles = userOrganizations.find(
+      (o) => o.organization.id === organizationId
+    )?.roles;
+
+    const asset = await getAsset({
+      id,
+      organizationId,
+      userOrganizations,
+      request,
+      include: getAssetOverviewFields(canUseBarcodes),
+    });
+
+    /**
+     * The latest scan of this asset, whichever code was scanned (QR, barcode
+     * or SAM ID).
+     *
+     * `getLastScanForViewer` applies the `scan:read` gate SERVER-SIDE and
+     * returns null without it. The parsed scan carries the scanner's name and
+     * email, GPS coordinates and user-agent; the component renders
+     * `<ScanDetails>` behind the same check, but a client-side check only
+     * hides the data — BASE and SELF_SERVICE hold `scan: []` and were still
+     * receiving all of it in the page payload.
+     *
+     * Read alongside it: the "Last audit" card's history. Gated server-side by
+     * the same rule as the "Last audit date" column: only callers who see
+     * every audit, in a workspace with the audits add-on, receive it. Everyone
+     * else gets null and no card, so no audit dates reach roles whose audits
+     * are assignment-scoped.
+     */
+    const canSeeAuditHistory =
+      lastAuditDateAccessFor(access, currentOrganization) === "available";
+    const [lastScan, auditHistory] = await Promise.all([
+      getLastScanForViewer({
+        target: { assetId: asset.id },
+        userId,
+        organizationId,
+        roles,
+      }),
+      canSeeAuditHistory
+        ? getAssetAuditHistory({
+            assetId: asset.id,
+            organizationId,
+            limit: LAST_AUDIT_CARD_RECENT_LIMIT,
+          })
+        : null,
+    ]);
+
+    const qrObj = await generateQrObj({
+      assetId: asset.id,
+      userId,
+      organizationId,
+    });
+
+    /**
+     * Derive edit permission once in the loader so we can conditionally
+     * skip the heavy categories/locations/custom-field-defs queries for
+     * users who are view-only. Uses the server-side `hasPermission` because
+     * the client-side `userHasPermission` validator file has the `.client.`
+     * suffix and is stripped from the SSR bundle. `roles` is derived once at
+     * the top of the loader.
+     */
+    const canEditAsset = await hasPermission({
+      userId,
+      organizationId,
+      roles,
+      entity: PermissionEntity.asset,
+      action: PermissionAction.update,
+    });
+
+    const reminders = await getRemindersForOverviewPage({
+      assetId: id,
+      organizationId,
+    });
+    /**
+     * Compute quantity availability for QUANTITY_TRACKED assets via the
+     * shared `getAssetAvailability` primitive, called with NO `window` —
+     * "current state" mode. This is the #2724 fix: the headline `available`
+     * below is `physicalAvailable` (total − inCustody − inKits −
+     * checkedOut), which can never be dragged negative by far-future
+     * reservations the way the old inline formula could (it summed EVERY
+     * active reservation, all-time, and subtracted the lot). Reservations
+     * still surface on their own "Reserved (bookings)" row
+     * (`reservedTotal`), just no longer baked into the headline.
+     */
+    let quantityData: QuantityData | null = null;
+    let overCommitmentReads: Awaited<
+      ReturnType<typeof loadOverCommitmentReads>
+    > | null = null;
+
+    if (isQuantityTracked(asset)) {
+      // Sum each location's slice — the asset's pool that has a physical
+      // placement. Not part of `getAssetAvailability` (placements are
+      // orthogonal to custody/bookings), so it's computed here from the
+      // already-loaded `asset.assetLocations`, same as before.
+      const inLocations = (asset.assetLocations ?? []).reduce(
+        (sum: number, al) => sum + (al.quantity ?? 0),
+        0
+      );
+
+      // Manual rows only (`assetKitId === null`). This is the sum
+      // `enforce_asset_location_sum_within_total` actually bounds — since
+      // `20260602100000_assetlocation_sum_exclude_kit_driven` the trigger
+      // ignores kit-driven rows, which are bounded on their own axis by
+      // `enforce_asset_kit_sum_within_total`. Deriving "over-placed" from the
+      // combined `inLocations` would flag a perfectly valid asset (80 manual +
+      // 50 kit-driven of 100) as over-allocated.
+      const inLocationsManual = (asset.assetLocations ?? []).reduce(
+        (sum: number, al) =>
+          sum + (al.assetKitId === null ? al.quantity ?? 0 : 0),
+        0
+      );
+
+      // Run together: both availability reads and the booking lookup are
+      // independent, and each walks the asset's active bookings.
+      const [availability, overCommitment] = await Promise.all([
+        getAssetAvailability({
+          assetId: asset.id,
+          organizationId,
+        }),
+        loadOverCommitmentReads(asset.id, organizationId),
+      ]);
+      overCommitmentReads = overCommitment;
+
+      quantityData = buildQuantityData({
+        availability,
+        inLocations,
+        inLocationsManual,
+      });
+    }
+
+    /**
+     * For QUANTITY_TRACKED assets, fetch team members for the custody
+     * dialog, scoped by the caller's custody assignment scope.
+     */
+    const { teamMembers, totalTeamMembers } = isQuantityTracked(asset)
+      ? await getTeamMembersForQuantityCustody({
+          organizationId,
+          request,
+          userId,
+          access,
+        })
+      : { teamMembers: [], totalTeamMembers: 0 };
+
+    // `bookingAssets` is already the asset's current booking: the query keeps
+    // only the slice that is out (`CURRENT_BOOKING_SLICE_FILTER`), so the first
+    // row is the one the page shows. Nothing further is derived from it here.
+
+    /**
+     * Is this pool promised beyond its size at any point ahead, and which
+     * upcoming booking asks for the most units?
+     *
+     * `asset.bookingAssets` cannot answer it: `getAssetOverviewFields` filters
+     * that relation to ONGOING/OVERDUE, so no upcoming booking is ever in it.
+     * The peak comes from the same primitive the booking engine consults,
+     * windowed from now onwards so it is the future peak, not a sum.
+     *
+     * The booking is ONE grouped row, never a list: an asset can carry
+     * hundreds of future bookings and this page must not pay for all of them
+     * to name one. Standalone slices only, a kit's slices are its `inKits`
+     * units, and the primitive excludes them for the same reason. The figure
+     * is the booked quantity of the largest upcoming RESERVED booking, which
+     * the page names as the biggest upcoming booking, not as part of the peak.
+     */
+    const [availabilityAhead, topReservedBooking] = overCommitmentReads ?? [
+      null,
+      null,
+    ];
+
+    /**
+     * The shortfall first, without a booking: the booking's name is read only
+     * for a pool that is actually over-committed, since nothing shows it
+     * otherwise.
+     */
+    const shortfall = availabilityAhead
+      ? resolveOverCommitment({
+          total: availabilityAhead.total,
+          inCustody: availabilityAhead.inCustody,
+          inKits: availabilityAhead.inKits,
+          peakBooked: availabilityAhead.reserved,
+          topBooking: null,
+        })
+      : null;
+
+    /**
+     * The booking is named and linked only for a viewer who may open it, by
+     * the same `canSeeBooking` rule the booking page enforces. Anyone else
+     * still reads the shortfall, without a name or a link that would 403.
+     */
+    const topReservedBookingRow =
+      shortfall && topReservedBooking
+        ? await db.booking.findFirst({
+            where: { id: topReservedBooking.bookingId, organizationId },
+            select: {
+              name: true,
+              custodianUserId: true,
+              custodianTeamMember: { select: { userId: true } },
+            },
+          })
+        : null;
+
+    const overCommitment =
+      shortfall &&
+      topReservedBooking &&
+      topReservedBookingRow &&
+      canSeeBooking({
+        access,
+        booking: topReservedBookingRow,
+        userId,
+      })
+        ? {
+            ...shortfall,
+            booking: {
+              id: topReservedBooking.bookingId,
+              name: topReservedBookingRow.name,
+              units: topReservedBooking._sum.quantity ?? 0,
+            },
+          }
+        : shortfall;
+
+    /** We only need customField with same category of asset or without any category */
+    const customFields = asset.categoryId
+      ? asset.customFields.filter(
+          (cf) =>
+            !cf.customField.categories.length ||
+            cf.customField.categories
+              .map((c) => c.id)
+              .includes(asset.categoryId!)
+        )
+      : asset.customFields;
+
+    /**
+     * Editor data is only needed for users who can update the asset. View-only
+     * users see static display rows and never enter edit mode, so we skip the
+     * categories/locations/custom-fields-definitions queries entirely. We also
+     * skip tags — they are read-only on the overview page in this iteration.
+     */
+    const [allCustomFieldDefs, categoriesData, locationsData] = canEditAsset
+      ? await Promise.all([
+          getActiveCustomFields({
+            organizationId,
+            category: asset.categoryId,
+          }),
+          getCategoriesForCreateAndEdit({
+            request,
+            organizationId,
+            defaultCategory: asset.categoryId,
+          }),
+          getLocationsForCreateAndEdit({
+            request,
+            organizationId,
+            defaultLocation: getPrimaryLocation(asset)?.id ?? undefined,
+          }),
+        ])
+      : [
+          [],
+          { categories: [], totalCategories: 0 },
+          { locations: [], totalLocations: 0 },
+        ];
+
+    const { categories, totalCategories } = categoriesData;
+    const { locations, totalLocations } = locationsData;
+    const header: HeaderData = {
+      title: `${asset.title}'s overview`,
+    };
+
+    /**
+     * Move-units destinations: org-wide list of `{ id, name }` shapes for the
+     * `MoveUnitsDialog` destination picker (split/merge UX).
+     *
+     * Returned unfiltered — render-time logic filters out the current source
+     * row per dialog instance so the picker never offers the source as a
+     * destination. Tight `select` keeps payload small even on orgs with
+     * thousands of locations or kits.
+     *
+     * Only meaningful for QUANTITY_TRACKED assets; the dialogs themselves
+     * are gated by `isQuantityTracked(asset)` in the JSX below.
+     */
+    const [allOrgLocations, allOrgKits] = isQuantityTracked(asset)
+      ? await Promise.all([
+          db.location.findMany({
+            where: { organizationId },
+            select: { id: true, name: true },
+            orderBy: { name: "asc" },
+          }),
+          db.kit.findMany({
+            where: { organizationId },
+            select: { id: true, name: true },
+            orderBy: { name: "asc" },
+          }),
+        ])
+      : [[], []];
+
+    const moveDestinations = {
+      locations: allOrgLocations,
+      kits: allOrgKits,
+    };
+
+    /**
+     * Unplaced quantity = `Asset.quantity` − Σ `AssetLocation.quantity` for
+     * MANUAL pivot rows (`assetKitId IS NULL`). Kit-driven AssetLocation
+     * rows are derived from `AssetKit.quantity` and would double-count.
+     * Always `0` for INDIVIDUAL assets.
+     */
+    const unplacedQuantity = isQuantityTracked(asset)
+      ? Math.max(
+          0,
+          (asset.quantity ?? 0) -
+            (asset.assetLocations ?? []).reduce(
+              (sum: number, al) =>
+                al.assetKitId == null ? sum + (al.quantity ?? 0) : sum,
+              0
+            )
+        )
+      : 0;
+
+    /**
+     * How many OTHER people hold custody, counted by person before the
+     * custodians are redacted below. One person can hold several rows (one
+     * per source location, plus kit-inherited ones), and once redacted those
+     * rows no longer say whose they are. Only read when the viewer cannot see
+     * everyone's custody.
+     */
+    const otherCustodyHolders = access.custody.seeAll
+      ? 0
+      : new Set(
+          (asset.custody ?? [])
+            .filter(
+              (c) => c.custodian?.userId !== userId && c.custodian?.id != null
+            )
+            .map((c) => c.custodian.id)
+        ).size;
+
+    return payload({
+      // Same reasoning as the parent detail route: this payload carries
+      // `custody[].custodian` and is reachable with `asset: read`.
+      asset: redactCustodianForViewer([{ ...asset, customFields }], {
+        canSeeAllCustody: access.custody.seeAll,
+        userId,
+      })[0],
+      currentOrganization,
+      userId,
+      lastScan,
+      auditHistory,
+      header,
+      locale,
+      timeZone,
+      qrObj,
+      reminders,
+      quantityData,
+      overCommitment,
+      teamMembers,
+      totalTeamMembers,
+      categories,
+      totalCategories,
+      locations,
+      totalLocations,
+      allCustomFieldDefs,
+      moveDestinations,
+      unplacedQuantity,
+      otherCustodyHolders,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+/**
+ * The reads behind the over-commitment notice: the pool's availability from
+ * now on, and the largest upcoming RESERVED booking's standalone units. See
+ * the note where the loader uses them.
+ */
+function loadOverCommitmentReads(assetId: string, organizationId: string) {
+  return Promise.all([
+    getAssetAvailability({
+      assetId,
+      organizationId,
+      window: { from: new Date(), to: AVAILABILITY_HORIZON },
+    }),
+    db.bookingAsset
+      .groupBy({
+        by: ["bookingId"],
+        where: {
+          assetId,
+          assetKitId: null,
+          booking: {
+            status: BookingStatus.RESERVED,
+            to: { gt: new Date() },
+          },
+        },
+        _sum: { quantity: true },
+        orderBy: { _sum: { quantity: "desc" } },
+        take: 1,
+      })
+      .then((rows) => rows[0] ?? null),
+  ]);
+}
+
+/**
+ * "From now on" for the over-commitment peak. A window end the booking
+ * engine's filter can hold: Prisma refuses to serialise the package's
+ * `FAR_FUTURE_SENTINEL` (the JS max date) as a DateTime argument.
+ */
+const AVAILABILITY_HORIZON = new Date("9999-12-31T00:00:00.000Z");
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: data ? appendToMetaTitle(data.header.title) : "" },
+];
+
+export const handle = {
+  breadcrumb: () => "Overview",
+};
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { assetId: id } = getParams(params, z.object({ assetId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const { organizationId } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.asset,
+      action: PermissionAction.update,
+    });
+
+    const formData = await request.formData();
+
+    /**
+     * Move-units intents (`MoveAxis`) are dispatched off a separate hidden
+     * field — `MOVE_UNITS_INTENT_FIELD` — so we can keep the existing
+     * `intent` enum dispatch below untouched. The `MoveUnitsDialog` component
+     * always sends this field; if present, take that branch and return.
+     */
+    const moveUnitsIntentRaw = formData.get(MOVE_UNITS_INTENT_FIELD);
+    if (typeof moveUnitsIntentRaw === "string" && moveUnitsIntentRaw) {
+      const moveResult = await handleMoveUnitsIntent({
+        formData,
+        assetId: id,
+        organizationId,
+        userId,
+      });
+      return moveResult;
+    }
+
+    const { intent } = parseData(
+      formData,
+      z.object({ intent: z.enum(["toggle", "updateField"]) })
+    );
+
+    if (intent === "toggle") {
+      const { availableToBook } = parseData(
+        formData,
+        AvailabilityForBookingFormSchema
+      );
+
+      await updateAssetBookingAvailability({
+        id,
+        organizationId,
+        availableToBook,
+        userId,
+      });
+
+      sendNotification({
+        title: "Asset availability status updated successfully",
+        message: "Your asset's availability for booking has been updated",
+        icon: { name: "success", variant: "success" },
+        senderId: authSession.userId,
+      });
+      return payload(null);
+    } else if (intent === "updateField") {
+      const { fieldName } = parseData(
+        formData,
+        z.object({
+          fieldName: z.enum([
+            "description",
+            "category",
+            "location",
+            "valuation",
+            "customField",
+          ]),
+        })
+      );
+
+      const fieldValue = formData.get("fieldValue") as string | null;
+
+      switch (fieldName) {
+        case "description": {
+          const { fieldValue: rawDescription } = parseData(
+            formData,
+            z.object({ fieldValue: assetDescriptionSchema.optional() })
+          );
+          /** Trim whitespace; treat empty as empty string (Prisma allows it) */
+          const description = (rawDescription ?? "").trim();
+          await updateAsset({
+            id,
+            description,
+            userId,
+            organizationId,
+            request,
+          });
+          break;
+        }
+        case "category": {
+          await updateAsset({
+            id,
+            categoryId: fieldValue || "uncategorized",
+            userId,
+            organizationId,
+            request,
+          });
+          break;
+        }
+        case "location": {
+          const newLocationId =
+            (formData.get("newLocationId") as string) || undefined;
+          const currentLocationId =
+            (formData.get("currentLocationId") as string) || undefined;
+          await updateAsset({
+            id,
+            newLocationId,
+            currentLocationId,
+            userId,
+            organizationId,
+            request,
+          });
+          break;
+        }
+        case "valuation": {
+          const rawVal = formData.get("fieldValue") as string | null;
+          const valuation = parseAssetValuation(rawVal);
+          await updateAsset({
+            id,
+            valuation,
+            userId,
+            organizationId,
+            request,
+          });
+          break;
+        }
+        case "customField": {
+          const customFieldId = formData.get("customFieldId") as string;
+
+          /**
+           * Org+category scoped lookup. Throws 404 if the asset does not belong
+           * to this organization, blocking cross-org writes. The asset's category
+           * is what gates which custom-field defs are returned, preventing crafted
+           * POSTs from writing values for fields outside this asset's category.
+           */
+          const customFields = await getActiveCustomFieldsForAsset({
+            id,
+            organizationId,
+          });
+          const fieldDef = customFields.find((cf) => cf.id === customFieldId);
+          if (!fieldDef) {
+            throw new ShelfError({
+              cause: null,
+              message: "Custom field not found",
+              label: "Assets",
+              status: 400,
+            });
+          }
+
+          const builtValue = buildCustomFieldValue(
+            { raw: fieldValue ?? "" },
+            fieldDef
+          );
+
+          /**
+           * Block clearing required custom fields. The full edit form
+           * enforces this via mergedSchema; inline editing must match.
+           */
+          if (!builtValue && fieldDef.required) {
+            throw new ShelfError({
+              cause: null,
+              message: `${fieldDef.name} is required and cannot be empty`,
+              label: "Assets",
+              shouldBeCaptured: false,
+              status: 400,
+            });
+          }
+
+          const customFieldsValues = builtValue
+            ? [{ id: customFieldId, value: builtValue }]
+            : [{ id: customFieldId, value: undefined }];
+
+          await updateAsset({
+            id,
+            customFieldsValues:
+              customFieldsValues as ShelfAssetCustomFieldValueType[],
+            userId,
+            organizationId,
+            request,
+          });
+          break;
+        }
+        default:
+          checkExhaustiveSwitch(fieldName);
+      }
+
+      sendNotification({
+        title: "Asset updated",
+        message: "Your asset has been updated successfully",
+        icon: { name: "success", variant: "success" },
+        senderId: authSession.userId,
+      });
+      return payload({ success: true });
+    } else {
+      checkExhaustiveSwitch(intent);
+      return payload(null);
+    }
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, id });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+/**
+ * Zod schemas for the three move-units intents. Each schema carries the
+ * discriminator literal so we can narrow off it after parse.
+ *
+ * - `location`       — manual AssetLocation → AssetLocation move
+ * - `kit`            — AssetKit → AssetKit move (cascades to bookings)
+ * - `place-unplaced` — one-sided placement of unplaced units
+ *
+ * `toId` is the destination row id submitted by the dialog's hidden mirror
+ * (axis-agnostic). The server maps it to `toLocationId` / `toKitId` per axis.
+ */
+const moveUnitsLocationSchema = z.object({
+  [MOVE_UNITS_INTENT_FIELD]: z.literal("location"),
+  fromLocationId: z.string().cuid("Invalid source location."),
+  toId: z.string().cuid("Please pick a destination."),
+  quantity: z.coerce
+    .number()
+    .int("Quantity must be a whole number.")
+    .positive("Quantity must be greater than zero."),
+});
+
+const moveUnitsKitSchema = z.object({
+  [MOVE_UNITS_INTENT_FIELD]: z.literal("kit"),
+  fromKitId: z.string().cuid("Invalid source kit."),
+  toId: z.string().cuid("Please pick a destination."),
+  quantity: z.coerce
+    .number()
+    .int("Quantity must be a whole number.")
+    .positive("Quantity must be greater than zero."),
+});
+
+const placeUnplacedSchema = z.object({
+  [MOVE_UNITS_INTENT_FIELD]: z.literal("place-unplaced"),
+  toId: z.string().cuid("Please pick a destination."),
+  quantity: z.coerce
+    .number()
+    .int("Quantity must be a whole number.")
+    .positive("Quantity must be greater than zero."),
+});
+
+/**
+ * Handle a `MoveUnitsDialog` submission. Dispatches on the axis discriminator,
+ * validates the form body with axis-specific Zod schema, and calls the matching
+ * Wave 1 service. Errors are wrapped with `error()` so `getValidationErrors`
+ * on the client can surface per-field messages.
+ *
+ * @param args.formData      - Parsed request form data
+ * @param args.assetId       - Asset id from the route params
+ * @param args.organizationId - Caller's active organization
+ * @param args.userId        - Acting user id (for note + event authorship)
+ * @returns A `data()` response wrapping `{ success: true }` or an error.
+ */
+async function handleMoveUnitsIntent({
+  formData,
+  assetId,
+  organizationId,
+  userId,
+}: {
+  formData: FormData;
+  assetId: string;
+  organizationId: string;
+  userId: string;
+}) {
+  /**
+   * Narrow off the axis discriminator with a small enum parse first so we
+   * give a clear error for malformed inputs before running the axis-specific
+   * schema.
+   */
+  const moveAxisEnum: z.ZodType<MoveAxis> = z.enum([
+    "location",
+    "kit",
+    "place-unplaced",
+  ]);
+  const { [MOVE_UNITS_INTENT_FIELD]: axis } = parseData(
+    formData,
+    z.object({
+      [MOVE_UNITS_INTENT_FIELD]: moveAxisEnum,
+    })
+  );
+
+  try {
+    switch (axis) {
+      case "location": {
+        const parsed = parseData(formData, moveUnitsLocationSchema);
+        await moveAssetLocationUnits({
+          assetId,
+          organizationId,
+          userId,
+          fromLocationId: parsed.fromLocationId,
+          toLocationId: parsed.toId,
+          quantity: parsed.quantity,
+        });
+        return payload({ success: true });
+      }
+      case "kit": {
+        const parsed = parseData(formData, moveUnitsKitSchema);
+        await moveAssetKitUnits({
+          assetId,
+          organizationId,
+          userId,
+          fromKitId: parsed.fromKitId,
+          toKitId: parsed.toId,
+          quantity: parsed.quantity,
+        });
+        return payload({ success: true });
+      }
+      case "place-unplaced": {
+        const parsed = parseData(formData, placeUnplacedSchema);
+        await placeUnplacedUnits({
+          assetId,
+          organizationId,
+          userId,
+          toLocationId: parsed.toId,
+          quantity: parsed.quantity,
+        });
+        return payload({ success: true });
+      }
+      default:
+        checkExhaustiveSwitch(axis);
+        return payload(null);
+    }
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, assetId, axis });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+// react-doctor:no-giant-component — deferred for follow-up refactor
+export default function AssetOverview() {
+  const {
+    asset,
+    locale,
+    qrObj,
+    lastScan,
+    auditHistory,
+    currentOrganization,
+    userId,
+    quantityData,
+    overCommitment,
+    allCustomFieldDefs,
+    moveDestinations,
+    unplacedQuantity,
+    otherCustodyHolders,
+  } = useLoaderData<typeof loader>();
+  const { prefs } = useDateFormatter();
+  /**
+   * The pool's sources from the asset detail loader, shared with the header
+   * actions menu so every Assign / Adjust dialog shows the same numbers.
+   */
+  const custodySources = useAssetCustodySources();
+
+  /** Route URL used by all three `MoveUnitsDialog` form submissions. */
+  const moveUnitsActionUrl = `/assets/${asset.id}/overview`;
+
+  /**
+   * The model's cover image, if the linked model has one. Used only to decide
+   * whether to explain that the displayed image is inherited — the image
+   * itself is resolved inside `AssetImage`.
+   *
+   * Read directly off the loader type, NOT through a cast: an `as {...}` here
+   * previously masked the fact that the select wasn't returning these columns
+   * at all, which is exactly the compile-time guard this feature relies on.
+   */
+  const assetModelImage = asset.assetModel?.image;
+
+  const booking =
+    asset.status === AssetStatus.CHECKED_OUT && asset?.bookingAssets?.length
+      ? asset?.bookingAssets[0]?.booking
+      : undefined;
+
+  /**
+   * Build ONE unified list of ALL custom fields, sorted alphabetically.
+   * Each entry pairs the field definition with its stored value (or null
+   * if not set). This keeps fields in a stable position regardless of
+   * whether they have values — no jumping when a user adds or clears data.
+   *
+   * The asset's own values are the primary source: `allCustomFieldDefs` is
+   * loaded ONLY for users who can update the asset, so building the list from
+   * it alone hid every custom field from BASE and SELF_SERVICE users.
+   */
+  const allCustomFields = buildAssetOverviewCustomFields({
+    storedValues: asset?.customFields ?? [],
+    editableDefinitions: allCustomFieldDefs ?? [],
+  });
+
+  const location = asset ? getPrimaryLocation(asset) : null;
+  usePosition();
+  const fetcher = useFetcher();
+  const zo = useZorm(
+    "NewQuestionWizardScreen",
+    AvailabilityForBookingFormSchema
+  );
+  const roles = useOrganizationRoles();
+  const assignsSelfOnly = useRoleAccess().custody.assign === "self";
+  const { canUseBarcodes } = useBarcodePermissions();
+  const canUpdateAvailability = userHasPermission({
+    roles,
+    entity: PermissionEntity.asset,
+    action: PermissionAction.update,
+  });
+  const hasCustodyPermission = userHasPermission({
+    roles,
+    entity: PermissionEntity.asset,
+    action: PermissionAction.custody,
+  });
+  const canViewAllCustody = userHasCustodyViewPermission({
+    roles,
+    organization: currentOrganization,
+  });
+  /**
+   * Archived assets are frozen: reinstate or permanently delete, nothing else
+   * (issue #382). Folding `archivedAt` in here rather than at each control
+   * means every inline editor, placement action, move-unit action and custody
+   * control on this route inherits the freeze from one place, and the page
+   * cannot drift as controls are added. Reinstate lives in the Actions
+   * dropdown, so it is unaffected.
+   *
+   * Comments are the one deliberate exception: the Activity tab keeps its
+   * composer on an archived asset, so people can record why it was archived
+   * or what became of it. A comment changes nothing about the asset itself.
+   */
+  const assetIsFrozen = !!asset?.archivedAt;
+  const canEditAsset = canUpdateAvailability && !assetIsFrozen;
+  const canCustody = hasCustodyPermission && !assetIsFrozen;
+
+  return (
+    <div>
+      <ContextualModal />
+      <div className="mx-[-16px] mt-[-16px] block md:mx-0 lg:flex ">
+        <div className="max-w-full flex-1 overflow-hidden">
+          <Card className="my-3 max-w-full px-[-4] py-[-5] md:border">
+            <ul className="item-information">
+              <li className="w-full border-b-[1.1px] border-b-gray-100 p-4 last:border-b-0 md:flex">
+                <span className="w-1/4 text-[14px] font-medium text-gray-900">
+                  ID
+                </span>
+                <div className="mt-1 w-3/5 text-gray-600 md:mt-0">
+                  {asset?.id}
+                </div>
+              </li>
+              {asset?.sequentialId ? (
+                <li className="w-full border-b-[1.1px] border-b-gray-100 p-4 last:border-b-0 md:flex">
+                  <span className="w-1/4 text-[14px] font-medium text-gray-900">
+                    Asset ID
+                  </span>
+                  <div className="mt-1 w-3/5 text-gray-600 md:mt-0">
+                    {asset.sequentialId}
+                  </div>
+                </li>
+              ) : null}
+              {asset?.qrCodes?.[0] ? (
+                <li className="w-full border-b-[1.1px] border-b-gray-100 p-4 last:border-b-0 md:flex">
+                  <span className="w-1/4 text-[14px] font-medium text-gray-900">
+                    Shelf QR ID
+                  </span>
+                  <div className="mt-1 w-3/5 text-gray-600 md:mt-0">
+                    {asset.qrCodes[0].id}
+                  </div>
+                </li>
+              ) : null}
+              <li className="w-full border-b-[1.1px] border-b-gray-100 p-4 last:border-b-0 md:flex">
+                <span className="w-1/4 text-[14px] font-medium text-gray-900">
+                  Created
+                </span>
+                <div className="mt-1 w-3/5 text-gray-600 md:mt-0">
+                  <DateS date={asset.createdAt} includeTime />
+                </div>
+              </li>
+
+              <InlineEditableField
+                fieldName="category"
+                label="Category"
+                canEdit={canEditAsset}
+                renderDisplay={() => (
+                  <CategoryBadge category={asset.category} linkToAssets />
+                )}
+                renderEditor={() => (
+                  <DynamicSelect
+                    fieldName="fieldValue"
+                    defaultValue={asset.category?.id ?? undefined}
+                    model={{ name: "category", queryKey: "name" }}
+                    contentLabel="Categories"
+                    placeholder="Select category"
+                    initialDataKey="categories"
+                    countKey="totalCategories"
+                    closeOnSelect
+                    allowClear
+                    hideLabel
+                  />
+                )}
+              />
+
+              {isQuantityTracked(asset) ? (
+                /*
+                 * QUANTITY_TRACKED variant: render every placement with
+                 * its per-location qty, and route the pencil edit
+                 * button to the multi-row "Manage placements" modal
+                 * instead of the inline single-location editor. Same
+                 * shell as `InlineEditableField` so the row visually
+                 * matches the rest of the detail list. INDIVIDUAL
+                 * assets keep the original inline editor below (one
+                 * pivot row max, the inline `LocationSelect` is fine).
+                 */
+                <li className="group/field w-full border-b-[1.1px] border-b-gray-100 p-4 last:border-b-0 md:flex">
+                  <span className="w-1/4 text-[14px] font-medium text-gray-900">
+                    Location
+                  </span>
+                  <div className="relative mt-1 flex items-start gap-2 md:mt-0 md:w-3/5">
+                    <div className="min-w-0 flex-1">
+                      {asset.assetLocations.length > 0 ? (
+                        <ul className="-ml-2 flex flex-col gap-1">
+                          {asset.assetLocations.map((al) => {
+                            const viaKit = al.assetKit?.kit ?? null;
+                            return (
+                              <li
+                                key={`${al.location.id}-${
+                                  al.assetKitId ?? "manual"
+                                }`}
+                                className="flex items-center gap-2"
+                              >
+                                <LocationBadge
+                                  location={{
+                                    id: al.location.id,
+                                    name: al.location.name,
+                                    parentId: al.location.parentId,
+                                    childCount:
+                                      al.location._count?.children ?? 0,
+                                  }}
+                                />
+                                {viaKit ? (
+                                  <TooltipProvider delayDuration={150}>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <Button
+                                          to={`/kits/${viaKit.id}`}
+                                          role="link"
+                                          variant="link"
+                                          target="_blank"
+                                          className="shrink-0 rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 no-underline hover:bg-blue-100 hover:text-blue-800"
+                                        >
+                                          via kit
+                                        </Button>
+                                      </TooltipTrigger>
+                                      <TooltipContent
+                                        side="top"
+                                        className="max-w-xs"
+                                      >
+                                        <p className="text-xs font-semibold text-gray-700">
+                                          {viaKit.name}
+                                        </p>
+                                        <p className="mt-1 text-xs text-gray-500">
+                                          These units are at this location
+                                          because the asset is in this kit.
+                                          Change the kit&apos;s location to move
+                                          them.
+                                        </p>
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
+                                ) : null}
+                                <span className="shrink-0 text-xs tabular-nums text-gray-500">
+                                  {al.quantity} {asset.unitOfMeasure || "units"}
+                                </span>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      ) : (
+                        <span className="text-gray-600">
+                          No locations · {asset.quantity ?? 0}{" "}
+                          {asset.unitOfMeasure || "units"} unplaced
+                        </span>
+                      )}
+                    </div>
+                    {canEditAsset ? (
+                      <Button
+                        // Relative to the current overview route
+                        // (`/assets/<id>/overview/`) — the dropdown
+                        // version uses `overview/manage-placements`
+                        // because it's mounted from the parent route.
+                        to="manage-placements"
+                        variant="link"
+                        aria-label="Manage placements"
+                        title="Manage placements"
+                        className="hidden shrink-0 rounded p-1 text-gray-500 transition-opacity hover:bg-gray-100 hover:text-gray-700 md:inline-flex md:opacity-0 md:group-hover/field:opacity-100 md:focus-visible:opacity-100"
+                      >
+                        <Icon icon="pen" />
+                      </Button>
+                    ) : null}
+                  </div>
+                </li>
+              ) : (
+                <InlineEditableField
+                  fieldName="location"
+                  label="Location"
+                  canEdit={canEditAsset}
+                  isEmpty={!location}
+                  renderDisplay={() =>
+                    location ? (
+                      <div className="-ml-2">
+                        <LocationBadge
+                          location={{
+                            id: location.id,
+                            name: location.name,
+                            parentId: location.parentId,
+                            childCount: location._count?.children ?? 0,
+                          }}
+                        />
+                      </div>
+                    ) : (
+                      <span className="text-gray-600">No location</span>
+                    )
+                  }
+                  renderEditor={() => (
+                    <LocationSelect
+                      isBulk={false}
+                      locationId={location?.id ?? undefined}
+                      fieldName="newLocationId"
+                      defaultValue={location?.id ?? undefined}
+                      hideClearButton={false}
+                      hideCurrentLocationInput={false}
+                    />
+                  )}
+                />
+              )}
+
+              <InlineEditableField
+                fieldName="description"
+                label="Description"
+                canEdit={canEditAsset}
+                isEmpty={!asset.description}
+                renderDisplay={() => (
+                  <div className="whitespace-pre-wrap text-gray-600">
+                    {asset.description || "No description"}
+                  </div>
+                )}
+                renderEditor={() => (
+                  <div>
+                    <Input
+                      label="Description"
+                      hideLabel
+                      inputType="textarea"
+                      name="fieldValue"
+                      defaultValue={asset.description ?? ""}
+                      className="w-full"
+                      characterLimit={ASSET_DESCRIPTION_MAX_LENGTH}
+                    />
+                  </div>
+                )}
+              />
+
+              {/* Tags — read-only display. Inline editing deferred to a
+                  follow-up PR (TagsAutocomplete needs a multi-select
+                  DynamicSelect variant for compact inline contexts). */}
+              <li className="w-full border-b-[1.1px] border-b-gray-100 p-4 last:border-b-0 md:flex">
+                <span className="w-1/4 text-[14px] font-medium text-gray-900">
+                  Tags
+                </span>
+                <div className="mt-1 text-gray-600 md:mt-0 md:w-3/5">
+                  {asset.tags?.length > 0 ? (
+                    <div className="-ml-2">
+                      {asset.tags.map((tag) => (
+                        <AssetsFilterLink
+                          key={tag.id}
+                          filter={{ tag: tag.id }}
+                          title={`View assets tagged ${tag.name}`}
+                        >
+                          <Tag
+                            className="ml-2"
+                            color={tag.color ?? undefined}
+                            withDot={false}
+                          >
+                            {tag.name}
+                          </Tag>
+                        </AssetsFilterLink>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="text-gray-600">No tags</span>
+                  )}
+                </div>
+              </li>
+
+              <InlineEditableField
+                fieldName="valuation"
+                label="Value"
+                canEdit={canEditAsset}
+                isEmpty={asset.valuation == null}
+                renderDisplay={() => (
+                  <div className="text-gray-600">
+                    {asset.valuation != null
+                      ? formatCurrency({
+                          value: asset.valuation,
+                          locale,
+                          currency: asset.organization.currency,
+                        })
+                      : "No value"}
+                  </div>
+                )}
+                renderEditor={() => (
+                  /*
+                   * Use type="text" with inputMode="decimal" — NOT
+                   * type="number" (which silently strips non-numeric chars
+                   * before submit, making server-side validation unreachable)
+                   * and NOT with a `pattern` attribute (which the browser
+                   * enforces with a native validation tooltip that ALSO
+                   * blocks form submission).
+                   *
+                   * The server-side `Number.isFinite()` check in the action
+                   * handler is the source of truth for valuation validation;
+                   * any browser-side gate would prevent the user from seeing
+                   * those server errors.
+                   *
+                   * inputMode="decimal" still hints mobile keyboards to show
+                   * the numeric keypad.
+                   */
+                  <Input
+                    label="Value"
+                    hideLabel
+                    type="text"
+                    inputMode="decimal"
+                    name="fieldValue"
+                    defaultValue={asset.valuation ?? undefined}
+                    className="w-full"
+                  />
+                )}
+              />
+
+              {/* QT-aware: shows total value (per-unit × quantity) below the
+                  per-unit Value row. Hidden for INDIVIDUAL assets and QT with
+                  qty=1 where it would be redundant. */}
+              {isQuantityTracked(asset) &&
+              asset.valuation != null &&
+              (asset.quantity ?? 1) > 1
+                ? (() => {
+                    const breakdown = formatAssetValueWithBreakdown(asset, {
+                      currency: asset.organization.currency,
+                      locale,
+                    });
+                    return (
+                      <li className="w-full border-b-[1.1px] border-b-gray-100 p-4 last:border-b-0 md:flex">
+                        <span className="w-1/4 text-[14px] font-medium text-gray-900">
+                          Total value
+                        </span>
+                        <div className="mt-1 text-gray-600 md:mt-0 md:w-3/5">
+                          {breakdown.total}
+                          {breakdown.unit && breakdown.suffix ? (
+                            <span className="text-gray-500">
+                              {" "}
+                              ({breakdown.unit} {breakdown.suffix})
+                            </span>
+                          ) : null}
+                        </div>
+                      </li>
+                    );
+                  })()
+                : null}
+
+              {asset?.assetModel ? (
+                <li className="w-full border-b-[1.1px] border-b-gray-100 p-4 last:border-b-0 md:flex">
+                  <span className="w-1/4 text-[14px] font-medium text-gray-900">
+                    Asset Model
+                  </span>
+                  <div className="mt-1 text-gray-600 md:mt-0 md:w-3/5">
+                    {userHasPermission({
+                      roles,
+                      entity: PermissionEntity.assetModel,
+                      action: PermissionAction.update,
+                    }) ? (
+                      <Button
+                        to={`/settings/asset-models/${asset.assetModel.id}/edit`}
+                        variant="link-gray"
+                        className="text-gray-600 underline"
+                      >
+                        {asset.assetModel.name}
+                      </Button>
+                    ) : (
+                      <span>{asset.assetModel.name}</span>
+                    )}
+                    {/*
+                      Explains why this asset looks identical to every other
+                      one of its model. Shown only when the image actually
+                      comes from the model — an asset with its own upload
+                      overrides it, and saying otherwise would be wrong.
+                    */}
+                    <When truthy={!asset.mainImage && !!assetModelImage}>
+                      <div className="mt-1 text-[12px] text-gray-500">
+                        Image shown for this asset comes from its model. Upload
+                        an image on the asset to override it.
+                      </div>
+                    </When>
+                  </div>
+                </li>
+              ) : null}
+              {(() => {
+                const assetWithBarcodes = asset as AssetWithOptionalBarcodes;
+                const barcodeCount =
+                  assetWithBarcodes.barcodes?.length ||
+                  assetWithBarcodes._count?.barcodes ||
+                  0;
+
+                if (!barcodeCount) return null;
+
+                // Barcodes exist and addon is enabled — show them
+                if (canUseBarcodes && assetWithBarcodes.barcodes?.length) {
+                  return (
+                    <li className="w-full max-w-full p-4 last:border-b-0 md:block">
+                      <span className="mb-3 flex items-center gap-1 text-[14px] font-medium text-gray-900">
+                        Barcodes ({assetWithBarcodes.barcodes.length})
+                        <InfoTooltip
+                          iconClassName="size-4"
+                          content={
+                            <>
+                              <h6>Barcodes support</h6>
+                              <p>
+                                Want to know more about barcodes? Check out our
+                                knowledge base article on{" "}
+                                <Button
+                                  variant="link"
+                                  target="_blank"
+                                  to="https://www.shelf.nu/knowledge-base/alternative-barcodes"
+                                >
+                                  barcode support
+                                </Button>
+                              </p>
+                            </>
+                          }
+                        />
+                      </span>
+                      <div className="flex flex-wrap gap-3">
+                        {assetWithBarcodes.barcodes.map((barcode) => (
+                          <BarcodeCard key={barcode.id} barcode={barcode} />
+                        ))}
+                      </div>
+                    </li>
+                  );
+                }
+
+                // Barcodes exist but addon is disabled — show locked state
+                return (
+                  <li className="w-full max-w-full p-4 last:border-b-0 md:block">
+                    <span className="mb-3 flex items-center gap-1 text-[14px] font-medium text-gray-900">
+                      Barcodes ({barcodeCount})
+                    </span>
+                    <div className="flex flex-wrap gap-3">
+                      {Array.from({ length: barcodeCount }).map((_, i) => (
+                        <div
+                          key={i}
+                          className="flex h-[72px] w-[180px] items-center justify-center rounded border border-gray-200 bg-gray-50"
+                        >
+                          <div className="flex flex-col items-center gap-1 text-gray-400">
+                            <Icon icon="lock" />
+                            <span className="text-xs">Hidden</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-3">
+                      <UnlockBarcodesBanner />
+                    </div>
+                  </li>
+                );
+              })()}
+            </ul>
+          </Card>
+
+          {/* Custom fields — one unified alphabetically-sorted list */}
+          {allCustomFields.some((cf) => cf.storedValue) ||
+          (canEditAsset && allCustomFields.length > 0) ? (
+            <>
+              <TextualDivider
+                text="Custom fields"
+                className="mb-8 pt-3 lg:hidden"
+              />
+              <Card className="my-3 px-[-4] py-[-5] md:border">
+                <ul className="item-information">
+                  {allCustomFields.map(({ def, storedValue, isEditable }) => {
+                    const hasValue = !!storedValue;
+                    /**
+                     * A field the action would refuse to write (its definition
+                     * is outside the asset's category scope) stays visible but
+                     * read-only — offering an editor there would dead-end on a
+                     * 400.
+                     */
+                    const canEditField = canEditAsset && isEditable;
+                    const fieldValue = hasValue
+                      ? (storedValue.value as unknown as ShelfAssetCustomFieldValueType["value"])
+                      : null;
+                    const rawValue =
+                      fieldValue?.raw !== undefined
+                        ? String(fieldValue.raw)
+                        : "";
+                    const customFieldDisplayValue = hasValue
+                      ? getCustomFieldDisplayValue(fieldValue!, prefs)
+                      : null;
+
+                    /* Hide "Not set" rows from users who can't fill them in */
+                    if (!hasValue && !canEditField) return null;
+
+                    return (
+                      <InlineEditableField
+                        key={def.id}
+                        fieldName={`customField-${def.id}`}
+                        formFieldName="customField"
+                        label={def.name}
+                        canEdit={canEditField}
+                        extraHiddenInputs={{
+                          customFieldId: def.id,
+                        }}
+                        renderDisplay={() =>
+                          hasValue ? (
+                            <div
+                              className={tw(
+                                "text-gray-600",
+                                def.type !== CustomFieldType.MULTILINE_TEXT &&
+                                  "max-w-[350px]"
+                              )}
+                            >
+                              {def.type === CustomFieldType.MULTILINE_TEXT ? (
+                                <MarkdownViewer
+                                  content={
+                                    customFieldDisplayValue as RenderableTreeNode
+                                  }
+                                  allowExternalLinks
+                                />
+                              ) : isLink(customFieldDisplayValue as string) ? (
+                                <Button
+                                  variant="link-gray"
+                                  target="_blank"
+                                  to={buildCustomFieldLinkHref(
+                                    customFieldDisplayValue as string
+                                  )}
+                                >
+                                  {customFieldDisplayValue as string}
+                                </Button>
+                              ) : def.type === CustomFieldType.AMOUNT ? (
+                                formatCurrency({
+                                  value: fieldValue!.raw as number,
+                                  locale,
+                                  currency: asset.organization.currency,
+                                })
+                              ) : (
+                                (customFieldDisplayValue as string)
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-gray-400">Not set</span>
+                          )
+                        }
+                        renderEditor={() => {
+                          switch (def.type) {
+                            case CustomFieldType.MULTILINE_TEXT:
+                              return (
+                                <Input
+                                  label={def.name}
+                                  hideLabel
+                                  inputType="textarea"
+                                  name="fieldValue"
+                                  defaultValue={rawValue}
+                                  className="w-full"
+                                />
+                              );
+                            case CustomFieldType.BOOLEAN:
+                              return (
+                                <BooleanCustomFieldEditor
+                                  name="fieldValue"
+                                  label={def.name}
+                                  initialChecked={
+                                    fieldValue?.raw === "yes" ||
+                                    fieldValue?.raw === true
+                                  }
+                                  initialIsUnset={!hasValue}
+                                />
+                              );
+                            case CustomFieldType.DATE:
+                              return (
+                                <DateTimePicker
+                                  mode="date"
+                                  label={def.name}
+                                  hideLabel
+                                  name="fieldValue"
+                                  defaultValue={rawValue}
+                                  className="w-full"
+                                />
+                              );
+                            case CustomFieldType.OPTION:
+                              return (
+                                <select
+                                  aria-label={def.name}
+                                  name="fieldValue"
+                                  defaultValue={rawValue}
+                                  className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                                >
+                                  <option value="">Select an option</option>
+                                  {(def.options as string[] | null)
+                                    ?.filter(
+                                      (o: string) => o !== null && o !== ""
+                                    )
+                                    .map((option: string, index: number) => (
+                                      // Legacy fields can hold the same option twice.
+                                      <option
+                                        key={`${index}-${option}`}
+                                        value={option}
+                                      >
+                                        {option}
+                                      </option>
+                                    ))}
+                                </select>
+                              );
+                            case CustomFieldType.AMOUNT:
+                            case CustomFieldType.NUMBER:
+                              return (
+                                <Input
+                                  label={def.name}
+                                  hideLabel
+                                  type="text"
+                                  inputMode="decimal"
+                                  name="fieldValue"
+                                  defaultValue={rawValue}
+                                  className="w-full"
+                                />
+                              );
+                            default:
+                              return (
+                                <Input
+                                  label={def.name}
+                                  hideLabel
+                                  name="fieldValue"
+                                  defaultValue={rawValue}
+                                  className="w-full"
+                                />
+                              );
+                          }
+                        }}
+                      />
+                    );
+                  })}
+                </ul>
+              </Card>
+            </>
+          ) : null}
+        </div>
+
+        <div className="w-full md:w-[360px] lg:ml-4">
+          <When truthy={canUpdateAvailability}>
+            <Card className="my-3">
+              <fetcher.Form
+                ref={zo.ref}
+                method="post"
+                onChange={(e) => fetcher.submit(e.currentTarget)}
+              >
+                <div className="flex justify-between gap-3">
+                  <div>
+                    <p className="text-[14px] font-medium text-gray-700">
+                      Available for bookings
+                    </p>
+                    <p className="text-[12px] text-gray-600">
+                      {/* An archived asset can't be booked whatever this says.
+                          The switch shows Off for it, and this line keeps the
+                          stored setting, which a reinstate brings back. */}
+                      {asset?.archivedAt
+                        ? `Archived assets can't be booked. When reinstated, it will be ${
+                            asset.availableToBook ? "available" : "unavailable"
+                          } for bookings again.`
+                        : "Asset is available for being used in bookings"}
+                    </p>
+                  </div>
+                  <Switch
+                    // Remount when the archive state flips, so defaultChecked
+                    // is read again rather than kept from the previous state.
+                    key={asset?.archivedAt ? "archived" : "active"}
+                    name={zo.fields.availableToBook()}
+                    disabled={
+                      !canUpdateAvailability ||
+                      isFormProcessing(fetcher.state) ||
+                      // Archived assets are frozen: no actions except reinstate.
+                      !!asset?.archivedAt
+                    } // Disable for self service users + archived assets
+                    defaultChecked={
+                      !asset?.archivedAt && asset?.availableToBook
+                    }
+                    required
+                    title={
+                      asset?.archivedAt
+                        ? "This asset is archived. Reinstate it to change availability."
+                        : !canUpdateAvailability
+                        ? "You do not have the permissions to change availability"
+                        : "Toggle availability"
+                    }
+                  />
+                  <input type="hidden" value="toggle" name="intent" />
+                </div>
+              </fetcher.Form>
+            </Card>
+          </When>
+
+          <AssetReminderCards className="my-2" />
+
+          <AssetLastAuditCard assetId={asset.id} history={auditHistory} />
+
+          {(() => {
+            /**
+             * A QUANTITY_TRACKED asset can belong to multiple kits at
+             * distinct slices. Render one row per membership with the
+             * per-kit quantity badge on qty-tracked assets; INDIVIDUAL
+             * assets keep the single-name layout since they're DB-locked
+             * to one kit and have no meaningful "quantity per kit" to
+             * surface.
+             */
+            type KitMembership = {
+              quantity: number;
+              kit: { id: string; name: string } | null;
+            };
+            const memberships = ((asset.assetKits ?? []) as KitMembership[])
+              .filter((ak) => ak.kit?.id && ak.kit.name)
+              .map((ak) => ({
+                kitId: ak.kit!.id,
+                kitName: ak.kit!.name,
+                quantity: ak.quantity ?? 0,
+              }));
+            if (memberships.length === 0) return null;
+            const isQty = isQuantityTracked(asset);
+            const unit = asset.unitOfMeasure || "units";
+            return (
+              <Card className="my-3 py-3 md:border">
+                <div className="flex items-start gap-3">
+                  <div className="flex size-11 shrink-0 items-center justify-center rounded-full bg-gray-100/50">
+                    <div className="flex size-7 items-center justify-center rounded-full bg-gray-200">
+                      <Icon icon="kit" />
+                    </div>
+                  </div>
+
+                  <div className="min-w-0 flex-1">
+                    <h3 className="mb-1 text-sm font-semibold">
+                      {memberships.length > 1
+                        ? "Included in kits"
+                        : "Included in kit"}
+                    </h3>
+                    <ul className="space-y-1">
+                      {memberships.map((m) => (
+                        <li
+                          key={m.kitId}
+                          className="flex items-center justify-between gap-2"
+                        >
+                          <Button
+                            to={`/kits/${m.kitId}`}
+                            role="link"
+                            variant="link"
+                            className="min-w-0 justify-start truncate text-sm font-normal text-gray-700 underline hover:text-gray-700"
+                            target="_blank"
+                          >
+                            <span className="truncate">{m.kitName}</span>
+                          </Button>
+                          <div className="flex shrink-0 items-center gap-2">
+                            {isQty ? (
+                              <span className="text-xs tabular-nums text-gray-500">
+                                {m.quantity} {unit}
+                              </span>
+                            ) : null}
+                            {/*
+                             * Move-units affordance for kit allocations.
+                             * QUANTITY_TRACKED-only — INDIVIDUAL assets are
+                             * DB-locked to a single kit so the "move between
+                             * kits" flow is not meaningful for them.
+                             */}
+                            {isQty && canEditAsset ? (
+                              <MoveUnitsDialog
+                                axis="kit"
+                                assetId={asset.id}
+                                assetTitle={asset.title}
+                                unitOfMeasure={asset.unitOfMeasure}
+                                fromKit={{
+                                  id: m.kitId,
+                                  name: m.kitName,
+                                  quantity: m.quantity,
+                                }}
+                                destinations={moveDestinations.kits.filter(
+                                  (k) => k.id !== m.kitId
+                                )}
+                                actionUrl={moveUnitsActionUrl}
+                                trigger={
+                                  <Button
+                                    type="button"
+                                    variant="link"
+                                    className="text-xs font-normal text-gray-500 underline hover:text-gray-700"
+                                  >
+                                    Move
+                                  </Button>
+                                }
+                              />
+                            ) : null}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </Card>
+            );
+          })()}
+
+          {(() => {
+            /**
+             * "Placed at locations" sidebar card — mirrors the
+             * "Included in kits" card above. A QUANTITY_TRACKED asset
+             * can sit at multiple locations at distinct per-location
+             * slices; an INDIVIDUAL asset sits at exactly one. Render
+             * one row per placement with the per-location quantity
+             * badge for qty-tracked rows; the per-location qty is
+             * irrelevant for INDIVIDUAL (always 1, no signal). Hide
+             * the card entirely when there are zero placements so the
+             * sidebar doesn't grow an empty section for unplaced
+             * assets. The detailed multi-placement editor opens from
+             * the "Edit placements" button on this card.
+             */
+            type Placement = {
+              quantity: number;
+              location: {
+                id: string;
+                name: string;
+                parentId: string | null;
+                _count?: { children?: number };
+              } | null;
+              assetKitId: string | null;
+              assetKit: {
+                id: string;
+                kit: { id: string; name: string };
+              } | null;
+            };
+            const placements = ((asset.assetLocations ?? []) as Placement[])
+              .filter((al) => al.location?.id && al.location?.name)
+              .map((al) => ({
+                locationId: al.location!.id,
+                locationName: al.location!.name,
+                parentId: al.location!.parentId,
+                childCount: al.location!._count?.children ?? 0,
+                quantity: al.quantity ?? 0,
+                // Kit-driven rows render a "via {kit}" badge and are
+                // NOT editable from the manage-placements dialog. The
+                // kit info comes from the nested AssetKit → Kit
+                // relation pulled by `getAssetOverviewFields`.
+                viaKit: al.assetKit?.kit ?? null,
+              }));
+            if (placements.length === 0) return null;
+            const isQty = isQuantityTracked(asset);
+            const unit = asset.unitOfMeasure || "units";
+            return (
+              <Card className="my-3 py-3 md:border">
+                <div className="flex items-start gap-3">
+                  <div className="flex size-11 shrink-0 items-center justify-center rounded-full bg-gray-100/50">
+                    <div className="flex size-7 items-center justify-center rounded-full bg-gray-200">
+                      <Icon icon="location" />
+                    </div>
+                  </div>
+
+                  <div className="min-w-0 flex-1">
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <h3 className="text-sm font-semibold">
+                        {placements.length > 1
+                          ? "Placed at locations"
+                          : "Placed at location"}
+                      </h3>
+                      {isQty && canEditAsset ? (
+                        <Button
+                          to="manage-placements"
+                          variant="link"
+                          className="shrink-0 text-xs font-normal text-gray-500 underline hover:text-gray-700"
+                        >
+                          Edit placements
+                        </Button>
+                      ) : null}
+                    </div>
+                    <ul className="space-y-1">
+                      {placements.map((p) => (
+                        <li
+                          key={`${p.locationId}-${p.viaKit?.id ?? "manual"}`}
+                          className="flex items-center justify-between gap-2"
+                        >
+                          <div className="flex min-w-0 items-center gap-2">
+                            <Button
+                              to={`/locations/${p.locationId}`}
+                              role="link"
+                              variant="link"
+                              className="min-w-0 justify-start truncate text-sm font-normal text-gray-700 underline hover:text-gray-700"
+                              target="_blank"
+                            >
+                              <span className="truncate">{p.locationName}</span>
+                            </Button>
+                            {p.viaKit ? (
+                              <TooltipProvider delayDuration={150}>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      to={`/kits/${p.viaKit.id}`}
+                                      role="link"
+                                      variant="link"
+                                      target="_blank"
+                                      className="shrink-0 rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 no-underline hover:bg-blue-100 hover:text-blue-800"
+                                    >
+                                      via kit
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent
+                                    side="top"
+                                    className="max-w-xs"
+                                  >
+                                    <p className="text-xs font-semibold text-gray-700">
+                                      {p.viaKit.name}
+                                    </p>
+                                    <p className="mt-1 text-xs text-gray-500">
+                                      These units are at this location because
+                                      the asset is in this kit. Change the
+                                      kit&apos;s location to move them.
+                                    </p>
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                            ) : null}
+                          </div>
+                          <div className="flex shrink-0 items-center gap-2">
+                            {isQty ? (
+                              <PlacementCount
+                                quantity={p.quantity}
+                                unit={unit}
+                                inCustody={
+                                  // For a pool placed at two or more locations, how
+                                  // many of this location's units are out with
+                                  // people. Manual rows only: kit-held units
+                                  // follow the kit. Never names anyone.
+                                  custodySources?.multiSource && !p.viaKit
+                                    ? custodySources.options.find(
+                                        (o) => o.locationId === p.locationId
+                                      )?.inCustody ?? 0
+                                    : 0
+                                }
+                              />
+                            ) : null}
+                            {/*
+                             * Move-units affordance — manual rows only. Kit-driven
+                             * rows (`viaKit`) must be moved via the `kit` axis
+                             * because their quantity is derived from `AssetKit`,
+                             * not editable directly. Gated on edit permission +
+                             * QUANTITY_TRACKED so INDIVIDUAL assets don't see it.
+                             */}
+                            {isQty && canEditAsset && !p.viaKit ? (
+                              <MoveUnitsDialog
+                                axis="location"
+                                assetId={asset.id}
+                                assetTitle={asset.title}
+                                unitOfMeasure={asset.unitOfMeasure}
+                                fromLocation={{
+                                  id: p.locationId,
+                                  name: p.locationName,
+                                  quantity: p.quantity,
+                                }}
+                                destinations={moveDestinations.locations.filter(
+                                  (l) => l.id !== p.locationId
+                                )}
+                                actionUrl={moveUnitsActionUrl}
+                                trigger={
+                                  <Button
+                                    type="button"
+                                    variant="link"
+                                    className="text-xs font-normal text-gray-500 underline hover:text-gray-700"
+                                  >
+                                    Move
+                                  </Button>
+                                }
+                              />
+                            ) : null}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </Card>
+            );
+          })()}
+
+          {!isQuantityTracked(asset) ? (
+            <CustodyCard
+              booking={booking}
+              custody={asset?.custody || null}
+              hasPermission={userCanViewSpecificCustody({
+                roles,
+                // The holder the card shows, so a viewer always sees custody
+                // that is their own — including a booking they hold.
+                custodianUserId: getCustodyCardHolderUserId({
+                  custody: asset?.custody,
+                  booking,
+                  viewerUserId: userId,
+                }),
+                organization: currentOrganization,
+                currentUserId: userId,
+              })}
+            />
+          ) : null}
+
+          {isQuantityTracked(asset) ? (
+            <QuantityOverviewCard
+              assetId={asset.id}
+              quantity={asset.quantity ?? null}
+              unitOfMeasure={asset.unitOfMeasure ?? null}
+              minQuantity={asset.minQuantity ?? null}
+              consumptionType={asset.consumptionType ?? null}
+              availableQuantity={quantityData?.available}
+              custodyAvailableQuantity={quantityData?.custodyAvailable}
+              inCustodyQuantity={quantityData?.inCustody}
+              inKitsQuantity={quantityData?.inKits}
+              inLocationsQuantity={quantityData?.inLocations}
+              inLocationsManualQuantity={quantityData?.inLocationsManual}
+              reservedQuantity={quantityData?.reserved}
+              overCommitment={overCommitment}
+              reservingBookingCount={quantityData?.reservingBookingCount}
+              checkedOutQuantity={quantityData?.checkedOut}
+              canUpdate={canUpdateAvailability}
+              custodySources={custodySources}
+            />
+          ) : null}
+
+          {/*
+           * Place-unplaced CTA. Sits outside QuantityOverviewCard because
+           * that card is read-only and shared by other surfaces — adding
+           * an action would broaden its prop surface. Renders only when
+           * there are unplaced units AND the user can edit the asset.
+           */}
+          {isQuantityTracked(asset) && canEditAsset && unplacedQuantity > 0 ? (
+            <Card className="my-3 px-4 py-3 md:border">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-gray-600">
+                  <span className="font-semibold text-gray-900">
+                    {unplacedQuantity} {asset.unitOfMeasure || "units"}
+                  </span>{" "}
+                  currently unplaced.
+                </p>
+                <MoveUnitsDialog
+                  axis="place-unplaced"
+                  assetId={asset.id}
+                  assetTitle={asset.title}
+                  unitOfMeasure={asset.unitOfMeasure}
+                  unplacedQuantity={unplacedQuantity}
+                  destinations={moveDestinations.locations}
+                  actionUrl={moveUnitsActionUrl}
+                  trigger={
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      className="py-1 text-xs"
+                    >
+                      Place them
+                    </Button>
+                  }
+                />
+              </div>
+            </Card>
+          ) : null}
+
+          {isQuantityTracked(asset) ? (
+            <QuantityCustodyList
+              custody={asset.custody}
+              assetId={asset.id}
+              unitOfMeasure={asset.unitOfMeasure}
+              consumptionType={asset.consumptionType}
+              availableQuantity={quantityData?.custodyAvailable}
+              ownRowsOnly={assignsSelfOnly}
+              currentUserId={userId}
+              canViewAllCustody={canViewAllCustody}
+              canCustody={canCustody}
+              inKit={getPrimaryKit<{ id: string; name: string }>(asset)}
+              sources={custodySources}
+              otherHoldersCount={otherCustodyHolders}
+            />
+          ) : null}
+
+          {asset && (
+            <CodePreview
+              qrObj={qrObj}
+              barcodes={
+                canUseBarcodes
+                  ? (asset as AssetWithOptionalBarcodes).barcodes || []
+                  : []
+              }
+              item={{
+                id: asset.id,
+                name: asset.title,
+                type: "asset",
+              }}
+              sequentialId={asset.sequentialId}
+            />
+          )}
+          <When
+            truthy={userHasPermission({
+              roles,
+              entity: PermissionEntity.scan,
+              action: PermissionAction.read,
+            })}
+          >
+            <ScanDetails
+              lastScan={lastScan}
+              target={{ assetId: asset.id }}
+              itemName={asset.title}
+            />
+          </When>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Small helper for BOOLEAN custom fields.
+ * Supports tri-state: yes / no / unset (empty string).
+ * When `isUnset` is true the hidden input sends "" which
+ * `buildCustomFieldValue` treats as undefined (no value stored).
+ * This prevents "Not set" booleans from being forced to "no" on save.
+ */
+/**
+ * The unit count on a "Placed at locations" row, with "N in custody" on a
+ * second, smaller line when some of the location's units are out with
+ * people. Stacked rather than inline so a long location name keeps its room
+ * in the narrow sidebar.
+ */
+function PlacementCount({
+  quantity,
+  unit,
+  inCustody,
+}: {
+  quantity: number;
+  unit: string;
+  inCustody: number;
+}) {
+  if (inCustody <= 0) {
+    return (
+      <span className="text-xs tabular-nums text-gray-500">
+        {quantity} {unit}
+      </span>
+    );
+  }
+  return (
+    <span className="flex flex-col items-end text-xs tabular-nums text-gray-500">
+      <span>
+        {quantity} {unit}
+      </span>
+      <span className="text-gray-400">{inCustody} in custody</span>
+    </span>
+  );
+}
+
+function BooleanCustomFieldEditor({
+  name,
+  label,
+  initialChecked,
+  initialIsUnset = false,
+}: {
+  name: string;
+  label: string;
+  // why: named `initialChecked` / `initialIsUnset` rather than the more
+  // common `defaultChecked` / `defaultIsUnset` so they don't get treated
+  // as controlled-input defaults that should sync — once the user
+  // toggles, local state owns the value. Also silences react-doctor's
+  // `no-derived-useState` heuristic, which flags `default*`-named
+  // props seeded into useState as derived-state-in-disguise.
+  initialChecked: boolean;
+  initialIsUnset?: boolean;
+}) {
+  const [isUnset, setIsUnset] = useState(initialIsUnset);
+  const [checked, setChecked] = useState(initialChecked);
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        type="hidden"
+        name={name}
+        value={isUnset ? "" : checked ? "yes" : "no"}
+      />
+      <Switch
+        aria-label={label}
+        checked={!isUnset && checked}
+        onCheckedChange={(val) => {
+          setIsUnset(false);
+          setChecked(val);
+        }}
+      />
+      <span className="text-sm text-gray-600">
+        {isUnset ? `${label} (not set)` : label}
+      </span>
+      {/*
+       * Clear is only offered when the field was originally unset
+       * (initialIsUnset === true) and the user has just toggled the Switch on,
+       * so they can revert without committing a yes/no value. Once cleared, the
+       * only way back is to flip the Switch — which automatically un-sets
+       * isUnset via the onCheckedChange handler above.
+       */}
+      {!isUnset && initialIsUnset && (
+        <button
+          type="button"
+          onClick={() => setIsUnset(true)}
+          className="text-xs text-gray-400 underline hover:text-gray-600"
+        >
+          Clear
+        </button>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,674 @@
+import { ChevronLeft } from "lucide-react";
+import {
+  data,
+  type LoaderFunctionArgs,
+  type ActionFunctionArgs,
+} from "react-router";
+import {
+  Outlet,
+  useActionData,
+  useFetcher,
+  useLoaderData,
+  useNavigation,
+} from "react-router";
+import { z } from "zod";
+import { FileForm } from "~/components/assets/import-content-file-form";
+import { Form } from "~/components/custom-form";
+import FormRow from "~/components/forms/form-row";
+import Input from "~/components/forms/input";
+import { Switch } from "~/components/forms/switch";
+import HorizontalTabs from "~/components/layout/horizontal-tabs";
+import { Button } from "~/components/shared/button";
+import { DateS } from "~/components/shared/date";
+import { db } from "~/database/db.server";
+import { createAssetsFromContentImport } from "~/modules/asset/service.server";
+import { ASSET_CSV_HEADERS } from "~/modules/asset/utils.server";
+import {
+  toggleOrganizationSso,
+  toggleWorkspaceDisabled,
+  toggleBarcodeEnabled,
+  toggleAuditEnabled,
+  setRequireSsoLogin,
+} from "~/modules/organization/service.server";
+import { createDefaultWorkingHours } from "~/modules/working-hours/service.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+
+import { csvDataFromRequest } from "~/utils/csv.server";
+import { ShelfError, makeShelfError } from "~/utils/error";
+import { isFormProcessing } from "~/utils/form";
+import { getParams, payload, error, parseData } from "~/utils/http.server";
+import { extractCSVDataFromContentImport } from "~/utils/import.server";
+import { requireAdmin } from "~/utils/roles.server";
+import { hasSsoGroupMappings } from "~/utils/sso-group-roles";
+import { validateDomains } from "~/utils/sso.server";
+import { canUseBarcodes } from "~/utils/subscription.server";
+import { resolveUserDisplayName } from "~/utils/user";
+
+export const meta = () => [
+  { title: appendToMetaTitle("Organization details") },
+];
+export const loader = async ({ context, params }: LoaderFunctionArgs) => {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { organizationId } = getParams(
+    params,
+    z.object({ organizationId: z.string() }),
+    { additionalData: { userId } }
+  );
+
+  try {
+    await requireAdmin(userId);
+
+    const organization = await db.organization
+      .findFirstOrThrow({
+        where: { id: organizationId },
+        include: {
+          qrCodes: {
+            include: {
+              asset: true,
+            },
+          },
+          owner: true,
+          ssoDetails: true,
+          workingHours: true,
+        },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          title: "Organization not found",
+          message:
+            "The organization you are trying to access does not exist or you do not have permission to access it.",
+          additionalData: { userId, params },
+          label: "Admin dashboard",
+        });
+      });
+
+    if (!organization.workingHours) {
+      await createDefaultWorkingHours(organization.id);
+    }
+
+    return payload({ organization });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, organizationId });
+    throw data(error(reason), { status: reason.status });
+  }
+};
+
+export const action = async ({
+  context,
+  request,
+  params,
+}: ActionFunctionArgs) => {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { organizationId } = getParams(
+    params,
+    z.object({ organizationId: z.string() }),
+    { additionalData: { userId } }
+  );
+
+  try {
+    await requireAdmin(userId);
+    const { intent } = parseData(
+      await request.clone().formData(),
+      z.object({
+        intent: z.enum([
+          "toggleSso",
+          "updateSsoDetails",
+          "content",
+          "disableWorkspace",
+          "toggleBarcodes",
+          "toggleAudits",
+          "toggleRequireSsoLogin",
+        ]),
+      })
+    );
+
+    switch (intent) {
+      case "toggleSso": {
+        const { enabledSso } = parseData(
+          await request.formData(),
+          z.object({
+            enabledSso: z
+              .string()
+              .transform((val) => val === "on")
+              .default("false"),
+          })
+        );
+        await toggleOrganizationSso({ organizationId, enabledSso });
+
+        return payload({ message: "SSO toggled" });
+      }
+      case "disableWorkspace": {
+        const { workspaceDisabled } = parseData(
+          await request.formData(),
+          z.object({
+            workspaceDisabled: z
+              .string()
+              .transform((val) => val === "on")
+              .default("false"),
+          })
+        );
+        // console.log("workspaceDisabled", workspaceDisabled);
+        await toggleWorkspaceDisabled({ organizationId, workspaceDisabled });
+
+        return payload({
+          message: `Workspace ${workspaceDisabled ? "disabled" : "enabled"}`,
+        });
+      }
+      case "toggleBarcodes": {
+        const { barcodesEnabled } = parseData(
+          await request.formData(),
+          z.object({
+            barcodesEnabled: z
+              .string()
+              .transform((val) => val === "on")
+              .default("false"),
+          })
+        );
+        await toggleBarcodeEnabled({ organizationId, barcodesEnabled });
+
+        return payload({
+          message: `Barcodes ${barcodesEnabled ? "enabled" : "disabled"}`,
+        });
+      }
+      case "toggleAudits": {
+        const { auditsEnabled } = parseData(
+          await request.formData(),
+          z.object({
+            auditsEnabled: z
+              .string()
+              .transform((val) => val === "on")
+              .default("false"),
+          })
+        );
+        await toggleAuditEnabled({ organizationId, auditsEnabled });
+
+        return payload({
+          message: `Audits ${auditsEnabled ? "enabled" : "disabled"}`,
+        });
+      }
+      case "toggleRequireSsoLogin": {
+        const { requireSsoLogin } = parseData(
+          await request.formData(),
+          z.object({
+            requireSsoLogin: z
+              .string()
+              .transform((val) => val === "on")
+              .default("false"),
+          })
+        );
+        await setRequireSsoLogin({
+          organizationId,
+          requireSsoLogin,
+          actorUserId: userId,
+        });
+
+        return payload({
+          message: `Require SSO login ${requireSsoLogin ? "on" : "off"}`,
+        });
+      }
+      case "updateSsoDetails": {
+        /** A blank group field stores `null`: that role is not mapped. */
+        const optionalGroupId = z
+          .string()
+          .optional()
+          .transform((value) => value?.trim() || null);
+
+        const {
+          adminGroupId,
+          managerGroupId,
+          selfServiceGroupId,
+          baseUserGroupId,
+          domain,
+        } = parseData(
+          await request.formData(),
+          z
+            .object({
+              adminGroupId: optionalGroupId,
+              managerGroupId: optionalGroupId,
+              selfServiceGroupId: optionalGroupId,
+              baseUserGroupId: optionalGroupId,
+              domain: z
+                .string()
+                .transform((domains) => domains.toLowerCase())
+                .transform((domains, ctx) => {
+                  try {
+                    return validateDomains(domains).join(", ");
+                  } catch (error) {
+                    ctx.addIssue({
+                      code: z.ZodIssueCode.custom,
+                      message:
+                        error instanceof Error
+                          ? error.message
+                          : "Invalid domains",
+                    });
+                    return z.NEVER;
+                  }
+                }),
+            })
+            // Any one mapped role is enough for SSO to assign access; a setup
+            // with none gives SSO no role to assign.
+            .refine((groups) => hasSsoGroupMappings(groups), {
+              message:
+                "Map at least one group to a role. Only the roles you use need a group.",
+              path: ["adminGroupId"],
+            })
+        );
+
+        await db.organization.update({
+          where: { id: organizationId },
+          data: {
+            ssoDetails: {
+              upsert: {
+                create: {
+                  domain,
+                  adminGroupId,
+                  managerGroupId,
+                  selfServiceGroupId,
+                  baseUserGroupId,
+                },
+                update: {
+                  domain,
+                  adminGroupId,
+                  managerGroupId,
+                  selfServiceGroupId,
+                  baseUserGroupId,
+                },
+              },
+            },
+          },
+        });
+
+        return payload({ message: "SSO details updated" });
+      }
+      case "content": {
+        const csvData = await csvDataFromRequest({ request });
+        if (csvData.length < 2) {
+          throw new ShelfError({
+            cause: null,
+            message: "CSV file is empty",
+            additionalData: { intent },
+            label: "Assets",
+          });
+        }
+
+        const contentData = extractCSVDataFromContentImport(
+          csvData,
+          ASSET_CSV_HEADERS
+        );
+        const organization = await db.organization.findUniqueOrThrow({
+          where: { id: organizationId },
+          select: { barcodesEnabled: true },
+        });
+        await createAssetsFromContentImport({
+          data: contentData,
+          userId,
+          organizationId,
+          canUseBarcodes: canUseBarcodes(organization),
+        });
+        return payload(null);
+      }
+      default:
+        throw new ShelfError({
+          cause: null,
+          title: "Invalid intent",
+          message: "The intent provided is not valid",
+          additionalData: { intent },
+          label: "Admin dashboard",
+        });
+    }
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, organizationId });
+    return data(error(reason), { status: reason.status });
+  }
+};
+
+export default function OrgPage() {
+  const { organization } = useLoaderData<typeof loader>();
+  const fetcher = useFetcher();
+  const actionData = useActionData<typeof action>();
+  const navigation = useNavigation();
+  const disabled = isFormProcessing(navigation.state);
+  return (
+    <div>
+      <h1>{organization.name}</h1>
+      <div className="flex items-center gap-3">
+        <Button
+          variant="secondary"
+          to={`/admin-dashboard/${organization.owner.id}`}
+          className={"p-2"}
+        >
+          <ChevronLeft className="size-4" />
+        </Button>
+        <h3>
+          {" "}
+          Owner: {resolveUserDisplayName(organization.owner)} -{" "}
+          {organization.owner.email}
+        </h3>
+      </div>
+
+      {/* @ts-ignore */}
+      {actionData && actionData.message && (
+        <div className="my-4 bg-green-100 p-4 text-green-700">
+          {/* @ts-ignore */}
+          {actionData.message}
+        </div>
+      )}
+      {/* A refused save (for example SSO details with no group mapped) */}
+      {actionData?.error?.message ? (
+        <div role="alert" className="my-4 bg-red-100 p-4 text-red-700">
+          {actionData.error.message}
+        </div>
+      ) : null}
+      <div className="my-5 flex gap-3">
+        <div className="flex w-[400px] flex-col gap-2 bg-gray-200 p-4">
+          <h4>Organization details</h4>
+          <ol className="">
+            {Object.entries(organization).map(
+              ([key, value]) =>
+                !["workingHours", "ssoDetails", "owner", "qrCodes"].includes(
+                  key
+                ) && (
+                  <li key={key}>
+                    <span className="font-semibold">{key}</span>:{" "}
+                    {typeof value === "string" ? value : null}
+                    {typeof value === "boolean" ? String(value) : null}
+                    {value instanceof Date ? <DateS date={value} /> : null}
+                  </li>
+                )
+            )}
+          </ol>
+          <hr className="border-1 border-gray-700" />
+          <h4>Enable SSO</h4>
+          <p>Enable or disable SSO functionality for a workspace</p>
+          <fetcher.Form
+            method="post"
+            onChange={(e) => fetcher.submit(e.currentTarget)}
+          >
+            <div className="flex justify-between gap-3">
+              <div>
+                <p className="text-[14px] font-medium text-gray-700">
+                  Toggle SSO
+                </p>
+              </div>
+              <Switch
+                name={"enabledSso"}
+                disabled={isFormProcessing(fetcher.state)} // Disable for self service users
+                defaultChecked={organization?.enabledSso}
+                required
+                title={"Toggle SSO"}
+              />
+              <input type="hidden" value="toggleSso" name="intent" />
+            </div>
+          </fetcher.Form>
+          <hr className="border-1 border-gray-700" />
+          <h4>Enable/Disable Barcodes</h4>
+          <p>Enable or disable barcode functionality for this workspace</p>
+          <fetcher.Form
+            method="post"
+            onChange={(e) => fetcher.submit(e.currentTarget)}
+          >
+            <div className="flex justify-between gap-3">
+              <div>
+                <p className="text-[14px] font-medium text-gray-700">
+                  Enable Barcodes
+                </p>
+              </div>
+              <Switch
+                name={"barcodesEnabled"}
+                disabled={isFormProcessing(fetcher.state)}
+                defaultChecked={organization.barcodesEnabled}
+                required
+                title={"Toggle Barcodes"}
+              />
+              <input type="hidden" value="toggleBarcodes" name="intent" />
+            </div>
+          </fetcher.Form>
+          <hr className="border-1 border-gray-700" />
+          <h4>Enable/Disable Audits</h4>
+          <p>Enable or disable audit functionality for this workspace</p>
+          <fetcher.Form
+            method="post"
+            onChange={(e) => fetcher.submit(e.currentTarget)}
+          >
+            <div className="flex justify-between gap-3">
+              <div>
+                <p className="text-[14px] font-medium text-gray-700">
+                  Enable Audits
+                </p>
+              </div>
+              <Switch
+                name={"auditsEnabled"}
+                disabled={isFormProcessing(fetcher.state)}
+                defaultChecked={organization.auditsEnabled}
+                required
+                title={"Toggle Audits"}
+              />
+              <input type="hidden" value="toggleAudits" name="intent" />
+            </div>
+          </fetcher.Form>
+          <hr className="border-1 border-gray-700" />
+          <h4>Enable/Disabled Workspace</h4>
+          <fetcher.Form
+            method="post"
+            onChange={(e) => fetcher.submit(e.currentTarget)}
+          >
+            <div className="flex justify-between gap-3">
+              <div>
+                <p className="text-[14px] font-medium text-gray-700">
+                  Disabled Workspace
+                </p>
+              </div>
+              <Switch
+                name={"workspaceDisabled"}
+                disabled={isFormProcessing(fetcher.state)} // Disable for self service users
+                defaultChecked={organization.workspaceDisabled}
+                required
+                title={"Disabled workspace"}
+              />
+              <input type="hidden" value="disableWorkspace" name="intent" />
+            </div>
+          </fetcher.Form>
+        </div>
+        {organization.enabledSso ? (
+          <div className="w-[400px] bg-gray-200 p-4">
+            <Form method="post">
+              <div>
+                <div className=" border-b pb-5">
+                  <h2 className=" text-[18px] font-semibold">SSO details</h2>
+                  <p>
+                    This workspace has SSO enabled so you can see your SSO
+                    settings.
+                  </p>
+                </div>
+
+                <div className="flex flex-col">
+                  <FormRow
+                    rowLabel={"SSO Domain"}
+                    className="block border-b-0 pb-0 [&>div]:lg:basis-auto"
+                    subHeading={
+                      "The domain that this workspace is linked to. If you want it changed, please contact support."
+                    }
+                    required
+                  >
+                    <Input
+                      label="SSO Domain"
+                      name="domain"
+                      hideLabel
+                      className="disabled w-full"
+                      defaultValue={organization?.ssoDetails?.domain}
+                      required
+                    />
+                  </FormRow>
+
+                  <FormRow
+                    rowLabel={`Administrator role group id`}
+                    subHeading={
+                      <div>
+                        Place the Id of the group that should be mapped to the{" "}
+                        <b>Administrator</b> role. Accepts one or more group
+                        IDs, separated by commas. Leave blank if the role is not
+                        mapped.
+                      </div>
+                    }
+                    className="block border-b-0 pb-0 [&>div]:lg:basis-auto"
+                  >
+                    <Input
+                      label={"Administrator role group id"}
+                      hideLabel
+                      className="w-full"
+                      name={"adminGroupId"}
+                      defaultValue={
+                        organization?.ssoDetails?.adminGroupId || undefined
+                      }
+                    />
+                  </FormRow>
+
+                  <FormRow
+                    rowLabel={`Manager role group id`}
+                    subHeading={
+                      <div>
+                        Place the Id of the group that should be mapped to the{" "}
+                        <b>Manager</b> role. Accepts one or more group IDs,
+                        separated by commas. Leave blank if the role is not
+                        mapped.
+                      </div>
+                    }
+                    className="block border-b-0 pb-0 [&>div]:lg:basis-auto"
+                  >
+                    <Input
+                      label={"Manager role group id"}
+                      hideLabel
+                      name={"managerGroupId"}
+                      defaultValue={
+                        organization?.ssoDetails?.managerGroupId || undefined
+                      }
+                      className="w-full"
+                    />
+                  </FormRow>
+
+                  <FormRow
+                    rowLabel={`Self service role group id`}
+                    subHeading={
+                      <div>
+                        Place the Id of the group that should be mapped to the{" "}
+                        <b>Self service</b> role. Accepts one or more group IDs,
+                        separated by commas. Leave blank if the role is not
+                        mapped.
+                      </div>
+                    }
+                    className="block border-b-0 pb-0 [&>div]:lg:basis-auto"
+                  >
+                    <Input
+                      label={"Self service role group id"}
+                      hideLabel
+                      name={"selfServiceGroupId"}
+                      defaultValue={
+                        organization?.ssoDetails?.selfServiceGroupId ||
+                        undefined
+                      }
+                      className="w-full"
+                    />
+                  </FormRow>
+
+                  <FormRow
+                    rowLabel={`Base user role group id`}
+                    subHeading={
+                      <div>
+                        Place the Id of the group that should be mapped to the{" "}
+                        <b>Base</b> role. Accepts one or more group IDs,
+                        separated by commas. Leave blank if the role is not
+                        mapped.
+                      </div>
+                    }
+                    className="block border-b-0 pb-0 [&>div]:lg:basis-auto"
+                  >
+                    <Input
+                      label={"Base user role group id"}
+                      hideLabel
+                      name={"baseUserGroupId"}
+                      defaultValue={
+                        organization?.ssoDetails?.baseUserGroupId || undefined
+                      }
+                      className="w-full"
+                    />
+                  </FormRow>
+
+                  <Button
+                    type="submit"
+                    name="intent"
+                    value="updateSsoDetails"
+                    className="mt-2"
+                    disabled={disabled}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </Form>
+            {organization.ssoDetails ? (
+              <>
+                <hr className="border-1 my-4 border-gray-700" />
+                <h4>Require SSO login</h4>
+                <p id="require-sso-login-description">
+                  When on, everyone on this workspace's SSO domain must sign in
+                  with SSO, except the workspace owner until converted. Turn off
+                  only while setting up and testing SSO.
+                </p>
+                <fetcher.Form
+                  method="post"
+                  onChange={(e) => fetcher.submit(e.currentTarget)}
+                >
+                  <div className="flex justify-between gap-3">
+                    <div>
+                      <p className="text-[14px] font-medium text-gray-700">
+                        Require SSO login
+                      </p>
+                    </div>
+                    <Switch
+                      name={"requireSsoLogin"}
+                      disabled={isFormProcessing(fetcher.state)}
+                      defaultChecked={organization.ssoDetails.requireSsoLogin}
+                      title={"Toggle Require SSO login"}
+                      aria-label="Require SSO login"
+                      aria-describedby="require-sso-login-description"
+                    />
+                    <input
+                      type="hidden"
+                      value="toggleRequireSsoLogin"
+                      name="intent"
+                    />
+                  </div>
+                </fetcher.Form>
+              </>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="w-[400px] bg-gray-200 p-4">
+          <div className="flex flex-col gap-8">
+            <div>
+              <h3>Import content</h3>
+              <FileForm intent={"content"} />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-10">
+        <HorizontalTabs
+          items={[
+            { to: "assets", content: "Assets" },
+            { to: "qr-codes", content: "QR codes" },
+            { to: "members", content: "Members" },
+            { to: "transfer-ownership", content: "Transfer Ownership" },
+          ]}
+        />
+        <div>
+          <Outlet />
+        </div>
+      </div>
+    </div>
+  );
+}

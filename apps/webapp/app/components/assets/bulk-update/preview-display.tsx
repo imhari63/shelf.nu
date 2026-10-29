@@ -1,0 +1,405 @@
+/**
+ * @file Preview stage for the bulk asset update import flow.
+ * Displays the server-generated diff analysis before changes are applied,
+ * including summary stats, validation warnings, new entity creation notices,
+ * a spreadsheet-style change grid, and the "I AGREE" confirmation dialog.
+ *
+ * @see {@link file://./form.tsx} Parent orchestration component
+ * @see {@link file://./../../../utils/import-update.server.ts} Server-side preview logic
+ */
+import type React from "react";
+import type useFetcherWithReset from "~/hooks/use-fetcher-with-reset";
+import type { action } from "~/routes/_layout+/assets.import-update";
+import type { UpdatePreview } from "~/utils/import-update.server";
+import {
+  formatUnrecognizedColumnLabel,
+  PREVIEW_DISPLAY_LIMIT,
+} from "./helpers";
+import { SummaryPill } from "./shared";
+import { SpreadsheetPreview } from "./spreadsheet-preview";
+import { Button } from "../../shared/button";
+import { Table, Td, Th, Tr } from "../../table";
+import { ConfirmImportDialog } from "../import-preview/confirm-import-dialog";
+import { NewEntitiesNotice } from "../import-preview/new-entities-notice";
+
+// ---------------------------------------------------------------------------
+// Preview Display (shown after CSV analysis, before apply)
+// ---------------------------------------------------------------------------
+
+/**
+ * Displays the server-generated bulk-update preview and handles the apply confirmation.
+ * Shows summary statistics, validation warnings, unrecognized columns, new entity warnings,
+ * failed rows, a spreadsheet-style change grid, and the "I AGREE" confirmation dialog.
+ */
+// react-doctor:no-giant-component — deferred for follow-up refactor
+export function PreviewDisplay({
+  preview,
+  formRef,
+  applyFetcher,
+  isApplyLoading,
+  selectedFile,
+  onReanalyze,
+  isReanalyzing,
+  onReset,
+}: {
+  preview: UpdatePreview;
+  formRef: React.RefObject<HTMLFormElement | null>;
+  applyFetcher: ReturnType<typeof useFetcherWithReset<typeof action>>;
+  isApplyLoading: boolean;
+  selectedFile: File | null;
+  onReanalyze: () => void;
+  isReanalyzing: boolean;
+  onReset: () => void;
+}) {
+  const totalChanges = preview.totalFieldChanges;
+  /**
+   * Assets that have at least one change the apply layer will actually write.
+   * An asset whose every change is warning-marked (e.g. a multi-location
+   * asset whose only diff is `location`) is skipped entirely at apply time,
+   * so counting it as "to update" — or offering an Apply button for it —
+   * promises a write that never happens.
+   */
+  const assetsWithApplicableChanges = preview.assetsToUpdate.filter((asset) =>
+    asset.changes.some((c) => !c.warning)
+  );
+  const totalAssets = assetsWithApplicableChanges.length;
+  const hasNewEntities =
+    preview.newEntities.categories.length > 0 ||
+    preview.newEntities.locations.length > 0 ||
+    preview.newEntities.tags.length > 0;
+
+  /** Human summary of what will be created, used in the confirm dialog. */
+  const newEntitiesSummary = [
+    preview.newEntities.categories.length > 0 &&
+      `${preview.newEntities.categories.length} new categor${
+        preview.newEntities.categories.length !== 1 ? "ies" : "y"
+      }`,
+    preview.newEntities.locations.length > 0 &&
+      `${preview.newEntities.locations.length} new location${
+        preview.newEntities.locations.length !== 1 ? "s" : ""
+      }`,
+    preview.newEntities.tags.length > 0 &&
+      `${preview.newEntities.tags.length} new tag${
+        preview.newEntities.tags.length !== 1 ? "s" : ""
+      }`,
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  // Collect all field-level validation warnings
+  const allWarnings = preview.assetsToUpdate.flatMap((asset) =>
+    asset.changes
+      .filter((c) => c.warning)
+      .map((c) => ({
+        assetTitle: asset.title,
+        assetId: asset.id,
+        field: c.field,
+        value: c.newValue,
+        warning: c.warning!,
+      }))
+  );
+  const hasWarnings = allWarnings.length > 0;
+
+  /** Submits the apply intent with the phrase the user typed in the dialog. */
+  function submitApply(confirmation: string) {
+    if (!formRef.current || !selectedFile) return;
+    const fd = new FormData(formRef.current);
+    fd.set("intent", "apply-update");
+    fd.set("confirmation", confirmation);
+    void applyFetcher.submit(fd, {
+      method: "post",
+      encType: "multipart/form-data",
+    });
+  }
+
+  return (
+    <div className="mt-4 w-full">
+      {/* Summary section — always first */}
+      <div className="mb-4 rounded-md border bg-gray-50 p-4">
+        <h4 className="mb-3 text-base font-semibold">Analysis Summary</h4>
+        <div className="flex flex-wrap gap-3">
+          <SummaryPill count={totalAssets} label="to update" color="blue" />
+          <SummaryPill
+            count={preview.skippedAssets.length}
+            label="unchanged"
+            color="gray"
+          />
+          <SummaryPill
+            count={preview.failedRows.length}
+            label="failed"
+            color="red"
+          />
+        </div>
+
+        {/* Reassurance message */}
+        {preview.totalUnchangedFields > 0 && (
+          <p className="mt-3 text-sm text-gray-500">
+            {preview.totalUnchangedFields} field
+            {preview.totalUnchangedFields !== 1 ? "s" : ""} across{" "}
+            {preview.assetsToUpdate.length + preview.skippedAssets.length} asset
+            {preview.assetsToUpdate.length + preview.skippedAssets.length !== 1
+              ? "s"
+              : ""}{" "}
+            will remain unchanged.
+          </p>
+        )}
+      </div>
+
+      {/* Validation warnings — format issues that will cause failures */}
+      {hasWarnings && (
+        <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-4">
+          <p className="mb-2 font-medium text-red-800">
+            {allWarnings.length} value
+            {allWarnings.length !== 1 ? "s" : ""} need
+            {allWarnings.length === 1 ? "s" : ""} fixing before you apply
+          </p>
+          <div className="max-h-[200px] overflow-y-auto">
+            <Table className="[&_td]:px-2 [&_td]:py-1.5 [&_th]:px-2 [&_th]:py-1.5">
+              <thead className="sticky top-0 bg-red-50">
+                <Tr>
+                  <Th>Asset</Th>
+                  <Th>Field</Th>
+                  <Th>Problem</Th>
+                </Tr>
+              </thead>
+              <tbody>
+                {allWarnings.map((w) => (
+                  // Composite key: one asset can have multiple warnings across
+                  // different fields, so `assetId + field` uniquely identifies
+                  // the row.
+                  <Tr key={`${w.assetId}:${w.field}`}>
+                    <Td className="font-medium">{w.assetTitle}</Td>
+                    <Td>{w.field}</Td>
+                    <Td className="text-red-600">{w.warning}</Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          </div>
+          <p className="mt-2 text-sm text-red-700">
+            Fix these values in your CSV and re-upload, or apply anyway — rows
+            with invalid values will be partially updated (valid fields will
+            still be saved, invalid ones will be skipped).
+          </p>
+        </div>
+      )}
+
+      {/* Unrecognized columns — headers that don't match any Shelf field or
+          custom field in this workspace. Genuinely-unknown-only by
+          construction (see analyzeUpdateHeaders): a recognized-but-not-
+          updatable field like Status or Kit lands in `ignoredColumns`
+          below instead, so the custom-field suggestion here never fires
+          for a core field like Title or Category. */}
+      {preview.unrecognizedColumns.length > 0 && (
+        <div className="mb-4 rounded-md border border-blue-200 bg-blue-50 p-4">
+          <p className="mb-1 font-medium text-blue-800">
+            We skipped{" "}
+            {preview.unrecognizedColumns.length === 1
+              ? "a column"
+              : `${preview.unrecognizedColumns.length} columns`}{" "}
+            that don't match a field in your workspace
+          </p>
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {preview.unrecognizedColumns.map((col) => (
+              // `col` (the raw header) is the key — stable/unique even
+              // though the DISPLAYED label is parsed down to just the
+              // field name for a `cf:<Name>,type:<TYPE>` header (see
+              // formatUnrecognizedColumnLabel).
+              <span
+                key={col}
+                className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-medium text-blue-700"
+              >
+                {formatUnrecognizedColumnLabel(col)}
+              </span>
+            ))}
+          </div>
+          <p className="text-sm text-blue-700">
+            Double-check these for typos against your column headers. If they're
+            meant to hold custom data, create matching{" "}
+            <Button variant="link" to="/settings/custom-fields" target="_blank">
+              Custom Fields
+            </Button>{" "}
+            first, then come back and re-analyze.
+          </p>
+          <Button
+            type="button"
+            variant="secondary"
+            className="mt-2"
+            onClick={onReanalyze}
+            disabled={isReanalyzing}
+          >
+            {isReanalyzing ? "Re-analyzing..." : "Re-analyze file"}
+          </Button>
+        </div>
+      )}
+
+      {/* Known but unsupported columns — a mixed bucket by construction (see
+          analyzeUpdateHeaders): recognized-but-read-only core fields
+          (Status, Kit, Custody, …), fields not supported for bulk update at
+          all (Tracking method, QR ID, barcodes, long-text custom fields),
+          and a duplicate identifier column (e.g. "ID" when "Asset ID" is
+          also present). Framed as "recognized but not written" rather than
+          an error — the file is fine, these columns just aren't touched by
+          this tool for varying reasons. */}
+      {preview.ignoredColumns.length > 0 && (
+        <details className="mb-4">
+          <summary className="cursor-pointer text-sm text-gray-500">
+            Your file also has {preview.ignoredColumns.length} column
+            {preview.ignoredColumns.length !== 1 ? "s" : ""} Shelf recognizes
+            but doesn't update through bulk import (click to see which)
+          </summary>
+          <p className="mt-1 text-xs text-gray-500">
+            {preview.ignoredColumns.join(", ")} — Shelf recognizes each of
+            these, but doesn't write to them here: some (e.g. Status, Kit,
+            Custody) have their own dedicated workflows elsewhere in Shelf, some
+            (e.g. Tracking method, QR ID, barcodes, or long-text custom fields)
+            aren't supported for bulk update yet, and a duplicate identifier
+            column is simply unused. Any edits you made to them in this file are
+            kept in the file but won't be applied.
+          </p>
+        </details>
+      )}
+
+      {/* New entity creation warning */}
+      <NewEntitiesNotice
+        entities={[
+          { label: "New categories", names: preview.newEntities.categories },
+          { label: "New locations", names: preview.newEntities.locations },
+          { label: "New tags", names: preview.newEntities.tags },
+        ]}
+      />
+
+      {/* Failed rows */}
+      {preview.failedRows.length > 0 && (
+        <div className="mb-4">
+          <h4 className="mb-2 text-red-600">
+            Failed rows ({preview.failedRows.length})
+          </h4>
+          <div className="max-h-[200px] overflow-y-auto rounded-md border border-red-200">
+            <Table className="[&_td]:px-2 [&_td]:py-1.5 [&_th]:px-2 [&_th]:py-1.5">
+              <thead className="sticky top-0 bg-red-50">
+                <Tr>
+                  <Th>Row</Th>
+                  <Th>ID</Th>
+                  <Th>Reason</Th>
+                </Tr>
+              </thead>
+              <tbody>
+                {preview.failedRows.map((row) => (
+                  // `rowNumber` is the 1-based CSV line number and is unique
+                  // per row in the uploaded file.
+                  <Tr key={row.rowNumber}>
+                    <Td>{row.rowNumber}</Td>
+                    <Td className="font-mono text-xs">{row.id || "(empty)"}</Td>
+                    <Td className="text-red-600">{row.reason}</Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          </div>
+        </div>
+      )}
+
+      {/* Spreadsheet-style change grid */}
+      {preview.assetsToUpdate.length > 0 && (
+        <div>
+          <SpreadsheetPreview
+            assets={preview.assetsToUpdate}
+            columns={preview.updatableColumns}
+            displayLimit={PREVIEW_DISPLAY_LIMIT}
+            totalChanges={totalChanges}
+          />
+        </div>
+      )}
+
+      {/* Skipped assets (collapsible) */}
+      {preview.skippedAssets.length > 0 && (
+        <details className="mb-4">
+          <summary className="cursor-pointer text-sm text-gray-500">
+            {preview.skippedAssets.length} asset
+            {preview.skippedAssets.length !== 1 ? "s" : ""} with no changes
+            (click to expand)
+          </summary>
+          <div className="mt-2 max-h-[200px] overflow-y-auto rounded-md border">
+            <Table className="[&_td]:px-2 [&_td]:py-1.5 [&_th]:px-2 [&_th]:py-1.5">
+              <thead className="sticky top-0 bg-gray-50">
+                <Tr>
+                  <Th>Asset</Th>
+                  <Th>Reason</Th>
+                </Tr>
+              </thead>
+              <tbody>
+                {preview.skippedAssets.map((asset) => (
+                  // Asset `id` here is the CSV sequential identifier
+                  // (e.g. "SAM-0022"), unique within the uploaded file.
+                  <Tr key={asset.id}>
+                    <Td>{asset.title}</Td>
+                    <Td className="text-gray-500">{asset.reason}</Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          </div>
+        </details>
+      )}
+
+      {/* Apply confirmation. The Apply button is hidden when every proposed
+          change is warning-marked (the apply layer would write nothing), but
+          "Start over" stays reachable in that case. */}
+      <div className="mt-2 flex items-center gap-3">
+        {totalAssets > 0 && (
+          <ConfirmImportDialog
+            triggerLabel={`Apply ${totalChanges} change${
+              totalChanges !== 1 ? "s" : ""
+            } to ${totalAssets} asset${totalAssets !== 1 ? "s" : ""}`}
+            title="Confirm bulk update"
+            description={
+              <>
+                You are about to apply{" "}
+                <strong>
+                  {totalChanges} change
+                  {totalChanges !== 1 ? "s" : ""}
+                </strong>{" "}
+                across <strong>{totalAssets}</strong> asset
+                {totalAssets !== 1 ? "s" : ""}. This action cannot be undone.
+                Empty cells will clear existing values where applicable.
+                {hasNewEntities && (
+                  <span className="mt-2 block text-amber-600">
+                    This will also create {newEntitiesSummary}.
+                  </span>
+                )}
+              </>
+            }
+            confirmLabel={
+              isApplyLoading
+                ? "Applying..."
+                : `Apply ${totalChanges} change${totalChanges !== 1 ? "s" : ""}`
+            }
+            isSubmitting={isApplyLoading}
+            onConfirm={submitApply}
+            error={
+              applyFetcher.data?.error
+                ? {
+                    message:
+                      applyFetcher.data.error.message ||
+                      "An error occurred while applying changes.",
+                  }
+                : null
+            }
+          />
+        )}
+        <Button type="button" variant="secondary" onClick={onReset}>
+          Start over
+        </Button>
+      </div>
+
+      {totalAssets === 0 && (
+        <p className="mt-4 text-gray-500">
+          {preview.assetsToUpdate.length > 0
+            ? "Nothing to apply — every proposed change needs fixing first. Correct the flagged values in your CSV and re-upload."
+            : "No changes detected. All assets are already up to date, or all rows failed validation."}
+        </p>
+      )}
+    </div>
+  );
+}

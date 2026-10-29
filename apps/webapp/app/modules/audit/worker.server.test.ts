@@ -1,0 +1,252 @@
+/* eslint-disable no-console */
+import { AuditStatus } from "@prisma/client";
+import type PgBoss from "pg-boss";
+import { db } from "~/database/db.server";
+import { ShelfError } from "~/utils/error";
+import { Logger } from "~/utils/logger";
+import { QueueNames, scheduler } from "~/utils/scheduler.server";
+import {
+  AUDIT_INCLUDE_FOR_EMAIL,
+  AUDIT_SCHEDULER_EVENTS_ENUM,
+} from "./constants";
+import { sendAuditReminderEmail, sendAuditOverdueEmail } from "./email-helpers";
+import { scheduleNextAuditJob } from "./service.server";
+import type { AuditSchedulerData } from "./types";
+
+/**
+ * 24-hour reminder handler
+ * Sends the reminder email and push to assignees and schedules the next
+ * reminder (4h)
+ */
+const reminder24h = async ({ data }: PgBoss.Job<AuditSchedulerData>) => {
+  const audit = await db.auditSession
+    .findFirstOrThrow({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: background pg-boss scheduler handler; AuditSchedulerData carries only the audit id (no user request / organizationId in scope). Lookup is keyed on the trusted job payload, not user input.
+      where: { id: data.id },
+      include: AUDIT_INCLUDE_FOR_EMAIL,
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Audit not found",
+        additionalData: { data, work: data.eventType },
+        label: "Audit",
+      });
+    });
+
+  // Only send if audit has due date and is not completed/cancelled
+  if (
+    audit.dueDate &&
+    audit.status !== AuditStatus.COMPLETED &&
+    audit.status !== AuditStatus.CANCELLED
+  ) {
+    // Schedule the 4h reminder before notifying, so a scheduling failure
+    // that makes pg-boss retry does not notify twice
+    const when4h = new Date(audit.dueDate.getTime() - 4 * 60 * 60 * 1000);
+    await scheduleNextAuditJob({
+      data: {
+        ...data,
+        eventType: AUDIT_SCHEDULER_EVENTS_ENUM.reminder4h,
+      },
+      when: when4h,
+    });
+
+    sendAuditReminderEmail({
+      audit,
+      assignees: audit.assignments,
+      hints: data.hints,
+      reminder: "REMINDER_24H",
+    });
+  }
+};
+
+/**
+ * 4-hour reminder handler
+ * Sends the reminder email and push to assignees and schedules the next
+ * reminder (1h)
+ */
+const reminder4h = async ({ data }: PgBoss.Job<AuditSchedulerData>) => {
+  const audit = await db.auditSession
+    .findFirstOrThrow({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: background pg-boss scheduler handler; AuditSchedulerData carries only the audit id (no user request / organizationId in scope). Lookup is keyed on the trusted job payload, not user input.
+      where: { id: data.id },
+      include: AUDIT_INCLUDE_FOR_EMAIL,
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Audit not found",
+        additionalData: { data, work: data.eventType },
+        label: "Audit",
+      });
+    });
+
+  // Only send if audit has due date and is not completed/cancelled
+  if (
+    audit.dueDate &&
+    audit.status !== AuditStatus.COMPLETED &&
+    audit.status !== AuditStatus.CANCELLED
+  ) {
+    // Schedule the 1h reminder before notifying, so a scheduling failure
+    // that makes pg-boss retry does not notify twice
+    const when1h = new Date(audit.dueDate.getTime() - 1 * 60 * 60 * 1000);
+    await scheduleNextAuditJob({
+      data: {
+        ...data,
+        eventType: AUDIT_SCHEDULER_EVENTS_ENUM.reminder1h,
+      },
+      when: when1h,
+    });
+
+    sendAuditReminderEmail({
+      audit,
+      assignees: audit.assignments,
+      hints: data.hints,
+      reminder: "REMINDER_4H",
+    });
+  }
+};
+
+/**
+ * 1-hour reminder handler
+ * Sends the reminder email and push to assignees and schedules the overdue
+ * notice
+ */
+const reminder1h = async ({ data }: PgBoss.Job<AuditSchedulerData>) => {
+  const audit = await db.auditSession
+    .findFirstOrThrow({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: background pg-boss scheduler handler; AuditSchedulerData carries only the audit id (no user request / organizationId in scope). Lookup is keyed on the trusted job payload, not user input.
+      where: { id: data.id },
+      include: AUDIT_INCLUDE_FOR_EMAIL,
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Audit not found",
+        additionalData: { data, work: data.eventType },
+        label: "Audit",
+      });
+    });
+
+  // Only send if audit has due date and is not completed/cancelled
+  if (
+    audit.dueDate &&
+    audit.status !== AuditStatus.COMPLETED &&
+    audit.status !== AuditStatus.CANCELLED
+  ) {
+    // Schedule the overdue notice at the due date, before notifying, so a
+    // scheduling failure that makes pg-boss retry does not notify twice
+    await scheduleNextAuditJob({
+      data: {
+        ...data,
+        eventType: AUDIT_SCHEDULER_EVENTS_ENUM.overdueNotice,
+      },
+      when: audit.dueDate,
+    });
+
+    sendAuditReminderEmail({
+      audit,
+      assignees: audit.assignments,
+      hints: data.hints,
+      reminder: "REMINDER_1H",
+    });
+  }
+};
+
+/**
+ * Overdue notice handler
+ * Sends the overdue email and push to the creator and assignees
+ * Does NOT change audit status (handled on frontend)
+ */
+const overdueNotice = async ({ data }: PgBoss.Job<AuditSchedulerData>) => {
+  const audit = await db.auditSession
+    .findFirstOrThrow({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: background pg-boss scheduler handler; AuditSchedulerData carries only the audit id (no user request / organizationId in scope). Lookup is keyed on the trusted job payload, not user input.
+      where: { id: data.id },
+      include: AUDIT_INCLUDE_FOR_EMAIL,
+    })
+    .catch((cause) => {
+      throw new ShelfError({
+        cause,
+        message: "Audit not found",
+        additionalData: { data, work: data.eventType },
+        label: "Audit",
+      });
+    });
+
+  // Only send if audit is still not completed/cancelled
+  if (
+    audit.status !== AuditStatus.COMPLETED &&
+    audit.status !== AuditStatus.CANCELLED
+  ) {
+    // Recipients: creator + all assignees. Each row is the loaded user spread
+    // whole, so it carries both the name columns the greeting resolves from and
+    // the four raw preference columns AUDIT_INCLUDE_FOR_EMAIL selects. `userId`
+    // is what lets the email render each recipient's dates in THEIR OWN stored
+    // format/timezone prefs rather than the scheduler-captured creator hints.
+    const recipients = [
+      { ...audit.createdBy, userId: audit.createdBy.id },
+      ...audit.assignments.map((a) => ({ ...a.user, userId: a.user.id })),
+    ];
+
+    // Remove duplicates (in case creator is also an assignee)
+    const uniqueRecipients = Array.from(
+      new Map(recipients.map((r) => [r.email, r])).values()
+    );
+
+    sendAuditOverdueEmail({
+      audit,
+      recipients: uniqueRecipients,
+      hints: data.hints,
+    });
+  }
+};
+
+/**
+ * Map of event types to handler functions
+ */
+const event2HandlerMap: Record<
+  AUDIT_SCHEDULER_EVENTS_ENUM,
+  (job: PgBoss.Job<AuditSchedulerData>) => Promise<void>
+> = {
+  [AUDIT_SCHEDULER_EVENTS_ENUM.reminder24h]: reminder24h,
+  [AUDIT_SCHEDULER_EVENTS_ENUM.reminder4h]: reminder4h,
+  [AUDIT_SCHEDULER_EVENTS_ENUM.reminder1h]: reminder1h,
+  [AUDIT_SCHEDULER_EVENTS_ENUM.overdueNotice]: overdueNotice,
+};
+
+/**
+ * Register audit worker to process scheduled jobs
+ * This should be called once during server initialization
+ */
+export const registerAuditWorkers = async () => {
+  await scheduler.work<AuditSchedulerData>(
+    QueueNames.auditQueue,
+    async (job) => {
+      const handler = event2HandlerMap[job.data.eventType];
+      if (typeof handler !== "function") {
+        Logger.error(
+          new ShelfError({
+            cause: null,
+            message: "Wrong event type received for the scheduled worker",
+            additionalData: { job },
+            label: "Audit",
+          })
+        );
+        return;
+      }
+      try {
+        await handler(job);
+      } catch (cause) {
+        Logger.error(
+          new ShelfError({
+            cause,
+            message: "Something went wrong while executing scheduled work.",
+            additionalData: { data: job.data, work: job.data.eventType },
+            label: "Audit",
+          })
+        );
+      }
+    }
+  );
+};

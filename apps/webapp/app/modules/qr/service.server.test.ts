@@ -1,0 +1,833 @@
+import {
+  type Asset,
+  type Organization,
+  type PrintBatch,
+  type Prisma,
+  type Qr,
+  type User,
+  type Kit,
+} from "@prisma/client";
+import type { ITXClientDenyList } from "@prisma/client/runtime/library";
+import type { TypeNumber, ErrorCorrectionLevel } from "qrcode-generator";
+import type { LoaderFunctionArgs } from "react-router";
+import { db, type ExtendedPrismaClient } from "~/database/db.server";
+import { updateCookieWithPerPage } from "~/utils/cookies.server";
+import type { ErrorLabel } from "~/utils/error";
+import { isLikeShelfError, isNotFoundError, ShelfError } from "~/utils/error";
+import { getCurrentSearchParams } from "~/utils/http.server";
+import { id } from "~/utils/id/id.server";
+import { getParamsValues } from "~/utils/list";
+// eslint-disable-next-line import/no-cycle
+import { generateCode } from "./utils.server";
+import type { CreateAssetFromContentImportPayload } from "../asset/types";
+import { generateRandomCode } from "../invite/helpers";
+
+const label: ErrorLabel = "QR";
+
+export async function getQrByAssetId({ assetId }: Pick<Qr, "assetId">) {
+  try {
+    return await db.qr.findFirst({
+      where: { assetId },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while fetching the QR. Please try again or contact support.",
+      additionalData: { assetId },
+      label,
+    });
+  }
+}
+
+export async function getQrByKitId({ kitId }: Pick<Qr, "kitId">) {
+  try {
+    return await db.qr.findFirst({
+      where: { kitId },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while fetching the QR. Please try again or contact support.",
+      additionalData: { kitId },
+      label,
+    });
+  }
+}
+
+type QrWithInclude<T extends Prisma.QrInclude | undefined> =
+  T extends Prisma.QrInclude ? Prisma.QrGetPayload<{ include: T }> : Qr;
+
+export async function getQr<T extends Prisma.QrInclude | undefined>({
+  id,
+  include,
+}: Pick<Asset, "id"> & {
+  include?: T;
+}): Promise<QrWithInclude<T>> {
+  try {
+    const qr = await db.qr.findUniqueOrThrow({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: generic QR resolver used by pre-org scan/claim/link flows where org context does not exist yet; callers that have org context enforce ownership themselves (e.g. claimQrCode checks unclaimed state, link routes compare qr.organizationId to the caller's org)
+      where: { id },
+      include: { ...include },
+    });
+
+    return qr as QrWithInclude<T>;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "This code doesn't exist or it doesn't belong to your current organization.",
+      title: "QR code not found",
+      status: 404,
+      additionalData: { id },
+      label,
+      shouldBeCaptured: !isNotFoundError(cause),
+    });
+  }
+}
+
+export async function getQrOrganizationLookup({ qrId }: { qrId: Qr["id"] }) {
+  const qr = await db.qr.findUnique({
+    // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: the entire purpose of this function is to resolve which organization a scanned QR code belongs to; org context does not exist until this lookup returns it
+    where: { id: qrId },
+    select: { organizationId: true },
+  });
+
+  if (!qr) {
+    throw new ShelfError({
+      cause: null,
+      message: "This code doesn't exist.",
+      title: "QR code not found",
+      status: 404,
+      additionalData: { qrId },
+      label,
+    });
+  }
+
+  return qr;
+}
+
+/**
+ * The transaction client `createQr` accepts. Spelled as the extended client
+ * minus the methods a transaction cannot offer, because a hand-written
+ * structural type is not assignable from the real `$transaction` callback
+ * argument — the extended delegates carry more than the shape they are used at.
+ */
+export type CreateQrTxClient = Omit<ExtendedPrismaClient, ITXClientDenyList>;
+
+/**
+ * Creates a QR code, optionally attached to an asset or a kit.
+ *
+ * Pass `tx` when the caller has already established that no code exists and is
+ * holding a lock that keeps it true — see `generateQrObj`. Nothing in the
+ * schema enforces one linked code per asset or kit: both columns are nullable
+ * and non-unique, because an unclaimed printed code has neither and there are
+ * many at once. So the serialisation is the caller's job, and a caller that
+ * skips it gets a duplicate rather than an error.
+ *
+ * @param args.assetId - Attach to this asset, if given.
+ * @param args.kitId - Attach to this kit, if given.
+ * @param tx - Run inside an existing transaction.
+ * @returns The created QR row.
+ */
+export async function createQr(
+  {
+    userId,
+    assetId,
+    kitId,
+    organizationId,
+  }: Pick<Qr, "userId" | "organizationId"> & {
+    assetId?: Asset["id"];
+    kitId?: Kit["id"];
+  },
+  tx?: CreateQrTxClient
+) {
+  const data = {
+    id: id(),
+    ...(userId && {
+      user: {
+        connect: {
+          id: userId,
+        },
+      },
+    }),
+    ...(assetId && {
+      asset: {
+        connect: {
+          id: assetId,
+        },
+      },
+    }),
+    ...(kitId && {
+      kit: {
+        connect: {
+          id: kitId,
+        },
+      },
+    }),
+    ...(organizationId && {
+      organization: {
+        connect: {
+          id: organizationId,
+        },
+      },
+    }),
+  };
+
+  return (tx ?? db).qr.create({
+    data,
+  });
+}
+
+/** Generates codes that are not attached to assets but attached to a certain org and user */
+export async function generateOrphanedCodes({
+  userId,
+  amount,
+  organizationId,
+}: {
+  userId: User["id"];
+  amount: number;
+  organizationId: Organization["id"];
+}) {
+  try {
+    const data = Array.from({ length: amount }).map(() => ({
+      userId,
+      organizationId,
+      id: id(),
+    }));
+
+    return await db.qr.createMany({
+      data: data,
+      skipDuplicates: true,
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to generate orphaned codes",
+      additionalData: { userId, amount, organizationId },
+      label,
+    });
+  }
+}
+
+/** Generates codes that are not attached to assets, user or organization */
+export async function generateUnclaimedCodesForPrint({
+  amount,
+  batchName,
+}: {
+  amount: number;
+  batchName?: string;
+}) {
+  try {
+    batchName = batchName || generateRandomCode(10);
+    /**
+     * We create an array of empty objects to create the amount of codes requested
+     */
+
+    const batch = await db.printBatch.create({
+      data: {
+        name: batchName,
+      },
+    });
+
+    const data = Array.from({ length: amount }).map(() => ({
+      // Generating codes also prints them so unclaimed codes are marked as printed
+      // We generate a random code for the batch
+      batchId: batch.id,
+      id: id(),
+    }));
+
+    await db.qr.createMany({
+      data,
+      skipDuplicates: true,
+    });
+
+    return await db.qr.findMany({
+      where: {
+        batch: {
+          name: {
+            equals: batchName,
+          },
+        },
+      },
+      include: {
+        batch: true,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: isLikeShelfError(cause)
+        ? cause.message
+        : "Failed to generate orphaned codes",
+      additionalData: { amount },
+      label,
+    });
+  }
+}
+
+export async function assertWhetherQrBelongsToCurrentOrganization({
+  request,
+  organizationId,
+}: {
+  request: Request;
+  organizationId: Organization["id"];
+}) {
+  const searchParams = getCurrentSearchParams(request);
+  const qrId = searchParams.get("qrId");
+
+  try {
+    /** We have the case when someone could be linking a QR that doesnt belong to the current org */
+    if (qrId) {
+      await db.qr.findUniqueOrThrow({
+        where: {
+          id: qrId,
+          organizationId,
+        },
+      });
+    }
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "This code doesn't exist or it doesn't belong to your current organization. A new asset cannot be linked to it.",
+      title: "QR code not found",
+      status: 404,
+      additionalData: { qrId, organizationId },
+      label,
+      shouldBeCaptured: !isNotFoundError(cause),
+    });
+  }
+}
+
+export const getPaginatedAndFilterableQrCodes = async ({
+  request,
+}: {
+  request: LoaderFunctionArgs["request"];
+}) => {
+  const searchParams = getCurrentSearchParams(request);
+  const { page, search, batch, perPageParam } = getParamsValues(searchParams);
+  const cookie = await updateCookieWithPerPage(request, perPageParam);
+  const { perPage } = cookie;
+
+  try {
+    const { qrCodes, totalQrCodes } = await getQrCodes({
+      page,
+      perPage,
+      search,
+      batch,
+    });
+    const totalPages = Math.ceil(totalQrCodes / perPage);
+
+    return {
+      page,
+      perPage,
+      search,
+      totalQrCodes,
+      qrCodes,
+      totalPages,
+    };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to get paginated and qr codes",
+      additionalData: { page, search },
+      label,
+    });
+  }
+};
+
+async function getQrCodes({
+  page = 1,
+  perPage = 8,
+  search,
+  batch,
+}: {
+  /** Page number. Starts at 1 */
+  page: number;
+
+  /** Assets to be loaded per page */
+  perPage?: number;
+
+  search?: string | null;
+
+  batch?: PrintBatch["id"] | "No batch" | null;
+}) {
+  try {
+    const skip = page > 1 ? (page - 1) * perPage : 0;
+    const take = perPage >= 1 && perPage <= 100 ? perPage : 20; // min 1 and max 100 per page
+
+    /** Default value of where. Takes the assets belonging to current user */
+    const where: Prisma.QrWhereInput = {};
+
+    /** If the search string exists, add it to the where object
+     */
+    if (search) {
+      where.id = {
+        contains: search,
+        mode: "insensitive",
+      };
+    }
+
+    if (batch) {
+      where.batchId =
+        batch === "No batch"
+          ? {
+              equals: null,
+            }
+          : batch;
+    }
+
+    const [qrCodes, totalQrCodes] = await Promise.all([
+      /** Get the users */
+      db.qr.findMany({
+        skip,
+        take,
+        include: {
+          asset: {
+            select: {
+              id: true,
+              title: true,
+            },
+          },
+          kit: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+          organization: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+          user: {
+            select: {
+              id: true,
+              email: true,
+              firstName: true,
+              lastName: true,
+              displayName: true,
+            },
+          },
+          batch: true,
+        },
+        where,
+        orderBy: { createdAt: "desc" },
+      }),
+
+      /** Count them */
+      db.qr.count({ where }),
+    ]);
+
+    return { qrCodes, totalQrCodes };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to get qr codes",
+      additionalData: { page, perPage, search },
+      label,
+    });
+  }
+}
+
+/** Generates codes that are not attached to assets but attached to a certain org and user */
+export async function markBatchAsPrinted({ batch }: { batch: string }) {
+  try {
+    const updatedBatch = await db.printBatch.update({
+      where: {
+        id: batch,
+      },
+      data: {
+        printed: true,
+      },
+    });
+    return updatedBatch;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to mark batch as printed",
+      additionalData: { batch },
+      label,
+    });
+  }
+}
+
+/** Claims a unclaimed code by linking it to an organization and user */
+export async function claimQrCode({
+  id,
+  organizationId,
+  userId,
+}: {
+  id: Qr["id"];
+  organizationId: Organization["id"];
+  userId: User["id"];
+}) {
+  try {
+    /** First, just in case we check whether its claimed */
+    const qr = await getQr({ id });
+    if (qr.organizationId) {
+      throw new ShelfError({
+        message:
+          "This QR code already belongs to an organization so you cannot claim it.",
+        title: "QR code already claimed",
+        status: 403,
+        additionalData: { id, organizationId, userId },
+        label,
+        cause: null,
+      });
+    }
+
+    try {
+      return await db.qr.update({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: claiming only proceeds for unclaimed codes (verified above: throws if qr.organizationId already set), so the code has no organizationId to scope by — this assigns its first org
+        where: {
+          id,
+          // why: the check above is not atomic with this write — two
+          // concurrent claims could both pass it and the last write would
+          // silently re-assign the code's org (cross-tenant: org B's claim
+          // overwriting a code org A already linked to an asset).
+          // Constraining the WHERE to the still-unclaimed state makes the
+          // first claim win; the loser gets a P2025, mapped below to the
+          // same 403 the pre-check produces.
+          organizationId: null,
+          // why: createAsset's loose QR-connect branch can link an orgless
+          // code to an asset between the callers' availability guards and
+          // this write. Also requiring the still-unlinked state here keeps
+          // claim atomic with "not linked to anything" — a loser on any
+          // condition gets the same P2025 → 403 mapping, instead of ending
+          // up with a code owned by org B but attached to org A's asset.
+          assetId: null,
+          kitId: null,
+        },
+        data: {
+          organizationId,
+          userId,
+        },
+      });
+    } catch (updateCause) {
+      if (isNotFoundError(updateCause)) {
+        throw new ShelfError({
+          // why: cause deliberately null — makeShelfError collapses any
+          // P2025 anywhere in the cause chain to a 404, which would turn
+          // this lost-race "already claimed" outcome into a not-found.
+          cause: null,
+          message:
+            "This QR code has already been claimed or linked so you cannot claim it.",
+          title: "QR code already claimed",
+          status: 403,
+          additionalData: { id, organizationId, userId },
+          label,
+          shouldBeCaptured: false,
+        });
+      }
+      throw updateCause;
+    }
+  } catch (cause) {
+    // why: our own guard errors above carry user-facing messages ("not
+    // available for claiming", already-claimed 403). ShelfError copies
+    // status/title from a cause but NOT message, so re-wrapping would ship
+    // the generic "Failed to claim qr code" to clients (the mobile error
+    // envelope only carries `message`). Pass our own errors through intact.
+    if (isLikeShelfError(cause)) {
+      throw cause;
+    }
+    throw new ShelfError({
+      cause,
+      message: "Failed to claim qr code",
+      additionalData: { id, organizationId, userId },
+      label,
+    });
+  }
+}
+
+interface QRCodeMapParams {
+  assets: Prisma.AssetGetPayload<{
+    include: {
+      qrCodes: true;
+    };
+  }>[];
+  organizationId: string;
+  userId: string;
+  size: "small" | "medium" | "large" | "cable";
+}
+
+export async function getQrCodeMaps({
+  assets,
+  size,
+}: QRCodeMapParams): Promise<Record<string, string>> {
+  const finalObject: Record<string, string> = {};
+
+  try {
+    const qrCodePromises = assets.map(async (asset) => {
+      try {
+        const qr = asset.qrCodes[0];
+        const qrCode = qr
+          ? await generateCode({
+              version: qr.version as TypeNumber,
+              errorCorrection: qr.errorCorrection as ErrorCorrectionLevel,
+              size,
+              qr,
+            })
+          : null;
+
+        if (qrCode?.code) {
+          finalObject[asset.id] = qrCode.code.src || "";
+        }
+      } catch (error) {
+        // Handle the error if needed
+        // eslint-disable-next-line no-console
+        console.error(`Error processing asset with id ${asset.id}:`, error);
+      }
+    });
+
+    await Promise.all(qrCodePromises);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("Error generating QR code maps:", err);
+  }
+
+  return finalObject;
+}
+
+/** Extracts qrCodes from data and checks their validity for import
+ * You can only import unclaimed or unlinked codes
+ * - For non-existing codes - we can allow them to be imported
+ * - For linked codes - we don't allow any imports
+ * - For unlinked - we can only allowed if the code is already claimed within the current workspace the user is trying to import to
+ * - For unclaimed - there are not really any limitations we need to place. This should work directly
+ */
+
+export type QRCodePerImportedAsset = {
+  title: string;
+  qrId: string;
+};
+
+/**
+ * Validates the QR codes of an import payload without writing anything.
+ * Throws a 400 `ShelfError` (additionalData keys `duplicateCodes`,
+ * `nonExistentCodes`, `linkedCodes`, `connectedToOtherOrgs`) when a code is
+ * repeated, unknown, linked to an asset or kit, or owned by another workspace.
+ *
+ * @param args.data - Import rows; rows without `qrId` are ignored
+ * @param args.organizationId - Workspace the import targets
+ * @returns The `{ key, title, qrId }` entry of every row that carries a code
+ * @throws {ShelfError} 400 for invalid codes, otherwise a failure ShelfError
+ */
+export async function validateImportQrCodes({
+  data,
+  organizationId,
+}: {
+  data: CreateAssetFromContentImportPayload[];
+  organizationId: Organization["id"];
+}) {
+  try {
+    const qrCodePerAsset = data
+      .map((asset) => {
+        if (asset.qrId) {
+          return {
+            key: asset.key,
+            title: asset.title,
+            qrId: asset.qrId,
+          };
+        }
+        return null;
+      })
+      .filter((asset) => asset !== null); // Filter out null values
+
+    const codes = await db.qr.findMany({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: import deliberately fetches codes across orgs so it can detect and REJECT codes belonging to other organizations (see connectedToOtherOrgs check at lines 613-630); scoping to organizationId would hide foreign codes instead of erroring on them
+      where: {
+        id: {
+          in: qrCodePerAsset.map((asset) => asset?.qrId),
+        },
+      },
+    });
+
+    /** Check for any codes that are present more than 1 time in the data */
+    const duplicateCodes = qrCodePerAsset.filter(
+      (asset, index, self) =>
+        self.findIndex((t) => t?.qrId === asset?.qrId) !== index
+    );
+
+    if (duplicateCodes.length) {
+      throw new ShelfError({
+        cause: null,
+        message:
+          "Some of the QR codes you are trying to import are present more than once in the data. Please make sure each QR code is only present once.",
+        additionalData: { duplicateCodes },
+        label,
+        // This is a user-input validation failure, not a server fault: return a
+        // 400 and don't capture it to Sentry (see SHELF-WEBAPP-1J0).
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    /** Check if any of the codes are non-existent */
+    const nonExistentCodes = qrCodePerAsset.filter(
+      (asset) => !codes.find((code) => code.id === asset?.qrId) && asset?.qrId
+    );
+
+    if (nonExistentCodes.length) {
+      throw new ShelfError({
+        cause: null,
+        message: "Some of the QR codes you are trying to import do not exist",
+        additionalData: { nonExistentCodes },
+        label,
+        // User-input validation failure: return a 400 (already not captured).
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    /** Check for codes already linked to asset or kit. Returns QRCodePerImportedAsset[] */
+    const linkedCodes = qrCodePerAsset.filter((asset) =>
+      codes.find(
+        (code) => code.id === asset?.qrId && (code.assetId || code.kitId)
+      )
+    );
+    if (linkedCodes.length) {
+      throw new ShelfError({
+        cause: null,
+        message:
+          "Some of the QR codes you are trying to import are already linked to an asset or a kit. Please use unlinked or unclaimed codes for your import.",
+        additionalData: { linkedCodes },
+        label,
+        // User-input validation failure: return a 400 and don't capture it to
+        // Sentry (SHELF-WEBAPP-1J0).
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    /** Check for codes linked to other any organization and the organization is different than the current one */
+    const connectedToOtherOrgs = qrCodePerAsset.filter((asset) =>
+      codes.find(
+        (code) =>
+          code.id === asset?.qrId &&
+          code.organizationId &&
+          code.organizationId !== organizationId
+      )
+    );
+    if (connectedToOtherOrgs.length) {
+      throw new ShelfError({
+        cause: null,
+        message:
+          "Some of the QR codes you are trying to import don't belong to your current organization. You can only import codes that are unclaimed, unlinked or linked to your organization.",
+        additionalData: { connectedToOtherOrgs },
+        label,
+        // User-input validation failure: return a 400 and don't capture it to
+        // Sentry (SHELF-WEBAPP-1J0).
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    return qrCodePerAsset;
+  } catch (cause) {
+    const isShelfError = isLikeShelfError(cause);
+    throw new ShelfError({
+      cause,
+      message: isShelfError ? cause.message : "Failed to get qr codes",
+      additionalData: {
+        data,
+        organizationId,
+        ...(isShelfError && cause.additionalData),
+      },
+      label,
+    });
+  }
+}
+
+/**
+ * Claims import QR codes for a workspace: sets `organizationId` and `userId`
+ * on every given code that has no workspace yet. Codes that already belong to
+ * a workspace are left untouched, so the call is idempotent and safe to retry.
+ * Callers validate the codes first with `validateImportQrCodes`.
+ *
+ * @param args.qrIds - Ids of the QR codes to claim
+ * @param args.organizationId - Workspace that receives the codes
+ * @param args.userId - User recorded as the claimer
+ * @throws {ShelfError} If the database update fails
+ */
+export async function claimImportQrCodes({
+  qrIds,
+  organizationId,
+  userId,
+}: {
+  qrIds: string[];
+  organizationId: Organization["id"];
+  userId: User["id"];
+}): Promise<void> {
+  if (!qrIds.length) {
+    return;
+  }
+
+  try {
+    await db.qr.updateMany({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: only codes with no workspace (organizationId: null) are updated; they have no organizationId to scope by, this assigns their first workspace. Codes of other workspaces never match.
+      where: {
+        id: { in: qrIds },
+        organizationId: null,
+      },
+      data: {
+        organizationId,
+        userId,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to claim qr codes",
+      additionalData: { qrIds, userId, organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * Validates the QR codes in an import payload and claims the unclaimed ones.
+ * Composition of `validateImportQrCodes` and `claimImportQrCodes`.
+ *
+ * @param args.data - Import rows; rows without `qrId` are ignored
+ * @param args.userId - User recorded as the claimer of unclaimed codes
+ * @param args.organizationId - Workspace the import targets
+ * @returns The `{ key, title, qrId }` entry of every row that carries a code
+ * @throws {ShelfError} 400 for invalid codes, otherwise a failure ShelfError
+ */
+export async function parseQrCodesFromImportData({
+  data,
+  userId,
+  organizationId,
+}: {
+  data: CreateAssetFromContentImportPayload[];
+  userId: User["id"];
+  organizationId: Organization["id"];
+}) {
+  try {
+    const qrCodePerAsset = await validateImportQrCodes({
+      data,
+      organizationId,
+    });
+    await claimImportQrCodes({
+      qrIds: qrCodePerAsset.map((asset) => asset.qrId),
+      organizationId,
+      userId,
+    });
+    return qrCodePerAsset;
+  } catch (cause) {
+    const isShelfError = isLikeShelfError(cause);
+    throw new ShelfError({
+      cause,
+      message: isShelfError ? cause.message : "Failed to get qr codes",
+      additionalData: {
+        userId,
+        ...(isShelfError && cause.additionalData),
+      },
+      label,
+    });
+  }
+}

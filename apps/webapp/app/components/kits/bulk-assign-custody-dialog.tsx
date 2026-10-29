@@ -1,0 +1,109 @@
+import { useLoaderData } from "react-router";
+import { useZorm } from "react-zorm";
+import { z } from "zod";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { createCustodianSchema } from "~/modules/custody/schema";
+import type { KitIndexLoaderData } from "~/routes/_layout+/kits._index";
+import { tw } from "~/utils/tw";
+import { resolveTeamMemberName } from "~/utils/user";
+import { BulkUpdateDialogContent } from "../bulk-update-dialog/bulk-update-dialog";
+import DynamicSelect from "../dynamic-select/dynamic-select";
+import { Button } from "../shared/button";
+
+export const BulkAssignKitCustodySchema = z.object({
+  kitIds: z.array(z.string()).min(1),
+  custodian: createCustodianSchema(),
+});
+
+export default function BulkAssignCustodyDialog() {
+  const zo = useZorm("BulkAssignKitCustody", BulkAssignKitCustodySchema);
+
+  const assignsSelfOnly = useRoleAccess().custody.assign === "self";
+  const { currentUserTeamMember } = useLoaderData<KitIndexLoaderData>();
+
+  return (
+    <BulkUpdateDialogContent
+      ref={zo.ref}
+      type="assign-custody"
+      title={`${assignsSelfOnly ? "Take" : "Assign"} custody of kit`}
+      description={`These kits are currently available. You're about to assign custody to ${
+        assignsSelfOnly ? "yourself" : "one of your team members"
+      }.`}
+      arrayFieldId="kitIds"
+      actionUrl="/api/kits/bulk-actions"
+    >
+      {({ disabled, fetcherError, handleCloseDialog }) => (
+        <div className="modal-content-wrapper">
+          <div className="relative z-50 mb-8">
+            <input type="hidden" value="bulk-assign-custody" name="intent" />
+
+            {assignsSelfOnly && currentUserTeamMember ? (
+              <input
+                type="hidden"
+                name="custodian"
+                value={JSON.stringify({
+                  id: currentUserTeamMember.id,
+                  name: resolveTeamMemberName(currentUserTeamMember),
+                })}
+              />
+            ) : (
+              <DynamicSelect
+                disabled={disabled}
+                model={{
+                  name: "teamMember",
+                  queryKey: "name",
+                  deletedAt: null,
+                  // ASSET custody: SELF_SERVICE may only take custody itself
+                  // and BASE never.
+                  custodyPurpose: "custody-assignment",
+                }}
+                fieldName="custodian"
+                contentLabel="Team members"
+                initialDataKey="teamMembers"
+                countKey="totalTeamMembers"
+                placeholder="Select a team member"
+                closeOnSelect
+                transformItem={(item) => ({
+                  ...item,
+                  id: JSON.stringify({
+                    id: item.id,
+                    name: resolveTeamMemberName(item),
+                  }),
+                })}
+                renderItem={(item) => resolveTeamMemberName(item, true)}
+              />
+            )}
+            {zo.errors.custodian()?.message ? (
+              <p className="text-sm text-error-500">
+                {zo.errors.custodian()?.message}
+              </p>
+            ) : null}
+            {fetcherError ? (
+              <p className="text-sm text-error-500">{fetcherError}</p>
+            ) : null}
+          </div>
+
+          <div className={tw("flex gap-3", assignsSelfOnly && "-mt-8")}>
+            <Button
+              type="button"
+              variant="secondary"
+              width="full"
+              disabled={disabled}
+              onClick={handleCloseDialog}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="primary"
+              width="full"
+              disabled={disabled}
+            >
+              Confirm
+            </Button>
+          </div>
+        </div>
+      )}
+    </BulkUpdateDialogContent>
+  );
+}

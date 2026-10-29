@@ -1,0 +1,1154 @@
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useSetAtom } from "jotai";
+import { MessageSquare, ImageIcon } from "lucide-react";
+import type {
+  LoaderFunctionArgs,
+  ActionFunctionArgs,
+  MetaFunction,
+} from "react-router";
+import {
+  data,
+  Form,
+  useActionData,
+  useFetcher,
+  useLoaderData,
+} from "react-router";
+import { z } from "zod";
+import { incrementAuditAssetMetaAtom } from "~/atoms/qr-scanner";
+import {
+  AuditAssetNoteItem,
+  type NoteData,
+} from "~/components/audit/audit-asset-note-item";
+import {
+  AuditImageUploadSection,
+  type SelectedImage,
+} from "~/components/audit/audit-image-upload-box";
+import { AuditImageUploadDialog } from "~/components/audit/audit-image-upload-dialog";
+import { Button } from "~/components/shared/button";
+import { db } from "~/database/db.server";
+import { useDisabled } from "~/hooks/use-disabled";
+import {
+  AUDIT_CLOSED_TO_COMMENTS_MESSAGE,
+  auditAcceptsComments,
+} from "~/modules/audit/comment-policy";
+import {
+  createAuditAssetImagesAddedNote,
+  createAuditImageEvidenceNote,
+} from "~/modules/audit/helpers.server";
+import {
+  uploadAuditImage,
+  deleteAuditImage,
+} from "~/modules/audit/image.service.server";
+import { stripMarkdocDelimiters } from "~/modules/audit/note-content.server";
+import {
+  assertAuditAcceptsComments,
+  assertAuditAcceptsCommentsOnLockedRow,
+  createWhileAuditAcceptsComments,
+  requireAuditAssignee,
+  requireAuditAssigneeForScopedViewer,
+} from "~/modules/audit/service.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import { error, getParams, payload } from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { resolveUserDisplayName } from "~/utils/user";
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: data ? appendToMetaTitle(data.header.title) : "" },
+];
+
+export async function loader({ context, request, params }: LoaderFunctionArgs) {
+  const { userId } = context.getSession();
+  const { auditId, auditAssetId } = getParams(
+    params,
+    z.object({ auditId: z.string(), auditAssetId: z.string() }),
+    {
+      additionalData: { userId },
+    }
+  );
+
+  try {
+    const permissionResult = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.audit,
+      action: PermissionAction.read,
+    });
+
+    const { organizationId, access } = permissionResult;
+
+    // Fetch audit asset with notes and images
+    const auditAsset = await db.auditAsset.findFirst({
+      where: {
+        id: auditAssetId,
+        // Bound to the audit named in the URL, not merely to the org. Without
+        // `auditSessionId` a caller could pass an audit asset from a DIFFERENT
+        // audit and the page would render it under this audit's heading — and
+        // the action's assignment guard, which keys on `auditId`, would then be
+        // validating a different audit from the one being written to.
+        auditSessionId: auditId,
+        auditSession: {
+          organizationId,
+        },
+      },
+      include: {
+        asset: {
+          select: {
+            id: true,
+            title: true,
+          },
+        },
+        auditSession: {
+          select: {
+            status: true,
+            assignments: {
+              select: { userId: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!auditAsset) {
+      throw new ShelfError({
+        cause: null,
+        message: "Audit asset not found",
+        additionalData: { auditAssetId, organizationId },
+        label: "Audit",
+        status: 404,
+      });
+    }
+
+    requireAuditAssigneeForScopedViewer({
+      audit: auditAsset.auditSession,
+      userId,
+      assignedOnly: !access.audits.seeAll,
+      auditId,
+    });
+
+    // Fetch the notes a PERSON wrote about this audit asset.
+    //
+    // why the type filter: uploading photos without typing a caption writes an
+    // UPDATE note against this same asset (helpers.server.ts,
+    // createAuditAssetImagesAddedNote), whose body is the Markdoc
+    // `{% audit_images %}` tag. Without the filter this panel counted that row
+    // in its Notes badge and rendered the photos twice — once inside the note,
+    // once in the Images grid below — and it disagreed with the count on the
+    // row that opened it, which asks for COMMENT only.
+    const notes = await db.auditNote.findMany({
+      where: {
+        auditSessionId: auditId,
+        auditAssetId: auditAssetId,
+        type: "COMMENT",
+      },
+      select: {
+        id: true,
+        content: true,
+        createdAt: true,
+        userId: true,
+        type: true,
+        user: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            displayName: true,
+            email: true,
+            profilePicture: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    // Fetch images
+    const images = await db.auditImage.findMany({
+      where: {
+        auditAssetId: auditAssetId,
+      },
+      select: {
+        id: true,
+        imageUrl: true,
+        thumbnailUrl: true,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    const header = {
+      title: auditAsset.asset.title,
+      subHeading: "Notes and images",
+    };
+
+    return payload({
+      showSidebar: true,
+      header,
+      auditAsset,
+      notes,
+      images,
+      auditId,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, auditId, auditAssetId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const { userId } = context.getSession();
+  const { auditId, auditAssetId } = getParams(
+    params,
+    z.object({ auditId: z.string(), auditAssetId: z.string() }),
+    {
+      additionalData: { userId },
+    }
+  );
+
+  try {
+    const { organizationId, access } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.audit,
+      action: PermissionAction.update,
+    });
+
+    // The loader gates the read with `requireAuditAssigneeForScopedViewer`;
+    // this action did not gate the writes. Every intent below mutates the
+    // audit — notes, condition, evidence deletion — so the guard is hoisted
+    // here rather than repeated per intent, and a new intent inherits it.
+    await requireAuditAssignee({
+      auditSessionId: auditId,
+      organizationId,
+      userId,
+      assignedOnly: !access.audits.seeAll,
+    });
+
+    // …and prove the audit asset actually belongs to that audit. Both ids come
+    // from the URL and were never tied together, so guarding on `auditId`
+    // alone would validate assignment against one audit while every intent
+    // below writes to an asset in another. `AuditAsset` has no
+    // `organizationId` of its own — the session link is its whole tenant
+    // boundary — so the org filter goes through the relation.
+    const auditAssetInSession = await db.auditAsset.findFirst({
+      where: {
+        id: auditAssetId,
+        auditSessionId: auditId,
+        auditSession: { organizationId },
+      },
+      select: { id: true },
+    });
+
+    if (!auditAssetInSession) {
+      throw new ShelfError({
+        cause: null,
+        // Uniform with a genuinely unknown id: both ids are caller-supplied,
+        // so a distinct message would confirm which ones exist.
+        message: "Audit asset not found in this audit",
+        additionalData: { auditId, auditAssetId },
+        label: "Audit",
+        status: 404,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const formData = await request.clone().formData();
+    const intent = formData.get("intent") as string;
+
+    if (intent === "create-note") {
+      const rawContent = formData.get("content") as string;
+
+      // Audit note content is Markdoc-rendered in the feed (MarkdownViewer)
+      // and the PDF path assumes server-side sanitization. Strip `{%`/`%}`
+      // so a user-authored note cannot smuggle a Markdoc tag (e.g.
+      // `{% audit_images ids="..." /%}`) into the rendered feed/report —
+      // mirrors the image-evidence path and the mobile note route.
+      const content = stripMarkdocDelimiters(rawContent ?? "");
+
+      if (!content) {
+        throw new ShelfError({
+          cause: null,
+          message: "Note content is required",
+          additionalData: { auditAssetId },
+          label: "Audit",
+          status: 400,
+          // Expected user-input validation — a 400, not a server error.
+          // Don't capture to Sentry (was noise: SHELF-WEBAPP-1KS).
+          shouldBeCaptured: false,
+        });
+      }
+
+      // Created only while the audit still accepts comments, checked on the
+      // locked row so a completion cannot slip in between.
+      const note = await createWhileAuditAcceptsComments(
+        { auditSessionId: auditId, organizationId },
+        (tx) =>
+          tx.auditNote.create({
+            data: {
+              content,
+              auditSessionId: auditId,
+              auditAssetId: auditAssetId,
+              userId,
+            },
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  displayName: true,
+                  email: true,
+                  profilePicture: true,
+                },
+              },
+            },
+          })
+      );
+
+      return payload({ note });
+    }
+
+    if (intent === "delete-note") {
+      const noteId = formData.get("noteId") as string;
+
+      if (!noteId) {
+        throw new ShelfError({
+          cause: null,
+          message: "Note ID is required",
+          additionalData: { auditAssetId },
+          label: "Audit",
+          status: 400,
+        });
+      }
+
+      // Prevent deletion of auto-generated notes (UPDATE type)
+      const noteToDelete = await db.auditNote.findFirst({
+        where: {
+          id: noteId,
+          // Bound to the audit in the URL as well as the org. Org scope alone
+          // let an assignee of one audit delete notes belonging to another
+          // audit in the same workspace.
+          auditSessionId: auditId,
+          auditAssetId,
+          auditSession: { organizationId },
+        },
+        select: { type: true },
+      });
+
+      if (noteToDelete?.type === "UPDATE") {
+        throw new ShelfError({
+          cause: null,
+          message: "Cannot delete auto-generated notes",
+          additionalData: { noteId },
+          label: "Audit",
+          status: 403,
+        });
+      }
+
+      // deleteMany, not delete: `delete` requires a unique where, and the
+      // organization scope has to come through the parent audit session
+      // (AuditNote has no organizationId column). Before this, the delete was
+      // keyed on the note id ALONE -- any authenticated user who could reach
+      // this route could delete any audit note in any organization.
+      // why: scoped by organization but deliberately NOT by userId, unlike
+      // audits.$auditId.note.tsx. Audit note deletion here is a role-gated,
+      // org-wide capability -- an auditor tidying a session should not be
+      // blocked by who typed the note. Cross-ORG deletion is what was wrong,
+      // and that is what the auditSession filter closes.
+      const deleted = await db.auditNote.deleteMany({
+        where: {
+          id: noteId,
+          auditSessionId: auditId,
+          auditAssetId,
+          auditSession: { organizationId },
+        },
+      });
+
+      if (deleted.count === 0) {
+        throw new ShelfError({
+          cause: null,
+          message: "Note not found or you don't have permission to delete it.",
+          additionalData: { noteId, organizationId },
+          label: "Audit",
+          status: 403,
+        });
+      }
+
+      return payload({ success: true });
+    }
+
+    if (intent === "upload-image" || intent === "upload-images") {
+      // Evidence reaches the feed as a note, so a finished audit refuses the
+      // whole upload. Checked before the files are stored — the note write
+      // below re-checks on the locked row, and refusing only there would leave
+      // the uploaded images behind.
+      const auditForUpload = await db.auditSession.findFirst({
+        where: { id: auditId, organizationId },
+        select: { status: true },
+      });
+
+      if (auditForUpload) {
+        assertAuditAcceptsComments(auditForUpload.status, {
+          auditSessionId: auditId,
+          organizationId,
+        });
+      }
+
+      // Get optional note content
+      const noteContent = formData.get("content") as string | null;
+
+      // Get all files from the form data (already parsed above via clone)
+      const fileEntries = formData.getAll(
+        intent === "upload-images" ? "images" : "auditImage"
+      );
+
+      // Filter to only actual File objects
+      const files = fileEntries.filter(
+        (entry): entry is File => entry instanceof File
+      );
+
+      if (files.length === 0) {
+        throw new ShelfError({
+          cause: null,
+          message: "No image files found in the request",
+          additionalData: { auditAssetId },
+          label: "Audit Image",
+          status: 400,
+        });
+      }
+
+      // Upload each file sequentially
+      const uploadedImages: Array<{ id: string }> = [];
+      for (const file of files) {
+        // Create a new FormData with single file
+        const singleFileFormData = new FormData();
+        singleFileFormData.set("image", file);
+
+        // Create a new Request with this FormData
+        const singleFileRequest = new Request(request.url, {
+          method: "POST",
+          body: singleFileFormData,
+        });
+
+        const image = await uploadAuditImage({
+          request: singleFileRequest,
+          auditSessionId: auditId,
+          organizationId,
+          uploadedById: userId,
+          auditAssetId: auditAssetId,
+        });
+
+        uploadedImages.push(image);
+      }
+
+      // Create a note in a transaction to track the image uploads.
+      await db.$transaction(async (tx) => {
+        await assertAuditAcceptsCommentsOnLockedRow(tx, {
+          auditSessionId: auditId,
+          organizationId,
+        });
+
+        const imageIds = uploadedImages.map((img) => img.id);
+
+        if (intent === "upload-image") {
+          // Single-file path — delegate entirely to the shared, sanitized
+          // evidence-note writer (same helper used by the mobile route).
+          // Markdoc injection is closed inside `createAuditImageEvidenceNote`
+          // via `buildAuditImagesNoteContent` → `stripMarkdocDelimiters`.
+          await createAuditImageEvidenceNote({
+            tx,
+            auditSessionId: auditId,
+            auditAssetId: auditAssetId,
+            userId,
+            imageIds,
+            content: noteContent,
+          });
+          return;
+        }
+
+        // Multi-file path — preserve the existing note shape but sanitize the
+        // user-authored text segment before the trusted tag is appended so an
+        // injected `{%`/`%}` cannot open or close a Markdoc tag. Branch on the
+        // SANITIZED value: a payload that sanitizes to "" must fall back to
+        // the auto-generated UPDATE note, not create a COMMENT note that holds
+        // only the trusted tag (wrong type + user-deletable).
+        const sanitizedNoteContent = stripMarkdocDelimiters(noteContent ?? "");
+        if (sanitizedNoteContent) {
+          await tx.auditNote.create({
+            data: {
+              auditSessionId: auditId,
+              auditAssetId: auditAssetId,
+              userId,
+              content: `${sanitizedNoteContent}\n\n{% audit_images count=${
+                imageIds.length
+              } ids="${imageIds.join(",")}" /%}`,
+              type: "COMMENT",
+            },
+          });
+        } else {
+          // No note provided — use the default auto-generated UPDATE note.
+          await createAuditAssetImagesAddedNote({
+            auditSessionId: auditId,
+            auditAssetId: auditAssetId,
+            userId,
+            imageIds,
+            tx,
+          });
+        }
+      });
+
+      return payload({ images: uploadedImages });
+    }
+
+    if (intent === "add-images-to-note") {
+      const noteId = formData.get("noteId") as string;
+
+      if (!noteId) {
+        throw new ShelfError({
+          cause: null,
+          message: "Note ID is required to attach images",
+          additionalData: { auditAssetId },
+          label: "Audit Image",
+          status: 400,
+        });
+      }
+
+      // Get all files from the form data
+      const fileEntries = formData.getAll("images");
+
+      // Filter to only actual File objects
+      const files = fileEntries.filter(
+        (entry): entry is File => entry instanceof File
+      );
+
+      if (files.length === 0) {
+        throw new ShelfError({
+          cause: null,
+          message: "No image files found in the request",
+          additionalData: { auditAssetId },
+          label: "Audit Image",
+          status: 400,
+        });
+      }
+
+      // Prove the note is ours BEFORE uploading anything.
+      //
+      // The scoped lookup used to sit inside the transaction below, AFTER this
+      // loop — so a request naming a note in another audit (or another
+      // organization) was correctly refused, but only once the images had
+      // already been written to storage and to the database. The refusal was
+      // sound; the side effect was not.
+      const targetNote = await db.auditNote.findFirst({
+        where: {
+          id: noteId,
+          auditSessionId: auditId,
+          auditAssetId,
+          auditSession: { organizationId },
+        },
+        select: { id: true },
+      });
+
+      if (!targetNote) {
+        throw new ShelfError({
+          cause: null,
+          // Uniform with a genuinely unknown id — `noteId` is caller-supplied.
+          message: "Note not found",
+          additionalData: { noteId, auditId },
+          label: "Audit Image",
+          status: 404,
+          shouldBeCaptured: false,
+        });
+      }
+
+      // Upload each file sequentially
+      const uploadedImages: Array<{ id: string }> = [];
+      for (const file of files) {
+        // Create a new FormData with single file
+        const singleFileFormData = new FormData();
+        singleFileFormData.set("image", file);
+
+        // Create a new Request with this FormData
+        const singleFileRequest = new Request(request.url, {
+          method: "POST",
+          body: singleFileFormData,
+        });
+
+        const image = await uploadAuditImage({
+          request: singleFileRequest,
+          auditSessionId: auditId,
+          organizationId,
+          uploadedById: userId,
+          auditAssetId: auditAssetId,
+        });
+
+        uploadedImages.push(image);
+      }
+
+      // Update the note to append the audit_images tag
+      // The pre-check above closes the ordinary case. This still re-checks
+      // under the write, because the note can be deleted between the two —
+      // and if that happens the uploads are rolled back rather than left
+      // orphaned in storage with nothing pointing at them.
+      try {
+        await db.$transaction(async (tx) => {
+          // SECURITY (cross-organization IDOR): `AuditNote` has no
+          // `organizationId` column — it inherits its tenant through
+          // `auditSession` — so an id-only lookup addressed every note in the
+          // table, in every workspace. `noteId` comes from the request body, so
+          // this branch could READ and then OVERWRITE the content of any audit
+          // note in any organization.
+          //
+          // The sibling delete branch was hardened for exactly this and carries
+          // a comment saying so; this path was missed.
+          const existingNote = await tx.auditNote.findFirst({
+            where: {
+              id: noteId,
+              auditSessionId: auditId,
+              auditAssetId,
+              auditSession: { organizationId },
+            },
+          });
+
+          if (!existingNote) {
+            throw new ShelfError({
+              cause: null,
+              message: "Note not found",
+              additionalData: { noteId },
+              label: "Audit Image",
+              status: 404,
+            });
+          }
+
+          // Extract existing image IDs from content if any
+          const existingImageIds: string[] = [];
+          const regex = /{%\s*audit_images[^%]*ids="([^"]+)"[^%]*%}/g;
+          let match;
+          while ((match = regex.exec(existingNote.content)) !== null) {
+            existingImageIds.push(...match[1].split(","));
+          }
+
+          // Add new image IDs
+          const newImageIds = uploadedImages.map((img) => img.id);
+          const allImageIds = [...existingImageIds, ...newImageIds];
+
+          // Remove existing audit_images tags, sanitize the surviving user-authored
+          // body so a previously-injected delimiter can't survive a re-tag, then
+          // append the fresh trusted tag.
+          const strippedTags = existingNote.content.replace(
+            /{%\s*audit_images[^%]*%}/g,
+            ""
+          );
+          // stripMarkdocDelimiters trims and removes `{%`/`%}` from user text only;
+          // the trusted tag is appended after, so it is never touched.
+          const sanitizedBody = stripMarkdocDelimiters(strippedTags);
+          const updatedContent = `${sanitizedBody}\n\n{% audit_images count=${
+            allImageIds.length
+          } ids="${allImageIds.join(",")}" /%}`;
+
+          // `updateMany`, not `update`: a unique-only `where` cannot carry the
+          // parent scope, and the write must be scoped in its own right rather
+          // than relying on the read above surviving a future refactor.
+          const updated = await tx.auditNote.updateMany({
+            where: {
+              id: noteId,
+              auditSessionId: auditId,
+              // …and to the ASSET the URL names. This route creates notes with
+              // `auditAssetId` set and lists them filtered by it, so a note on a
+              // different asset is one this page never offered. Not a privilege
+              // boundary — assignment is per-audit, so an assignee reaches every
+              // asset in it — but appending images to, or deleting, another
+              // asset's note corrupts data the caller never saw.
+              auditAssetId,
+              auditSession: { organizationId },
+            },
+            data: {
+              content: updatedContent,
+            },
+          });
+
+          if (updated.count === 0) {
+            throw new ShelfError({
+              cause: null,
+              message: "Note not found",
+              additionalData: { noteId, auditId },
+              label: "Audit",
+              status: 404,
+              shouldBeCaptured: false,
+            });
+          }
+        });
+      } catch (cause) {
+        // Best-effort cleanup. A failure here must not mask the original
+        // error, which is the one the caller needs to see.
+        await Promise.all(
+          uploadedImages.map((img) =>
+            deleteAuditImage({
+              imageId: img.id,
+              organizationId,
+              auditSessionId: auditId,
+              auditAssetId,
+            }).catch(() => undefined)
+          )
+        );
+        throw cause;
+      }
+
+      return payload({ images: uploadedImages });
+    }
+
+    if (intent === "delete-image") {
+      const imageId = formData.get("imageId") as string;
+
+      if (!imageId) {
+        throw new ShelfError({
+          cause: null,
+          message: "Image ID is required",
+          additionalData: { auditAssetId },
+          label: "Audit",
+          status: 400,
+        });
+      }
+
+      await deleteAuditImage({
+        imageId,
+        organizationId,
+        auditSessionId: auditId,
+        auditAssetId,
+      });
+
+      return payload({ success: true });
+    }
+
+    throw new ShelfError({
+      cause: null,
+      message: "Invalid intent",
+      additionalData: { intent },
+      label: "Audit",
+      status: 400,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, auditId, auditAssetId });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+/**
+ * Initial note transform used both for the initial state seed and for
+ * re-seeding whenever the loader returns a fresh `initialNotes` array.
+ */
+function notesFromLoader(
+  initialNotes: ReturnType<typeof useLoaderData<typeof loader>>["notes"]
+): NoteData[] {
+  return initialNotes.map((note) => ({
+    id: note.id,
+    content: note.content,
+    createdAt: note.createdAt,
+    userId: note.userId ?? "",
+    type: note.type,
+    user: {
+      id: note.user?.id ?? "",
+      name: resolveUserDisplayName(note.user) || note.user?.email || "",
+      img: note.user?.profilePicture ?? null,
+    },
+    needsServerSync: false,
+  }));
+}
+
+/** Coalesced state for AuditAssetDetails — replaces multiple useStates with a useReducer. */
+type AuditDetailsState = {
+  isUploadInProgress: boolean;
+  dialogOpen: boolean;
+  selectedImages: SelectedImage[];
+  clearTrigger: number;
+  attachingToNoteId: string | null;
+};
+
+type AuditDetailsAction =
+  | { type: "SET_UPLOAD_IN_PROGRESS"; payload: boolean }
+  | { type: "OPEN_DIALOG"; payload: SelectedImage[] }
+  | { type: "CLOSE_DIALOG" }
+  | { type: "SET_SELECTED_IMAGES"; payload: SelectedImage[] }
+  | { type: "START_ATTACHING"; payload: string };
+
+function auditDetailsReducer(
+  state: AuditDetailsState,
+  action: AuditDetailsAction
+): AuditDetailsState {
+  switch (action.type) {
+    case "SET_UPLOAD_IN_PROGRESS":
+      return { ...state, isUploadInProgress: action.payload };
+    case "OPEN_DIALOG":
+      return { ...state, selectedImages: action.payload, dialogOpen: true };
+    case "CLOSE_DIALOG":
+      return {
+        ...state,
+        dialogOpen: false,
+        attachingToNoteId: null,
+        selectedImages: [],
+        clearTrigger: state.clearTrigger + 1,
+      };
+    case "SET_SELECTED_IMAGES":
+      return { ...state, selectedImages: action.payload };
+    case "START_ATTACHING":
+      return {
+        ...state,
+        attachingToNoteId: action.payload,
+        selectedImages: [],
+      };
+    default:
+      return state;
+  }
+}
+
+const INITIAL_AUDIT_DETAILS_STATE: AuditDetailsState = {
+  isUploadInProgress: false,
+  dialogOpen: false,
+  selectedImages: [],
+  clearTrigger: 0,
+  attachingToNoteId: null,
+};
+
+// react-doctor:no-giant-component — deferred for follow-up refactor
+export default function AuditAssetDetails() {
+  const {
+    notes: initialNotes,
+    images,
+    auditAsset,
+  } = useLoaderData<typeof loader>();
+  const acceptsComments = auditAcceptsComments(auditAsset.auditSession.status);
+  const actionData = useActionData<typeof action>();
+
+  const imageUploadFetcher = useFetcher<typeof action>();
+  const incrementMeta = useSetAtom(incrementAuditAssetMetaAtom);
+
+  const [state, dispatch] = useReducer(
+    auditDetailsReducer,
+    INITIAL_AUDIT_DETAILS_STATE
+  );
+  const {
+    isUploadInProgress,
+    dialogOpen,
+    selectedImages,
+    clearTrigger,
+    attachingToNoteId,
+  } = state;
+  const filePickerTriggerRef = useRef<
+    ((currentSelectedCount?: number) => void) | null
+  >(null);
+  const imageRemovalRef = useRef<((id: string) => void) | null>(null);
+  const noteFormRef = useRef<HTMLFormElement | null>(null);
+  const disabled = useDisabled();
+
+  useEffect(() => {
+    if (
+      imageUploadFetcher.state === "submitting" ||
+      imageUploadFetcher.state === "loading"
+    ) {
+      dispatch({ type: "SET_UPLOAD_IN_PROGRESS", payload: true });
+    } else if (imageUploadFetcher.state === "idle") {
+      dispatch({ type: "SET_UPLOAD_IN_PROGRESS", payload: false });
+    }
+  }, [imageUploadFetcher.state]);
+
+  /**
+   * Local state for notes — seeded from the loader but then mutated
+   * optimistically. We re-seed via the "sync on prop change" pattern
+   * (ref + setState during render) rather than a useEffect so the UI
+   * never shows a stale frame after the loader revalidates.
+   */
+  const [localNotes, setLocalNotes] = useState<NoteData[]>(() =>
+    notesFromLoader(initialNotes)
+  );
+  const lastInitialNotesRef = useRef(initialNotes);
+  if (lastInitialNotesRef.current !== initialNotes) {
+    lastInitialNotesRef.current = initialNotes;
+    setLocalNotes(notesFromLoader(initialNotes));
+  }
+
+  /**
+   * Local state for images — seeded from the loader, then mutated
+   * optimistically on upload/delete. Same sync-on-prop-change pattern as
+   * localNotes above: the loader's `images` array is the source of truth,
+   * but we allow local tweaks between revalidations.
+   */
+  const [localImages, setLocalImages] = useState<typeof images>(images);
+  const lastImagesRef = useRef(images);
+  if (lastImagesRef.current !== images) {
+    lastImagesRef.current = images;
+    setLocalImages(images);
+  }
+
+  // Handle successful image upload from fetcher
+  useEffect(() => {
+    if (imageUploadFetcher.state === "idle" && imageUploadFetcher.data) {
+      const data = imageUploadFetcher.data as any;
+      if (data.images && Array.isArray(data.images)) {
+        // Add newly uploaded images to local state, avoiding duplicates
+        setLocalImages((prev) => {
+          const existingIds = new Set(prev.map((img) => img.id));
+          const newImages = data.images.filter(
+            (img: any) => !existingIds.has(img.id)
+          );
+          return [...newImages, ...prev];
+        });
+        // Sync list counters so scan view reflects new image counts.
+        if (auditAsset?.id) {
+          incrementMeta({
+            auditAssetId: auditAsset.id,
+            imagesDelta: data.images.length,
+          });
+        }
+      }
+    }
+  }, [
+    imageUploadFetcher.state,
+    imageUploadFetcher.data,
+    auditAsset?.id,
+    incrementMeta,
+  ]);
+
+  useEffect(() => {
+    if (actionData && "note" in actionData) {
+      noteFormRef.current?.reset();
+      // Update local counts for the scan list without waiting for reload.
+      if (auditAsset?.id) {
+        incrementMeta({ auditAssetId: auditAsset.id, notesDelta: 1 });
+      }
+    }
+  }, [actionData, auditAsset?.id, incrementMeta]);
+
+  /**
+   * Called when images are selected.
+   * Opens the dialog to allow adding a note.
+   */
+  const handleImagesSelected = (images: SelectedImage[]) => {
+    dispatch({ type: "OPEN_DIALOG", payload: images });
+  };
+
+  /**
+   * Handle removing an image from the selection
+   */
+  const handleRemoveImage = (id: string) => {
+    const image = selectedImages.find((img) => img.id === id);
+    if (image) {
+      URL.revokeObjectURL(image.previewUrl);
+    }
+    dispatch({
+      type: "SET_SELECTED_IMAGES",
+      payload: selectedImages.filter((img) => img.id !== id),
+    });
+    // Also remove from AuditImageUploadSection's local state
+    if (imageRemovalRef.current) {
+      imageRemovalRef.current(id);
+    }
+  };
+
+  /**
+   * Handle dialog close - cleanup preview URLs
+   */
+  const handleDialogClose = () => {
+    // Cleanup preview URLs before the reducer clears them.
+    selectedImages.forEach((img) => URL.revokeObjectURL(img.previewUrl));
+    dispatch({ type: "CLOSE_DIALOG" });
+  };
+
+  /**
+   * Called when "Add more" button is clicked in dialog.
+   * Triggers the file picker from AuditImageUploadBox.
+   */
+  const handleAddMoreImages = () => {
+    if (filePickerTriggerRef.current) {
+      // Pass the current selected count + existing count to properly calculate remaining slots
+      const totalCount = localImages.length + selectedImages.length;
+      filePickerTriggerRef.current(totalCount);
+    }
+  };
+
+  /**
+   * Called by AuditAssetNoteItem when server returns real note data.
+   * Replaces temp note with real note in local state.
+   */
+  const handleServerSync = useCallback((realNote: NoteData) => {
+    setLocalNotes((prev) =>
+      prev.map((note) =>
+        // Replace temp note with real note
+        note.needsServerSync && note.content === realNote.content
+          ? realNote
+          : note
+      )
+    );
+  }, []);
+
+  /**
+   * Called by AuditAssetNoteItem when delete is clicked.
+   * Removes note from local state immediately (optimistic).
+   */
+  const handleNoteDelete = useCallback((noteId: string) => {
+    setLocalNotes((prev) => prev.filter((note) => note.id !== noteId));
+  }, []);
+
+  const handleAttachImages = useCallback(
+    (noteId: string) => {
+      dispatch({ type: "START_ATTACHING", payload: noteId });
+      // Trigger file picker immediately when attaching to note
+      if (filePickerTriggerRef.current) {
+        filePickerTriggerRef.current(localImages.length);
+      }
+    },
+    [localImages.length]
+  );
+
+  /**
+   * Called when image delete is clicked.
+   * Removes image from local state immediately (optimistic).
+   */
+  const handleImageDelete = (imageId: string) => {
+    setLocalImages((prev) => prev.filter((img) => img.id !== imageId));
+  };
+
+  /**
+   * Handle image delete with confirmation and Form submission.
+   * This triggers the delete-image action which will revalidate.
+   */
+  const handleImageDeleteWithConfirm = (imageId: string) => {
+    if (!confirm("Are you sure you want to delete this image?")) {
+      return;
+    }
+    // Optimistic removal
+    handleImageDelete(imageId);
+    // Submit delete to server
+    const formData = new FormData();
+    formData.set("intent", "delete-image");
+    formData.set("imageId", imageId);
+    void fetch(window.location.href, {
+      method: "POST",
+      body: formData,
+    });
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* Add note form — only while the audit is still open */}
+      <div className="shrink-0 border-b border-gray-200 px-6 py-4">
+        {acceptsComments ? (
+          <Form method="post" ref={noteFormRef}>
+            <input type="hidden" name="intent" value="create-note" />
+            <div className="space-y-2">
+              <textarea
+                name="content"
+                placeholder="Add a note..."
+                rows={3}
+                className="w-full resize-none rounded-md border border-gray-300 p-2 text-sm focus:border-gray-500 focus:outline-none"
+              />
+              <div className="flex justify-end">
+                <Button type="submit" size="sm" disabled={disabled}>
+                  {disabled ? "Adding Note..." : "Add Note"}
+                </Button>
+              </div>
+            </div>
+          </Form>
+        ) : (
+          <p className="text-sm text-gray-500">
+            {AUDIT_CLOSED_TO_COMMENTS_MESSAGE}
+          </p>
+        )}
+        {/* A page opened while the audit was still running can submit after it
+            closed, so the server's refusal is rendered here rather than lost. */}
+        {actionData && "error" in actionData && actionData.error ? (
+          <p className="mt-2 text-sm text-error-500" role="alert">
+            {actionData.error.message}
+          </p>
+        ) : null}
+      </div>
+
+      {/* Notes section - scrollable, takes remaining space */}
+      <div className="flex-1 overflow-y-auto border-b border-gray-200 px-6 py-4">
+        <div className="mb-6">
+          <div className="mb-3 flex items-center gap-2">
+            <MessageSquare className="size-5 text-gray-600" />
+            <h3 className="text-base font-semibold text-gray-900">Notes</h3>
+            <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
+              {localNotes.length}
+            </span>
+          </div>
+
+          {localNotes.length === 0 ? (
+            <p className="text-sm text-gray-500">No notes yet</p>
+          ) : (
+            <div className="space-y-3">
+              {localNotes.map((note) => (
+                <AuditAssetNoteItem
+                  key={note.id}
+                  note={note}
+                  onServerSync={handleServerSync}
+                  onDelete={handleNoteDelete}
+                  onAttachImages={handleAttachImages}
+                  currentImageCount={localImages.length}
+                  maxImageCount={3}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Images section - fixed height at bottom */}
+      <div className="h-68 shrink-0 overflow-y-auto  border-gray-200 px-6 py-4">
+        <div className="mb-3 flex items-center gap-2">
+          <ImageIcon className="size-5 text-gray-600" />
+          <h3 className="text-base font-semibold text-gray-900">Images</h3>
+          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
+            {localImages.length}
+          </span>
+        </div>
+
+        {/* Upload section */}
+        <AuditImageUploadSection
+          maxCount={3}
+          inputNamePrefix="auditImage"
+          existingImages={localImages}
+          onExistingImageRemove={handleImageDeleteWithConfirm}
+          disabled={isUploadInProgress}
+          isUploading={isUploadInProgress}
+          onImagesSelected={handleImagesSelected}
+          clearTrigger={clearTrigger}
+          onExposeFilePicker={(trigger) => {
+            filePickerTriggerRef.current = trigger;
+          }}
+          currentSelectedInDialog={selectedImages.length}
+          onExposeImageRemoval={(removalFn) => {
+            imageRemovalRef.current = removalFn;
+          }}
+        />
+      </div>
+
+      {/* Image upload dialog */}
+      {dialogOpen && (
+        <AuditImageUploadDialog
+          open={dialogOpen}
+          onClose={handleDialogClose}
+          existingNoteId={attachingToNoteId}
+          selectedImages={selectedImages}
+          onRemoveImage={handleRemoveImage}
+          onChangeImages={handleAddMoreImages}
+          fetcher={imageUploadFetcher}
+          // The dialog is only mounted after a user interaction, which
+          // means hydration has already completed — we can safely read
+          // `document.body` inline instead of syncing it in a useEffect
+          // (which would otherwise produce a first-paint flash).
+          portalContainer={
+            typeof document !== "undefined" ? document.body : undefined
+          }
+          maxCount={3}
+          existingImagesCount={localImages.length}
+        />
+      )}
+    </div>
+  );
+}

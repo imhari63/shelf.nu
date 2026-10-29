@@ -1,0 +1,162 @@
+import { useEffect, useState } from "react";
+import { Slot, useRouter, useSegments } from "expo-router";
+import { StatusBar } from "expo-status-bar";
+import { Platform } from "react-native";
+import { SafeAreaProvider } from "react-native-safe-area-context";
+import * as SplashScreen from "expo-splash-screen";
+import { AuthProvider, useAuth } from "@/lib/auth-context";
+import { OrgProvider } from "@/lib/org-context";
+import { ThemeProvider, useTheme } from "@/lib/theme-context";
+import { OfflineBanner } from "@/components/offline-banner";
+import { UpdateAvailableBanner } from "@/components/update-available-banner";
+import AnimatedSplash from "@/components/animated-splash";
+import { useDeepLinkHandler } from "@/lib/deep-links";
+import { useQuickActions } from "@/lib/quick-actions";
+import { getStartPage, getStartPageRoute } from "@/lib/start-page";
+import { preloadScanSound } from "@/lib/scan-sound";
+import { initSentry, trackServerTag } from "@/lib/sentry";
+import {
+  hydrateActiveServer,
+  onBeforeSessionEnd,
+  refreshActiveServerConfig,
+} from "@/lib/server";
+import { unlockOrientationOnTablets } from "@/lib/orientation";
+import {
+  configureNotificationPresentation,
+  usePushRegistration,
+  usePushTapHandler,
+} from "@/lib/push/handlers";
+import { unregisterThisDevice } from "@/lib/push/registration";
+import * as Sentry from "@sentry/react-native";
+import Constants from "expo-constants";
+
+// Initialise crash/error reporting as early as possible (no-ops in dev / no DSN).
+initSentry();
+
+// Keep the native splash visible until our animated splash is mounted.
+SplashScreen.preventAutoHideAsync().catch(() => {});
+
+// Phones stay upright; an Android tablet follows its rotation from launch.
+unlockOrientationOnTablets();
+
+// A push that arrives while the app is open shows as a banner.
+configureNotificationPresentation();
+
+// Every sign-out, including the one a server switch performs, first asks the
+// server to forget this device, so a shared phone stops receiving the
+// previous person's pushes.
+onBeforeSessionEnd(unregisterThisDevice);
+
+// ── Startup diagnostic (visible in Metro terminal) ──────────────────
+if (__DEV__) {
+  console.log(
+    `\n[Shelf] JS executing on ${Platform.OS} | SDK ${Constants.expoConfig?.sdkVersion} | RN ${Platform.constants?.reactNativeVersion?.major}.${Platform.constants?.reactNativeVersion?.minor}.${Platform.constants?.reactNativeVersion?.patch}\n`
+  );
+}
+
+// Pre-load scan sound so first scan is instant (no init delay)
+preloadScanSound();
+
+function RootLayoutNav() {
+  const { session, isLoading } = useAuth();
+  const { isDark } = useTheme();
+  const segments = useSegments();
+  const router = useRouter();
+
+  const [splashComplete, setSplashComplete] = useState(false);
+  const [startPageRoute, setStartPageRoute] = useState("/(tabs)/assets");
+
+  // Load the user's preferred start page from AsyncStorage on mount.
+  // Runs in parallel with auth resolution — resolves in ~5ms, well before
+  // the splash animation finishes (~1300ms).
+  useEffect(() => {
+    getStartPage().then((page) => {
+      setStartPageRoute(getStartPageRoute(page));
+    });
+  }, []);
+
+  // Handle incoming deep links (shelf:// and universal links)
+  useDeepLinkHandler();
+
+  // Open the screen a tapped push is about, and keep this device registered
+  usePushTapHandler();
+  usePushRegistration();
+
+  // Register 3D Touch / long-press quick actions (home screen shortcuts)
+  useQuickActions();
+
+  // Redirect after splash finishes and auth state is known.
+  useEffect(() => {
+    if (isLoading || !splashComplete) return;
+
+    const inAuthGroup = segments[0] === "(auth)";
+
+    if (!session && !inAuthGroup) {
+      router.replace("/(auth)/login");
+    } else if (session && inAuthGroup) {
+      router.replace(startPageRoute as any);
+    }
+    // why: router from expo-router is a stable reference across renders; including it
+    // would not affect behavior but adds noise to the dep array
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, isLoading, segments, splashComplete, startPageRoute]);
+
+  return (
+    <>
+      <StatusBar style={isDark ? "light" : "dark"} />
+      <OfflineBanner />
+      <UpdateAvailableBanner>
+        <Slot />
+      </UpdateAvailableBanner>
+      {!splashComplete && (
+        <AnimatedSplash
+          isReady={!isLoading}
+          onComplete={() => setSplashComplete(true)}
+        />
+      )}
+    </>
+  );
+}
+
+function RootLayout() {
+  const [serverReady, setServerReady] = useState(false);
+
+  // Restore the persisted Shelf server (and rebuild the Supabase client against
+  // it) BEFORE any provider that touches auth mounts. AuthProvider reads
+  // getSupabase() in its session effect, so mounting it first would bind it to
+  // the cloud client and force an immediate teardown.
+  // `.finally` — a failed hydration falls back to Shelf Cloud rather than
+  // leaving the user stuck on the splash.
+  useEffect(() => {
+    hydrateActiveServer().finally(() => {
+      setServerReady(true);
+      // Fire-and-forget: revalidating the connected server must never delay
+      // first paint, and it has nothing to say on a Shelf Cloud install.
+      void refreshActiveServerConfig();
+    });
+  }, []);
+
+  // Tag telemetry once the active server is known, then follow every switch.
+  useEffect(() => (serverReady ? trackServerTag() : undefined), [serverReady]);
+
+  // why: the native splash is still up (SplashScreen.preventAutoHideAsync at
+  // module scope), so rendering nothing here shows the splash, not a blank
+  // screen. Hydration is a single AsyncStorage read — a few milliseconds.
+  if (!serverReady) return null;
+
+  return (
+    <SafeAreaProvider>
+      <ThemeProvider>
+        <AuthProvider>
+          <OrgProvider>
+            <RootLayoutNav />
+          </OrgProvider>
+        </AuthProvider>
+      </ThemeProvider>
+    </SafeAreaProvider>
+  );
+}
+
+// Sentry.wrap enables better error-boundary capture + touch context. No-ops
+// gracefully when Sentry isn't initialised (dev / no DSN).
+export default Sentry.wrap(RootLayout);

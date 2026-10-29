@@ -1,0 +1,345 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useAtom, useSetAtom } from "jotai";
+import type {
+  LinksFunction,
+  LoaderFunctionArgs,
+  MetaFunction,
+} from "react-router";
+import { data, Link, useNavigate } from "react-router";
+import { addScannedItemAtom } from "~/atoms/qr-scanner";
+import { ErrorContent } from "~/components/errors";
+import Header from "~/components/layout/header";
+import type { HeaderData } from "~/components/layout/header/types";
+import type { OnCodeDetectionSuccessProps } from "~/components/scanner/code-scanner";
+import { CodeScanner } from "~/components/scanner/code-scanner";
+import { scannerActionAtom } from "~/components/scanner/drawer/action-atom";
+import { ActionSwitcher } from "~/components/scanner/drawer/action-switcher";
+import { db } from "~/database/db.server";
+import { useFillViewportHeight } from "~/hooks/use-fill-viewport-height";
+import { useHapticFeedback } from "~/hooks/use-haptic-feedback";
+import { hasGetAllValue } from "~/hooks/use-model-filters";
+import { useScannerCameraId } from "~/hooks/use-scanner-camera-id";
+import {
+  getTeamMemberForCustodianFilter,
+  resolveCustodianPickerScope,
+} from "~/modules/team-member/service.server";
+import scannerCss from "~/styles/scanner.css?url";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { makeShelfError } from "~/utils/error";
+import { error, getCurrentSearchParams, payload } from "~/utils/http.server";
+import { getParamsValues } from "~/utils/list";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { hasPermission } from "~/utils/permissions/permission.validator.server";
+import { useBarcodePermissions } from "~/utils/permissions/use-barcode-permissions";
+import { requirePermission } from "~/utils/roles.server";
+import {
+  resolveAssetIdFromSamId,
+  type ResolveAssetIdFromSamIdOptions,
+} from "./scanner-sam-id";
+import type { AllowedModelNames } from "../api+/model-filters";
+
+const DEFAULT_ERROR_TITLE = "Unsupported Barcode detected";
+
+export const links: LinksFunction = () => [
+  { rel: "stylesheet", href: scannerCss },
+];
+
+export type ScannerLoader = typeof loader;
+
+// @TODO - to improve this we should place the action in the URL params and only fetch certain data depending on the action
+export async function loader({ request, context }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    const { organizationId, access, userOrganizations } =
+      await requirePermission({
+        userId,
+        request,
+        entity: PermissionEntity.asset,
+        action: PermissionAction.read,
+      });
+    /**
+     * The locations feed the scanner's "update location" drawer, whose action
+     * requires `asset:update`; members without it get no location list.
+     */
+    const canUpdateLocations = await hasPermission({
+      organizationId,
+      userId,
+      roles:
+        userOrganizations.find((o) => o.organization.id === organizationId)
+          ?.roles ?? [],
+      entity: PermissionEntity.asset,
+      action: PermissionAction.update,
+    });
+    const header: HeaderData = {
+      title: "Locations",
+    };
+
+    const searchParams = getCurrentSearchParams(request);
+    const paramsValues = getParamsValues(searchParams);
+
+    /** Get team members for form teamMember select */
+    const { teamMemberIds } = paramsValues;
+
+    /**
+     * An ASSIGNMENT picker: the role's `custody.assign` scope decides who it
+     * lists: everyone, only the caller, or no one.
+     */
+    const custodyScope = resolveCustodianPickerScope({
+      purpose: "custody-assignment",
+      access,
+      userId,
+    });
+
+    const teamMemberData = await getTeamMemberForCustodianFilter({
+      organizationId,
+      selectedTeamMembers: teamMemberIds,
+      getAll:
+        searchParams.has("getAll") &&
+        hasGetAllValue(searchParams, "teamMember"),
+      filterByUserId: custodyScope.mode === "self",
+      returnNone: custodyScope.mode === "none",
+      userId,
+    });
+    /** End team members */
+
+    /** Get locations  */
+    let locationsData;
+    if (canUpdateLocations) {
+      const locationSelected = searchParams.get("location") ?? "";
+      const getAllEntries = searchParams.getAll(
+        "getAll"
+      ) as AllowedModelNames[];
+      const [locationExcludedSelected, selectedLocation, totalLocations] =
+        await Promise.all([
+          db.location.findMany({
+            where: { organizationId, id: { not: locationSelected } },
+            take: getAllEntries.includes("location") ? undefined : 12,
+          }),
+          db.location.findMany({
+            where: { organizationId, id: locationSelected },
+          }),
+          db.location.count({ where: { organizationId } }),
+        ]);
+
+      locationsData = {
+        locations: [...selectedLocation, ...locationExcludedSelected],
+        totalLocations,
+      };
+    }
+    /** End locations */
+
+    return payload({
+      header,
+      ...teamMemberData,
+      ...locationsData,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export const handle = {
+  breadcrumb: () => <Link to="/scanner">QR code scanner</Link>,
+};
+
+export const meta: MetaFunction<typeof loader> = () => [
+  { title: appendToMetaTitle("Qr code scanner") },
+];
+
+/**
+ * Floor for the scanner pane, matching `CodeScanner`'s own `min-h-[400px]` so a
+ * mismeasurement can never collapse the viewfinder to nothing.
+ */
+const MIN_SCANNER_HEIGHT = 400;
+
+const QRScanner = () => {
+  const navigate = useNavigate();
+  const [paused, setPaused] = useState<boolean>(false);
+  const [scanMessage, setScanMessage] = useState<string>(
+    "Processing QR code..."
+  );
+  const [errorMessage, setErrorMessage] = useState<string | undefined>();
+  const [errorTitle, setErrorTitle] = useState<string | undefined>(undefined);
+  // The scanner fills everything below whatever chrome the layout puts above
+  // it — nothing here, a top bar below `md`, plus any account banner. Measuring
+  // that offset keeps the viewfinder flush with the bottom of the screen on
+  // every arrangement; a fixed subtraction only ever suits one of them.
+  const { ref: scannerContainerRef, height } =
+    useFillViewportHeight<HTMLDivElement>({ minHeight: MIN_SCANNER_HEIGHT });
+  const isNavigating = useRef(false);
+  const addItem = useSetAtom(addScannedItemAtom);
+
+  const savedCameraId = useScannerCameraId();
+
+  // Get action directly from the atom
+  const [action] = useAtom(scannerActionAtom);
+
+  const { canUseBarcodes } = useBarcodePermissions();
+
+  const { triggerSuccess, triggerError } = useHapticFeedback();
+
+  // Store the current action in a ref that's always up-to-date
+  // This is required in order to handle the action correctly, even tho we use global state
+  const actionRef = useRef(action);
+
+  // Update the ref whenever the action changes
+  useEffect(() => {
+    actionRef.current = action;
+
+    // Reset the navigating state when action changes
+    if (action !== "View asset") {
+      isNavigating.current = false;
+    }
+  }, [action]);
+
+  // Custom setPaused function that only pauses for "View asset"
+  const handleSetPaused = useCallback(
+    (value: boolean) => {
+      // Always use the ref value for the most current action
+      if (actionRef.current === "View asset") {
+        setPaused(value);
+
+        // Clear error message when unpausing (for "Continue Scanning" button)
+        if (!value) {
+          setErrorMessage(undefined);
+          setErrorTitle(undefined);
+          setScanMessage("Processing QR code...");
+        }
+      }
+    },
+    [] // No dependencies needed since we use the ref
+  );
+
+  // Define the handler using useCallback to prevent recreating it on every render
+  const handleCodeDetectionSuccess = useCallback(
+    ({ value, error, type }: OnCodeDetectionSuccessProps) => {
+      // IMPORTANT: Always use the current value from the ref
+      const currentAction = actionRef.current;
+
+      if (currentAction === "View asset") {
+        if (isNavigating.current) {
+          return;
+        }
+
+        // Handle error case (unsupported barcode type)
+        if (error) {
+          triggerError();
+          handleSetPaused(true);
+          setErrorTitle(DEFAULT_ERROR_TITLE);
+          setErrorMessage(error);
+          setScanMessage(""); // Clear scan message for error state
+          return;
+        }
+
+        isNavigating.current = true;
+        handleSetPaused(true);
+        setErrorMessage(undefined); // Clear any previous errors
+        setErrorTitle(undefined);
+        setScanMessage("Redirecting to mapped asset...");
+
+        // Navigate to appropriate route based on code type
+        if (type === "barcode") {
+          if (!canUseBarcodes) {
+            triggerError();
+            setErrorTitle("Barcode scanning disabled");
+            setErrorMessage(
+              "Your workspace does not support scanning barcodes. Contact your workspace owner to activate this feature or try scanning a Shelf QR code."
+            );
+            setScanMessage("");
+            isNavigating.current = false;
+            return;
+          }
+
+          triggerSuccess();
+          void navigate(`/barcode/${encodeURIComponent(value)}`);
+          return;
+        }
+
+        if (type === "samId") {
+          setScanMessage("Looking up asset...");
+
+          const options: ResolveAssetIdFromSamIdOptions = {
+            samId: value,
+            fetcher: fetch,
+          };
+
+          void resolveAssetIdFromSamId(options)
+            .then((assetId) => {
+              triggerSuccess();
+              setScanMessage("Redirecting to mapped asset...");
+              void navigate(`/assets/${assetId}`);
+            })
+            .catch((samError) => {
+              const reason = makeShelfError(
+                samError,
+                { samId: value, source: "scanner-samId" },
+                false
+              );
+
+              triggerError();
+              setErrorTitle(reason.title || "SAM ID lookup failed");
+              setErrorMessage(reason.message);
+              setScanMessage("");
+              isNavigating.current = false;
+            });
+
+          return;
+        }
+
+        triggerSuccess();
+        void navigate(`/qr/${value}`);
+      } else if (
+        ["Assign custody", "Release custody", "Update location"].includes(
+          currentAction
+        )
+      ) {
+        if (error) {
+          triggerError();
+        } else {
+          triggerSuccess();
+        }
+        addItem(value, error, type);
+      }
+    },
+    [
+      addItem,
+      navigate,
+      handleSetPaused,
+      canUseBarcodes,
+      triggerSuccess,
+      triggerError,
+    ]
+  );
+
+  return (
+    <>
+      <Header title="QR code scanner" hidePageDescription hideBreadcrumbs />
+      <div
+        ref={scannerContainerRef}
+        className="-mx-4 flex flex-col overflow-hidden"
+        style={height === undefined ? undefined : { height: `${height}px` }}
+      >
+        <CodeScanner
+          onCodeDetectionSuccess={handleCodeDetectionSuccess}
+          paused={paused}
+          setPaused={handleSetPaused}
+          scanMessage={scanMessage}
+          errorMessage={errorMessage}
+          errorTitle={errorTitle}
+          actionSwitcher={<ActionSwitcher />}
+          savedCameraId={savedCameraId}
+        />
+      </div>
+    </>
+  );
+};
+
+export default QRScanner;
+
+export const ErrorBoundary = () => <ErrorContent />;

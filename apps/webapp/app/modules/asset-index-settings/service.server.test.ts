@@ -1,0 +1,646 @@
+import {
+  AssetIndexMode,
+  AssetType,
+  type CustomField,
+  type OrganizationRoles,
+  type Prisma,
+} from "@prisma/client";
+import type { ITXClientDenyList } from "@prisma/client/runtime/library";
+import type { ExtendedPrismaClient } from "~/database/db.server";
+import { db } from "~/database/db.server";
+import { ShelfError, type ErrorLabel } from "~/utils/error";
+import { ROLE_POLICIES, resolveRole } from "~/utils/permissions/role-access";
+import type { Column, ColumnLabelKey } from "./helpers";
+import { syncCustomFieldColumn } from "./helpers";
+import {
+  barcodeFields,
+  defaultColumnsForWorkspace,
+  defaultFields,
+  fixedFields,
+  generateBarcodeColumns,
+  insertMissingDefaultColumns,
+  isQuantityColumn,
+} from "./helpers";
+import { getOrganizationById } from "../organization/service.server";
+
+/**
+ * The asset index mode a member gets before saving a preference of their own:
+ * their role's `ui.defaultAssetIndexMode`. No role (a membership still loading)
+ * resolves to BASE, the least privileged role.
+ *
+ * @param role - The membership's effective role
+ * @returns The role's default mode
+ */
+export function getDefaultModeForRole(
+  role?: OrganizationRoles | null
+): AssetIndexMode {
+  return ROLE_POLICIES[resolveRole(role ? [role] : [])].ui
+    .defaultAssetIndexMode;
+}
+
+const label: ErrorLabel = "Asset Index Settings";
+
+/**
+ * Whether the workspace has at least one quantity-tracked asset. Decides
+ * whether the quantity columns start visible in a column set.
+ *
+ * @param organizationId - The workspace to check
+ * @param client - The Prisma client or transaction to read through
+ * @returns `true` when any asset in the workspace is quantity-tracked
+ */
+async function workspaceHasQuantityAssets(
+  organizationId: string,
+  client: Pick<typeof db, "asset"> = db
+): Promise<boolean> {
+  const asset = await client.asset.findFirst({
+    // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: an archived quantity asset still makes this a counting workspace, and archived rows show in the list's Archived view
+    where: { organizationId, type: AssetType.QUANTITY_TRACKED },
+    select: { id: true },
+  });
+  return Boolean(asset);
+}
+
+export async function createUserAssetIndexSettings({
+  userId,
+  organizationId,
+  canUseBarcodes = false,
+  role,
+  tx,
+}: {
+  userId: string;
+  organizationId: string;
+  canUseBarcodes?: boolean;
+  /** User's role to determine default mode */
+  role?: OrganizationRoles;
+  /** Optionally receive a transaction when the settingsd need to be created together with other entries */
+  tx?: Omit<ExtendedPrismaClient, ITXClientDenyList>;
+}) {
+  const _db = tx || db;
+
+  try {
+    const [org, hasQuantityAssets] = await Promise.all([
+      getOrganizationById(organizationId, {
+        customFields: {
+          where: { active: true, deletedAt: null },
+        },
+      }),
+      workspaceHasQuantityAssets(organizationId, _db),
+    ]);
+
+    /** We start at the default fields length */
+    let position = defaultFields.length - 1;
+
+    // Add barcode columns if enabled
+    const barcodeColumns = canUseBarcodes ? generateBarcodeColumns() : [];
+    position += barcodeColumns.length;
+
+    const customFieldsColumns = org.customFields.map((cf) => {
+      /** We increment the position for each custom field */
+      position += 1;
+      return {
+        name: `cf_${cf.name}`,
+        visible: true,
+        position,
+        cfType: cf.type,
+      };
+    });
+
+    const columns = [
+      ...defaultColumnsForWorkspace({ hasQuantityAssets }),
+      ...barcodeColumns,
+      ...customFieldsColumns,
+    ];
+
+    // Align initial mode based on the user's role
+    const defaultMode = getDefaultModeForRole(role);
+
+    const settings = await _db.assetIndexSettings.create({
+      data: {
+        userId,
+        organizationId,
+        mode: defaultMode,
+        columns,
+      },
+    });
+
+    return settings;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      title: "Failed to create asset index settings.",
+      message:
+        "We couldn't create the asset index settings for the current user and organization. Please refresh to try again. If the issue persists, please contact support",
+      additionalData: { userId, organizationId },
+      label,
+    });
+  }
+}
+
+export async function getAssetIndexSettings({
+  userId,
+  organizationId,
+  canUseBarcodes = false,
+  role,
+}: {
+  userId: string;
+  organizationId: string;
+  canUseBarcodes?: boolean;
+  role?: OrganizationRoles;
+}) {
+  try {
+    const assetIndexSettings = await db.assetIndexSettings.findFirst({
+      where: { userId, organizationId },
+    });
+
+    /** Create new settings if none exist */
+    if (!assetIndexSettings) {
+      return await createUserAssetIndexSettings({
+        userId,
+        organizationId,
+        canUseBarcodes,
+        role,
+      });
+    }
+
+    /** Validate and potentially update columns structure */
+    const validatedSettings = await validateColumns({
+      userId,
+      organizationId,
+      columns: assetIndexSettings.columns as Column[],
+      canUseBarcodes,
+    });
+    return validatedSettings || assetIndexSettings;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      title: "Asset Index Settings not found.",
+      message:
+        "We couldn't find the asset index settings for the current user and organization. Please refresh to try again. If the issue persists, please contact support",
+      additionalData: { userId, organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * The mode a member's asset index will open in, for pages that link into it
+ * with a filter (see `buildAssetIndexFilterHref`). Read-only: unlike
+ * `getAssetIndexSettings` it never creates or repairs a settings row.
+ *
+ * @param args.userId - The viewer
+ * @param args.organizationId - The viewer's current workspace
+ * @param args.ui - The viewer's role policy UI flags, from `requirePermission().access.policy.ui`
+ * @returns The saved mode, or the role default when nothing is saved. ADVANCED
+ *   resolves to SIMPLE for a role without the advanced index, because the index
+ *   switches such a member back to simple mode.
+ */
+export async function getAssetIndexModeForUser({
+  userId,
+  organizationId,
+  ui,
+}: {
+  userId: string;
+  organizationId: string;
+  ui: { advancedAssetIndex: boolean; defaultAssetIndexMode: AssetIndexMode };
+}): Promise<AssetIndexMode> {
+  try {
+    const settings = await db.assetIndexSettings.findFirst({
+      where: { userId, organizationId },
+      select: { mode: true },
+    });
+    const mode = settings?.mode ?? ui.defaultAssetIndexMode;
+    return mode === AssetIndexMode.ADVANCED && !ui.advancedAssetIndex
+      ? AssetIndexMode.SIMPLE
+      : mode;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while reading your asset index mode.",
+      additionalData: { userId, organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * Ensure a user's asset index settings align with the defaults for their role.
+ * Creates settings when missing and promotes to ADVANCED when the role allows.
+ */
+export async function ensureAssetIndexModeForRole({
+  userId,
+  organizationId,
+  role,
+  tx,
+}: {
+  userId: string;
+  organizationId: string;
+  role?: OrganizationRoles | null;
+  tx?: Omit<ExtendedPrismaClient, ITXClientDenyList>;
+}) {
+  const client = tx || db;
+  const desiredMode = getDefaultModeForRole(role);
+
+  let settings = await client.assetIndexSettings.findUnique({
+    where: { userId_organizationId: { userId, organizationId } },
+  });
+
+  if (!settings) {
+    return createUserAssetIndexSettings({
+      userId,
+      organizationId,
+      role: role ?? undefined,
+      tx: client,
+    });
+  }
+
+  if (
+    desiredMode === AssetIndexMode.ADVANCED &&
+    settings.mode !== AssetIndexMode.ADVANCED
+  ) {
+    settings = await client.assetIndexSettings.update({
+      where: { userId_organizationId: { userId, organizationId } },
+      data: { mode: AssetIndexMode.ADVANCED },
+    });
+  }
+
+  return settings;
+}
+
+export async function changeMode({
+  userId,
+  organizationId,
+  mode,
+}: {
+  userId: string;
+  organizationId: string;
+  mode: AssetIndexMode;
+}) {
+  try {
+    const updatedAssetIndexSettings = await db.assetIndexSettings.update({
+      where: { userId_organizationId: { userId, organizationId } },
+      data: { mode },
+    });
+
+    return updatedAssetIndexSettings;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      title: "Failed to update asset index settings.",
+      message:
+        "We couldn't update the asset index settings for the current user and organization. Please refresh to try again. If the issue persists, please contact support",
+      additionalData: { userId, organizationId, mode },
+      label,
+    });
+  }
+}
+
+/** Must receive the complete object of all columns for the entry to update it */
+export async function updateColumns({
+  userId,
+  organizationId,
+  columns,
+}: {
+  userId: string;
+  organizationId: string;
+  columns: Column[];
+}) {
+  try {
+    const updatedAssetIndexSettings = await db.assetIndexSettings.update({
+      where: { userId_organizationId: { userId, organizationId } },
+      data: { columns },
+    });
+
+    return updatedAssetIndexSettings;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      title: "Failed to update asset index settings.",
+      message:
+        "We couldn't update the asset index settings for the current user and organization. Please refresh to try again. If the issue persists, please contact support",
+      additionalData: { userId, organizationId, columns },
+      label,
+    });
+  }
+}
+
+/** Updating a CustomField requires us to update the settings. Use this to handle the logic */
+export async function updateAssetIndexSettingsAfterCfUpdate({
+  oldField,
+  newField,
+}: {
+  /** The original field */
+  oldField: CustomField;
+
+  /** The updated field */
+  newField: CustomField;
+}) {
+  try {
+    const settings = await db.assetIndexSettings.findMany({
+      where: { organizationId: newField.organizationId },
+    });
+
+    const updates = settings.map((entry) => {
+      const columns = syncCustomFieldColumn(
+        Array.from(entry.columns as Prisma.JsonArray) as Column[],
+        {
+          oldName: oldField.name,
+          newName: newField.name,
+          active: newField.active,
+          cfType: newField.type,
+        }
+      );
+
+      return db.assetIndexSettings.update({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: entry.id comes from the org-scoped findMany on lines 272-274 (where organizationId)
+        where: { id: entry.id },
+        data: { columns },
+      });
+    });
+
+    await Promise.all(updates.filter(Boolean));
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      title: "Failed to update asset index settings.",
+      message:
+        "We couldn't update the asset index settings for the current user and organization. Please refresh to try again. If the issue persists, please contact support",
+      additionalData: { newField, oldField },
+      label,
+    });
+  }
+}
+
+/**
+ * Removes a custom field column from every asset index configuration that belongs to an organization.
+ * Uses a single SQL statement to efficiently filter the JSON columns payload for all matching rows.
+ */
+export async function removeCustomFieldFromAssetIndexSettings({
+  customFieldName,
+  organizationId,
+  prisma,
+}: {
+  customFieldName: string;
+  organizationId: string;
+  prisma?: Pick<Prisma.TransactionClient, "$executeRaw">;
+}) {
+  const client = prisma ?? db;
+
+  try {
+    const columnName = `cf_${customFieldName}`;
+
+    await client.$executeRaw`
+      UPDATE "AssetIndexSettings" AS ais
+      SET "columns" = (
+        SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)
+        FROM jsonb_array_elements(ais."columns") elem
+        WHERE elem->>'name' <> ${columnName}
+      )
+      WHERE ais."organizationId" = ${organizationId}
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(ais."columns") elem
+          WHERE elem->>'name' = ${columnName}
+        );
+    `;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      title: "Failed to update asset index settings.",
+      message:
+        "We couldn't update the asset index settings for all users in your organization. This operation affects everyone's column configurations. Please try again. If the issue persists, please contact support.",
+      additionalData: { customFieldName, organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * Updates the AssetIndexSettings for all users in an organization when new custom fields are created
+ * @param newCustomFields - The newly created or updated custom fields
+ * @param organizationId - The organization ID
+ */
+export async function updateAssetIndexSettingsWithNewCustomFields({
+  newCustomFields,
+  organizationId,
+}: {
+  newCustomFields: CustomField[];
+  organizationId: string;
+}) {
+  try {
+    // Get all asset index settings for the organization
+    const settings = await db.assetIndexSettings.findMany({
+      where: { organizationId },
+    });
+
+    // For each user's settings, update their columns
+    const updates = settings.map((setting) => {
+      const columns = setting.columns as Column[];
+
+      // Get the highest current position
+      const maxPosition = Math.max(...columns.map((col) => col.position));
+
+      // Create new column entries for each new custom field
+      const newColumns: Column[] = newCustomFields.map((field, index) => ({
+        name: `cf_${field.name}`,
+        visible: true,
+        position: maxPosition + 1 + index,
+        cfType: field.type,
+      }));
+
+      // Filter out any existing columns for these custom fields
+      const existingColumns = columns.filter(
+        (col) =>
+          !newCustomFields.some((field) => `cf_${field.name}` === col.name)
+      );
+
+      return db.assetIndexSettings.update({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: setting.id comes from the org-scoped findMany on lines 384-386 (where organizationId)
+        where: { id: setting.id },
+        data: {
+          columns: [...existingColumns, ...newColumns],
+        },
+      });
+    });
+
+    await Promise.all(updates);
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to update asset index settings with new custom fields",
+      additionalData: { organizationId },
+      label: "Asset Index Settings",
+    });
+  }
+}
+
+/**
+ * Validates both default fields and custom field columns structure
+ * Only queries the database if validation issues are found
+ * @returns Updated settings if changes were needed, null otherwise
+ */
+async function validateColumns({
+  userId,
+  organizationId,
+  columns,
+  canUseBarcodes = false,
+}: {
+  userId: string;
+  organizationId: string;
+  columns: Column[];
+  canUseBarcodes?: boolean;
+}) {
+  try {
+    let needsUpdate = false;
+    let updatedColumns = [...columns];
+
+    // 1. First validate default fields existence without DB query
+    const defaultFieldsNames = fixedFields.map((field) => field);
+    const existingDefaultFields = updatedColumns
+      .filter((col) => !col.name.startsWith("cf_"))
+      .map((col) => col.name);
+
+    // Detect missing default fields
+    const missingDefaultFields: ColumnLabelKey[] = defaultFieldsNames.filter(
+      (name) => !existingDefaultFields.includes(name)
+    );
+
+    // If default fields are missing, add them without moving any saved
+    // column out of the user's order
+    if (missingDefaultFields.length > 0) {
+      // Asked only when a quantity column is missing, which happens once per
+      // saved column set, not on every page load.
+      const hasQuantityAssets = missingDefaultFields.some(isQuantityColumn)
+        ? await workspaceHasQuantityAssets(organizationId)
+        : false;
+      updatedColumns = insertMissingDefaultColumns(
+        updatedColumns,
+        missingDefaultFields,
+        { hasQuantityAssets }
+      );
+      needsUpdate = true;
+    }
+
+    // 2. Handle barcode columns based on permissions
+    const existingBarcodeColumns = updatedColumns.filter((col) =>
+      barcodeFields.includes(col.name as any)
+    );
+
+    if (canUseBarcodes) {
+      // Add missing barcode columns if barcodes are enabled
+      const missingBarcodeFields = barcodeFields.filter(
+        (field) => !existingBarcodeColumns.some((col) => col.name === field)
+      );
+
+      if (missingBarcodeFields.length > 0) {
+        // Insert barcode columns right after default fields
+        const barcodeStartPosition = defaultFields.length;
+
+        // Create new barcode columns at their intended positions
+        const newBarcodeColumns = missingBarcodeFields.map((field, index) => ({
+          name: field,
+          visible: true,
+          position: barcodeStartPosition + index,
+        }));
+
+        // Shift existing columns that come after barcode positions
+        const adjustedColumns = updatedColumns.map((col) => {
+          if (
+            col.position >= barcodeStartPosition &&
+            !col.name.startsWith("barcode_")
+          ) {
+            return {
+              ...col,
+              position: col.position + missingBarcodeFields.length,
+            };
+          }
+          return col;
+        });
+
+        updatedColumns = [...adjustedColumns, ...newBarcodeColumns];
+        needsUpdate = true;
+      }
+    } else {
+      // Remove barcode columns if barcodes are disabled
+      if (existingBarcodeColumns.length > 0) {
+        updatedColumns = updatedColumns.filter(
+          (col) => !barcodeFields.includes(col.name as any)
+        );
+        needsUpdate = true;
+      }
+    }
+
+    // 3. Validate custom field columns structure
+    const customFieldColumns = updatedColumns.filter((col) =>
+      col.name.startsWith("cf_")
+    );
+
+    const hasInvalidCustomFields = customFieldColumns.some(
+      (col) =>
+        !col.cfType ||
+        typeof col.visible !== "boolean" ||
+        typeof col.position !== "number"
+    );
+
+    // Only query DB if we found invalid custom fields
+    if (hasInvalidCustomFields) {
+      // Fetch custom fields data only when needed
+      const customFields = await db.customField.findMany({
+        where: {
+          organizationId,
+          active: true,
+          deletedAt: null,
+        },
+        select: {
+          name: true,
+          type: true,
+        },
+      });
+
+      const customFieldsMap = new Map(
+        customFields.map((cf) => [cf.name, cf.type])
+      );
+
+      // Filter out non-custom field columns
+      const regularColumns = updatedColumns.filter(
+        (col) => !col.name.startsWith("cf_")
+      );
+
+      // Rebuild custom field columns with correct structure
+      const validatedCustomFieldColumns = customFieldColumns
+        .filter((col) => {
+          const cfName = col.name.slice(3);
+          return customFieldsMap.has(cfName);
+        })
+        .map((col) => {
+          const cfName = col.name.slice(3);
+          return {
+            ...col,
+            cfType: customFieldsMap.get(cfName),
+            visible: Boolean(col.visible),
+            position: Number(col.position),
+          };
+        });
+
+      updatedColumns = [...regularColumns, ...validatedCustomFieldColumns];
+      needsUpdate = true;
+    }
+
+    // Only update if changes were needed
+    if (needsUpdate) {
+      return await updateColumns({
+        userId,
+        organizationId,
+        columns: updatedColumns,
+      });
+    }
+
+    return null;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to validate columns structure",
+      additionalData: { userId, organizationId },
+      label,
+    });
+  }
+}

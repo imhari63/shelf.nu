@@ -1,0 +1,594 @@
+import { db } from "~/database/db.server";
+import {
+  bookingUpdatesTemplateString,
+  formatBookingEmailActorDetail,
+} from "~/emails/bookings-updates-template";
+import { sendEmail } from "~/emails/mail.server";
+import type {
+  BookingEmailActor,
+  BookingEmailActorLabel,
+  BookingForEmail,
+} from "~/emails/types";
+import { bookingEmailSubject } from "~/modules/push/messages";
+import type { ClientHint } from "~/utils/client-hints";
+import { getTimeRemainingMessage } from "~/utils/date-fns";
+import type { ResolvedFormatPrefs } from "~/utils/date-format";
+import { formatDate, resolveFormatPrefs } from "~/utils/date-format";
+import { SERVER_URL } from "~/utils/env";
+import { ShelfError } from "~/utils/error";
+import { Logger } from "~/utils/logger";
+import { resolveUserDisplayName } from "~/utils/user";
+import { BOOKING_INCLUDE_FOR_EMAIL } from "./constants";
+import { getBookingNotificationRecipients } from "./notification-recipients.server";
+import {
+  sendBookingPushToCustodian,
+  sendBookingPushToReplacedCustodian,
+} from "./push.server";
+import { USER_NAME_SELECT } from "../user/fields";
+
+type BasicEmailContentArgs = {
+  bookingName: string;
+  assetsCount: number;
+  custodian: string;
+  from: Date;
+  to: Date;
+  bookingId: string;
+  /** Resolved formatting prefs: the recipient's for the fan-out, the acting user's elsewhere. */
+  prefs: ResolvedFormatPrefs;
+  customEmailFooter?: string | null;
+  /** Who performed the action and when. Leave out for scheduled emails. */
+  actor?: BookingEmailActor;
+};
+
+/**
+ * The plain-text body shared by every booking email: the event sentence, the
+ * actor line (when there is an actor) on the line right after it, any
+ * event-specific details, then the booking summary and link.
+ *
+ * @param emailContent - The event sentence, e.g. `Your booking has been cancelled: "X".`
+ * @param emailDetails - Blocks that follow the actor line, e.g. a cancellation reason
+ */
+export const baseBookingTextEmailContent = ({
+  bookingName,
+  custodian,
+  from,
+  to,
+  bookingId,
+  assetsCount,
+  emailContent,
+  emailDetails,
+  prefs,
+  customEmailFooter,
+  actor,
+}: BasicEmailContentArgs & { emailContent: string; emailDetails?: string }) => {
+  const fromDate = formatDate(from, prefs, { includeTime: true });
+  const toDate = formatDate(to, prefs, { includeTime: true });
+  const actorLine = actor
+    ? `\n${actor.label}: ${formatBookingEmailActorDetail(actor, prefs)}`
+    : "";
+  const details = emailDetails ? `\n\n${emailDetails}` : "";
+  return `Howdy,
+
+${emailContent}${actorLine}${details}
+
+${bookingName} | ${assetsCount} assets
+
+Custodian: ${custodian}
+From: ${fromDate}
+To: ${toDate}
+
+To view the booking, follow the link below:
+${SERVER_URL}/bookings/${bookingId}
+${customEmailFooter ? `\n---\n${customEmailFooter}` : ""}
+Thanks,
+The Shelf Team
+`;
+};
+
+/**
+ * Looks up the person behind a booking action, for the actor line of the
+ * emails it sends. The name is their display name; a user with no name at all
+ * is shown by email address.
+ *
+ * `at` is read from the clock here, so call this once per action before the
+ * fan-out and every recipient sees the same moment.
+ *
+ * Best effort: returns `undefined` (the email goes out without the line) when
+ * there is no acting user or the lookup fails. A missing detail in a
+ * notification must never fail the action that sent it.
+ *
+ * @param args.userId - The acting user; `undefined` for system-run actions
+ * @param args.label - What they did, e.g. "Cancelled by"
+ */
+export async function resolveBookingEmailActor({
+  userId,
+  label,
+}: {
+  userId: string | null | undefined;
+  label: BookingEmailActorLabel;
+}): Promise<BookingEmailActor | undefined> {
+  if (!userId) return undefined;
+
+  try {
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { email: true, ...USER_NAME_SELECT },
+    });
+    if (!user) return undefined;
+
+    const name = resolveUserDisplayName(user) || user.email;
+    return { label, name, at: new Date() };
+  } catch (cause) {
+    Logger.error(
+      new ShelfError({
+        cause,
+        message: "Failed to look up the acting user for a booking email",
+        additionalData: { userId, label },
+        label: "Booking",
+      })
+    );
+    return undefined;
+  }
+}
+
+/**
+ * This is the content of the email sent to the custodian when a booking
+ * is reserved.
+ *
+ * When the booking has outstanding `BookingModelRequest` rows, the
+ * plain-text email appends a "Requested models" block that mirrors the
+ * HTML template. The block is left out when there are none.
+ *
+ * @param args.modelRequests - Optional list of `{ quantity, modelName }`
+ *   rows. Must be pre-filtered so only entries with `quantity > 0`
+ *   reach this helper.
+ */
+export const assetReservedEmailContent = ({
+  modelRequests,
+  ...args
+}: BasicEmailContentArgs & {
+  modelRequests?: { quantity: number; modelName: string }[];
+}) => {
+  const modelRequestsBlock =
+    modelRequests && modelRequests.length > 0
+      ? `Requested models:\n${modelRequests
+          .map((req) => `- ${req.quantity} × ${req.modelName}`)
+          .join("\n")}`
+      : undefined;
+
+  return baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Booking reservation for ${args.custodian}.`,
+    emailDetails: modelRequestsBlock,
+  });
+};
+
+/**
+ * This is the content of the email sent to the custodian when a booking is checked out.
+ */
+export const checkoutReminderEmailContent = (args: BasicEmailContentArgs) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking is due for checkout in ${getTimeRemainingMessage(
+      new Date(args.from),
+      new Date()
+    )}.`,
+  });
+
+/**
+ * This is the content of the email sent to the custodian when a booking is checked in.
+ */
+
+export const checkinReminderEmailContent = (args: BasicEmailContentArgs) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking is due for checkin in ${getTimeRemainingMessage(
+      new Date(args.to),
+      new Date()
+    )}.`,
+  });
+
+/**
+ * Sends the check-in reminder: a personalized email, with its reason
+ * footer, to every recipient `getBookingNotificationRecipients()` resolves,
+ * and one push to the custodian.
+ *
+ * Called from the `checkinReminder` scheduled job handler in
+ * `worker.server.ts`, which handles the booking status guard, and at once by
+ * a checkout or extension that leaves under an hour to checkin.
+ *
+ * @param booking - The booking with all email-required relations included
+ * @param assetCount - Number of assets in the booking (for display)
+ * @param hints - Client hints for date/time formatting
+ * @param organizationId - Used to resolve org-level notification settings
+ * @param options.push - `false` when the caller has already pushed about this
+ *   booking, so the custodian gets one push per booking event
+ * @param options.actorUserId - The user whose checkout triggered the reminder,
+ *   never pushed about it; absent for the scheduled job, which has no actor
+ */
+export async function sendCheckinReminder(
+  booking: BookingForEmail,
+  assetCount: number,
+  hints: ClientHint,
+  organizationId: string,
+  { push = true, actorUserId }: { push?: boolean; actorUserId?: string } = {}
+) {
+  const recipients = await getBookingNotificationRecipients({
+    booking,
+    eventType: "CHECKIN_REMINDER",
+    organizationId,
+    isScheduledJob: true, // Don't exclude editor for scheduled reminders
+  });
+
+  if (recipients.length === 0) return;
+
+  const custodian =
+    resolveUserDisplayName(booking.custodianUser) ||
+    (booking.custodianTeamMember?.name as string);
+
+  const subject = bookingEmailSubject("CHECKIN_REMINDER", booking.name);
+
+  for (const recipient of recipients) {
+    // Recipient prefs resolved from the ALREADY-LOADED row (raw pref fields on
+    // NotificationRecipient); hints is the null-field fallback only. Pure —
+    // no per-recipient DB fetch (avoids an N+1 in the fan-out).
+    const recipientPrefs = resolveFormatPrefs(recipient, hints);
+
+    const text = checkinReminderEmailContent({
+      prefs: recipientPrefs,
+      bookingName: booking.name,
+      assetsCount: assetCount,
+      custodian,
+      from: booking.from!,
+      to: booking.to!,
+      bookingId: booking.id,
+      customEmailFooter: booking.organization.customEmailFooter,
+    });
+
+    const html = await bookingUpdatesTemplateString({
+      booking,
+      heading: `Your booking is due for checkin in ${getTimeRemainingMessage(
+        new Date(booking.to!),
+        new Date()
+      )}.`,
+      assetCount,
+      prefs: recipientPrefs,
+      recipientReason: recipient.reason,
+      recipientEmail: recipient.email,
+    });
+
+    sendEmail({
+      to: recipient.email,
+      subject,
+      text,
+      html,
+    });
+  }
+
+  if (push) {
+    sendBookingPushToCustodian({
+      eventType: "CHECKIN_REMINDER",
+      booking,
+      recipients,
+      hints,
+      actorUserId,
+    });
+  }
+}
+
+/**
+ * Booking is overdue
+ *
+ * This email gets sent when a booking is overdue
+ */
+export const overdueBookingEmailContent = (args: BasicEmailContentArgs) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `You have passed the deadline for checking in your booking "${args.bookingName}".`,
+  });
+
+/**
+ * Booking is completed
+ *
+ * This email gets sent when a booking is checked-in
+ */
+export const completedBookingEmailContent = (args: BasicEmailContentArgs) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking has been completed: "${args.bookingName}".`,
+  });
+
+/**
+ * Booking is deleted
+ *
+ * This email gets sent when a booking is deleted
+ */
+export const deletedBookingEmailContent = (args: BasicEmailContentArgs) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking has been deleted: "${args.bookingName}".`,
+  });
+
+/**
+ * Booking is cancelled
+ *
+ * This email gets sent when a booking is cancelled
+ */
+export const cancelledBookingEmailContent = (
+  args: BasicEmailContentArgs & { cancellationReason?: string }
+) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking has been cancelled: "${args.bookingName}".`,
+    emailDetails: args.cancellationReason
+      ? `Reason: ${args.cancellationReason}`
+      : undefined,
+  });
+
+/**
+ * This is the content of the email sent to the custodian when a reserved
+ * booking is reverted back to draft (e.g. an admin sends a reservation
+ * request back for changes). The booking still exists — the recipient can
+ * open it, adjust it and reserve it again.
+ */
+export const revertedToDraftEmailContent = (args: BasicEmailContentArgs) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking reservation has been reverted to draft: "${args.bookingName}". You can review the booking, make changes and submit it again.`,
+  });
+
+/**
+ * Booking end date changed
+ *
+ * This email is sent when an ongoing or overdue booking's end date moves
+ * later or earlier.
+ *
+ * @param args.oldToDate - The end the booking had before the change
+ * @param args.verb - How the change reads: "extended" for a later end,
+ *   "shortened" for an earlier one
+ */
+export function extendBookingEmailContent({
+  oldToDate,
+  verb,
+  ...args
+}: BasicEmailContentArgs & {
+  oldToDate: Date;
+  verb: "extended" | "shortened";
+}) {
+  const format = (date: Date) =>
+    formatDate(date, args.prefs, { includeTime: true });
+
+  return baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking has been ${verb} from ${format(
+      oldToDate
+    )} to ${format(args.to)}`,
+  });
+}
+
+/**
+ * Booking is updated
+ *
+ * This email is sent when a booking's fields or assets are modified.
+ */
+export const bookingUpdatedEmailContent = (
+  args: BasicEmailContentArgs & { changes: string[] }
+) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking "${args.bookingName}" has been updated.`,
+    emailDetails: `Changes:\n${args.changes.map((c) => `- ${c}`).join("\n")}`,
+  });
+
+/**
+ * Sends a "Booking Updated" email to all resolved notification recipients.
+ *
+ * Resolves recipients via `getBookingNotificationRecipients()` with the
+ * `UPDATE` event type, which excludes the editing user from the list.
+ * Each recipient gets a personalized email with their reason footer.
+ *
+ * **Special case — custodian change:** When `oldCustodianEmail` is provided,
+ * the old custodian may no longer appear in the resolved recipient list
+ * (since they're no longer the booking's custodian). This function
+ * explicitly checks and sends them a notification if they weren't already
+ * included and aren't the editor.
+ *
+ * Every copy, the old custodian's included, carries an "Updated by" line
+ * naming `userId`.
+ *
+ * The custodian gets the update push, worded as a handover when this update
+ * made them the custodian, and the custodian it replaced gets a removal push;
+ * neither is pushed when they made the change.
+ *
+ * Skips sending entirely if `changes` is empty (no meaningful update).
+ */
+export async function sendBookingUpdatedEmail({
+  bookingId,
+  organizationId,
+  userId,
+  changes,
+  hints,
+  oldCustodianEmail,
+}: {
+  bookingId: string;
+  organizationId: string;
+  userId: string;
+  changes: string[];
+  hints: ClientHint;
+  oldCustodianEmail?: string;
+}) {
+  try {
+    if (changes.length === 0) return;
+
+    const booking = await db.booking.findUnique({
+      where: { id: bookingId, organizationId },
+      include: BOOKING_INCLUDE_FOR_EMAIL,
+    });
+
+    if (!booking) return;
+
+    // Don't send update emails for draft bookings — the booking hasn't
+    // been reserved yet, so emailing about changes is noise.
+    // Exception: custodian changes still send emails even in draft,
+    // because the new custodian needs to know they've been assigned
+    // and the old custodian needs to know they've been removed.
+    if (booking.status === "DRAFT" && !oldCustodianEmail) return;
+
+    const custodian =
+      (resolveUserDisplayName(booking.custodianUser) ||
+        booking.custodianTeamMember?.name) ??
+      "";
+
+    const subject = bookingEmailSubject("UPDATE", booking.name);
+
+    // Shared args for every recipient's plain-text body. `prefs` is supplied
+    // per recipient inside the loop, so it is omitted here.
+    const emailArgs: Omit<BasicEmailContentArgs, "prefs"> = {
+      bookingName: booking.name,
+      assetsCount: booking._count.bookingAssets,
+      custodian,
+      from: booking.from!,
+      to: booking.to!,
+      bookingId: booking.id,
+      customEmailFooter: booking.organization.customEmailFooter,
+    };
+
+    // Resolve all recipients with editor exclusion.
+    // The old custodian (if changed) is handled separately below.
+    const recipients = await getBookingNotificationRecipients({
+      booking,
+      eventType: "UPDATE",
+      organizationId,
+      editorUserId: userId,
+    });
+
+    const actor =
+      recipients.length > 0 || oldCustodianEmail
+        ? await resolveBookingEmailActor({ userId, label: "Updated by" })
+        : undefined;
+
+    // Send to all resolved recipients — the from/to dates and change list are
+    // formatted with each recipient's own resolved prefs. The `changes[]`
+    // strings themselves were built once by the editor upstream (acting-user
+    // compromise), so only the base template dates vary per recipient.
+    for (const recipient of recipients) {
+      // Pure resolve from the loaded recipient row; hints as null-field
+      // fallback only. No per-recipient DB fetch (avoids an N+1).
+      const recipientPrefs = resolveFormatPrefs(recipient, hints);
+
+      const text = bookingUpdatedEmailContent({
+        ...emailArgs,
+        prefs: recipientPrefs,
+        changes,
+        actor,
+      });
+
+      const html = await bookingUpdatesTemplateString({
+        booking,
+        heading: `Your booking "${booking.name}" has been updated`,
+        actor,
+        assetCount: booking._count.bookingAssets,
+        prefs: recipientPrefs,
+        changes,
+        recipientReason: recipient.reason,
+        recipientEmail: recipient.email,
+      });
+
+      sendEmail({
+        to: recipient.email,
+        subject,
+        text,
+        html,
+      });
+    }
+
+    // The custodian this update replaced, when they have an account
+    let replacedCustodianUserId: string | undefined;
+
+    // Special case: if custodian changed, notify the OLD custodian too
+    // (they might not be in the recipient list anymore since they're no longer the custodian)
+    if (oldCustodianEmail) {
+      const alreadyEmailed = recipients.find(
+        (r) => r.email === oldCustodianEmail
+      );
+      if (alreadyEmailed) {
+        replacedCustodianUserId = alreadyEmailed.userId;
+      } else {
+        // Check the old custodian is not the editor. The four format-pref
+        // columns are selected alongside `id` so we can resolve their prefs
+        // from this single lookup (already required for the editor check) —
+        // no extra round-trip.
+        const oldCustodianUser = await db.user.findUnique({
+          where: { email: oldCustodianEmail },
+          select: {
+            id: true,
+            dateFormat: true,
+            timeFormat: true,
+            weekStart: true,
+            timeZone: true,
+          },
+        });
+
+        replacedCustodianUserId = oldCustodianUser?.id;
+
+        if (!oldCustodianUser || oldCustodianUser.id !== userId) {
+          // Resolve the old custodian's prefs from the row just fetched (or
+          // hints/defaults when they have no user account).
+          const oldCustodianPrefs = resolveFormatPrefs(oldCustodianUser, hints);
+
+          const text = bookingUpdatedEmailContent({
+            ...emailArgs,
+            prefs: oldCustodianPrefs,
+            changes,
+            actor,
+          });
+
+          const html = await bookingUpdatesTemplateString({
+            booking,
+            heading: `Your booking "${booking.name}" has been updated`,
+            actor,
+            assetCount: booking._count.bookingAssets,
+            prefs: oldCustodianPrefs,
+            changes,
+            recipientReason: "custodian",
+            recipientEmail: oldCustodianEmail,
+          });
+
+          sendEmail({
+            to: oldCustodianEmail,
+            subject,
+            text,
+            html,
+          });
+        }
+      }
+    }
+
+    sendBookingPushToCustodian({
+      eventType: "UPDATE",
+      booking,
+      recipients,
+      hints,
+      actorUserId: userId,
+      custodianChanged:
+        !!oldCustodianEmail &&
+        booking.custodianUser?.email !== oldCustodianEmail,
+    });
+    if (replacedCustodianUserId) {
+      sendBookingPushToReplacedCustodian({
+        booking,
+        replacedCustodianUserId,
+        actorUserId: userId,
+      });
+    }
+  } catch (cause) {
+    Logger.error(
+      new ShelfError({
+        cause,
+        message: "Failed to send booking updated email",
+        additionalData: { bookingId },
+        label: "Booking",
+      })
+    );
+  }
+}

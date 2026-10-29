@@ -1,0 +1,350 @@
+import type { RenderableTreeNode } from "@markdoc/markdoc";
+import type {
+  Asset,
+  AssetCustomFieldValue,
+  Location,
+  Category,
+  CustomField,
+  Kit,
+  Prisma,
+  Tag,
+  User,
+  CustomFieldType,
+  AssetReminder,
+  Organization,
+  Booking,
+  BarcodeType,
+  Barcode,
+  TeamMember,
+} from "@prisma/client";
+import type { Return } from "@prisma/client/runtime/library";
+import type { StockStatus } from "@shelf/quantity-control";
+import type { assetIndexFields } from "./fields";
+
+export interface ICustomFieldValueJson {
+  raw: string | number | boolean;
+  valueText?: string;
+  valueBoolean?: boolean;
+  valueDate?: string;
+  valueOption?: string;
+  valueMultiLineText?: RenderableTreeNode;
+}
+
+export type ShelfAssetCustomFieldValueType = Omit<
+  AssetCustomFieldValue,
+  "value"
+> & { value: ICustomFieldValueJson };
+
+export interface UpdateAssetPayload {
+  id: Asset["id"];
+  title?: Asset["title"];
+  description?: Asset["description"];
+  /** Pass 'uncategorized' to clear the category */
+  categoryId?: Asset["categoryId"];
+  /** Pass null to clear the asset model association */
+  assetModelId?: string | null;
+  // `Asset.locationId` no longer exists (location lives on the
+  // `AssetLocation` pivot). These carry the single primary-location id
+  // through the update flow.
+  newLocationId?: string | null;
+  currentLocationId?: string | null;
+  /**
+   * Per-asset single-location qty for QUANTITY_TRACKED placements via
+   * the asset-overview update-location dialog. When provided alongside
+   * `newLocationId`, the new pivot row uses this value (subject to the
+   * orthogonal-MAX re-validation in `updateAsset`). Falls back to
+   * `Asset.quantity` (full pool) when omitted — preserves back-compat
+   * for paths that don't expose a qty input yet (bulk + scan + mobile).
+   */
+  newLocationQuantity?: number;
+  mainImage?: Asset["mainImage"];
+  thumbnailImage?: string | null;
+  mainImageExpiration?: Asset["mainImageExpiration"];
+  tags?: { set: { id: string }[] };
+  userId: User["id"];
+  customFieldsValues?: ShelfAssetCustomFieldValueType[];
+  barcodes?: { id?: string; type: BarcodeType; value: string }[];
+  /**
+   * Per-asset override of the displayed identifier in list views.
+   * - `undefined` → leave the column unchanged
+   * - `null` or `""` → clear the override (follow workspace default)
+   * - a string → set to that specific Barcode.id (validated to belong to this asset)
+   */
+  preferredBarcodeId?: Asset["preferredBarcodeId"] | undefined;
+  valuation?: Asset["valuation"];
+  organizationId: Organization["id"];
+  request: Request;
+  quantity?: Asset["quantity"];
+  minQuantity?: Asset["minQuantity"];
+  consumptionType?: Asset["consumptionType"];
+  unitOfMeasure?: Asset["unitOfMeasure"];
+}
+
+export interface CreateAssetFromContentImportPayload
+  extends Record<string, any> {
+  key: string; // Unique identifier for the asset in the import (this is generated while parsing the csv file)
+  /**
+   * A row may carry an `id` cell (the import-ready export's row matcher for
+   * the UPDATE importer). Deliberately not declared as a typed field here:
+   * createAssetsFromContentImport must never read it — it always mints a
+   * fresh cuid via `id(LEGACY_CUID_LENGTH)`, so a caller-supplied id can
+   * never be used to set/connect/upsert onto another workspace's asset.
+   */
+  title: string;
+  description?: string;
+  category?: string;
+  kit?: string;
+  tags?: string[];
+  location?: string;
+  custodian?: string;
+  bookable?: "yes" | "no";
+  imageUrl?: string; // URL of the image to import
+  /** AssetModel reference by name (case-insensitive). Resolved /
+   * upserted via createAssetModelsIfNotExists during import. */
+  assetModel?: string;
+  /** AssetType — defaults to INDIVIDUAL when omitted */
+  type?: "INDIVIDUAL" | "QUANTITY_TRACKED";
+  /** Required (>0) for QUANTITY_TRACKED; defaults to 1 for INDIVIDUAL */
+  quantity?: string;
+  /** Optional low-stock threshold for QUANTITY_TRACKED */
+  minQuantity?: string;
+  /** Free-form text label ("boxes", "kg", …) for QUANTITY_TRACKED */
+  unitOfMeasure?: string;
+  /** Required for QUANTITY_TRACKED. ONE_WAY (consumed on checkout) or
+   * TWO_WAY (returned with consumption report). */
+  consumptionType?: "ONE_WAY" | "TWO_WAY";
+}
+
+/** Item returned by getAssetsFromView */
+export type AssetsFromViewItem = Prisma.AssetGetPayload<{
+  include: Return<typeof assetIndexFields>;
+}>;
+
+/** Type for advanced asset booking */
+export type AdvancedAssetBooking = Pick<
+  Booking,
+  "id" | "name" | "status" | "description"
+> & {
+  from: string;
+  to: string;
+  tags: Array<Pick<Tag, "id" | "name" | "color">>;
+  custodianTeamMember?: Pick<TeamMember, "id" | "name">;
+  custodianUser?: Pick<
+    User,
+    "id" | "firstName" | "lastName" | "displayName" | "profilePicture"
+  >;
+  creator?: Pick<
+    User,
+    "id" | "firstName" | "lastName" | "displayName" | "profilePicture"
+  >;
+  /** BookingAsset.assetKitId of THIS slice: null = standalone (free pool),
+   * non-null = kit-driven (FK → AssetKit.id). Availability view only. */
+  assetKitId?: string | null;
+  /** BookingAsset.quantity — booked units for THIS slice. Never Asset.quantity
+   * (workspace stock). Availability view only. */
+  quantity?: number;
+  /** Kit name for THIS slice (null when standalone), resolved via
+   * AssetKit → Kit.name. Availability view only. */
+  kitName?: string | null;
+  /** BookingAsset.checkedOutAt of THIS slice: null until the slice goes out.
+   * Advanced mode delivers an ISO string (jsonb), simple mode a Date.
+   * Availability view only. */
+  checkedOutAt?: string | Date | null;
+  /** BookingAsset.checkedInAt of THIS slice: set once the slice is fully
+   * reconciled, cleared again by a second departure. The calendar reads it
+   * together with `checkedOutAt` to decide whether the bar reads as returned.
+   * Availability view only. */
+  checkedInAt?: string | Date | null;
+};
+
+/** Type for advanced index query. We cannot infer it because we do a raw query so we need to create it ourselves. */
+export type AdvancedIndexAsset = Pick<
+  Asset,
+  | "id"
+  | "sequentialId"
+  | "title"
+  | "description"
+  | "createdAt"
+  | "updatedAt"
+  | "userId"
+  | "mainImage"
+  | "thumbnailImage"
+  | "mainImageExpiration"
+  | "categoryId"
+  | "organizationId"
+  | "status"
+  | "type"
+  | "valuation"
+  | "quantity"
+  | "unitOfMeasure"
+  | "minQuantity"
+  | "consumptionType"
+  | "availableToBook"
+  | "archivedAt"
+> & {
+  qrId: string; // QR code will always be available
+  /**
+   * Units free to hand over right now: `quantity` minus custody, kit
+   * allocations and checked-out units. Computed in the index SQL, not stored.
+   *
+   * Deliberately NOT reduced by future reservations, a reserved unit is still
+   * physically on the shelf, so read it alongside `reserved` rather than on
+   * its own. `null` for INDIVIDUAL assets, which have no pool.
+   */
+  available: number | null;
+  /** Units committed to RESERVED bookings. `null` for INDIVIDUAL assets. */
+  reserved: number | null;
+  /**
+   * Units held by custodians DIRECTLY. Kit-inherited custody is not here: those
+   * units live in `inKits`, and counting them twice is the double-deduction
+   * `getAssetAvailability` guards against. This is the arithmetic figure.
+   */
+  inCustody: number | null;
+  /**
+   * Every custody unit, kit-inherited included. For the status badge's LABEL
+   * only, a member of a kit in custody is still "In custody" to a reader,
+   * never for arithmetic.
+   */
+  inCustodyAll: number | null;
+  /** Units earmarked to kits, whatever the kit is doing. */
+  inKits: number | null;
+  /**
+   * Standalone units that have actually LEFT on ONGOING/OVERDUE bookings
+   * (dispatched minus ledgered returns). The arithmetic figure behind `Free now`.
+   */
+  checkedOut: number | null;
+  /** Every unit out, kit-driven included. Badge label only. */
+  checkedOutAll: number | null;
+  /** Units promised to RESERVED bookings including kit slices. Badge label only. */
+  reservedAll: number | null;
+  /**
+   * The most units owed to bookings at any single instant from now on, over
+   * standalone slices, `peakConcurrent` in SQL. This is the figure the `Short`
+   * verdict is computed from, so it is also the figure the badge's tooltip
+   * must quote.
+   */
+  peakBooked: number | null;
+  /**
+   * Start of the SOONEST upcoming (RESERVED) booking, or null when there is
+   * none. A single scalar on purpose: an asset may carry hundreds of future
+   * bookings, and the index must not ship a per-booking list just so a hover
+   * card can say "those units leave on the 2nd". Serialised as a string.
+   */
+  nextReservedFrom: string | null;
+  /**
+   * The single upcoming booking claiming the MOST units of this pool, the one
+   * the `SHORT` verdict is computed from. Null when there are no upcoming
+   * bookings. Carried so a `Short` row can NAME the booking instead of only
+   * announcing that a problem exists.
+   */
+  topBookingId: string | null;
+  topBookingName: string | null;
+  /** Units that booking asks for, so the hover can say so beside its name. */
+  topBookingUnits: number | null;
+  /**
+   * Derived pool verdict powering the `Stock status` column, computed in SQL
+   * by `POOL_STOCK_STATUS_EXPR` (`query.server.ts`), which is its only source.
+   * `null` for INDIVIDUAL assets.
+   */
+  stockStatus: StockStatus | null;
+  assetModelId?: string | null;
+  assetModelName?: string | null;
+  /** The model's cover image, used when the asset has none of its own.
+   * Shaped as the nested relation the Prisma selects return so
+   * `resolveAssetImage` takes the same input on both index modes. */
+  assetModel: { image: string | null; thumbnailImage: string | null } | null;
+  /** Primary kit (oldest pivot row) — mirrors the LATERAL primary-pick
+   * used by ORDER BY and filters. Kept alongside `kits` for back-compat
+   * with consumers that only need the primary. */
+  kit: Pick<Kit, "id" | "name"> | null;
+  /** Full kit membership for the asset, ordered by `AssetKit.createdAt`.
+   * A multi-kit QUANTITY_TRACKED asset surfaces all kits here so the
+   * asset-index "Kit" column can render the primary plus a "+N more"
+   * affordance (mirror of `custody`). Always an array, never null. */
+  kits: Array<Pick<Kit, "id" | "name" | "status">>;
+  category: Pick<Category, "id" | "name" | "color"> | null;
+  tags: Pick<Tag, "id" | "name" | "color">[];
+  /** Primary placement (oldest pivot row) — see `kit` above. */
+  location:
+    | (Pick<Location, "id" | "name"> & {
+        parentId?: Location["parentId"];
+        childCount?: number;
+      })
+    | null;
+  /** Full placement list for the asset, ordered by
+   * `AssetLocation.createdAt`. Mirror of `kits`. Always an array. */
+  locations: Array<
+    Pick<Location, "id" | "name"> & {
+      parentId?: Location["parentId"];
+      childCount?: number;
+    }
+  >;
+  custody:
+    | {
+        /** Custodian display name; mirrored at the top level so callers
+         * can read it without descending into `custodian`. */
+        name?: string;
+        /** Per-custody quantity; meaningful for QUANTITY_TRACKED assets
+         * where the same asset can be split across multiple custodians.
+         * Optional because the booking-derived synthetic custody case
+         * does not project a quantity. */
+        quantity?: number;
+        custodian: {
+          /** Team member id; null for a booking custodian with no team
+           * member row. */
+          id: string | null;
+          name: string;
+          user: {
+            id: string;
+            firstName: string | null;
+            lastName: string | null;
+            displayName: string | null;
+            profilePicture: string | null;
+            email: string;
+          } | null;
+        };
+      }[]
+    | null;
+  customFields: (AssetCustomFieldValue & {
+    customField: Pick<
+      CustomField,
+      "id" | "name" | "helpText" | "required" | "type" | "options"
+    > & {
+      categories: Pick<Category, "id" | "name">[] | null;
+    };
+  })[];
+  upcomingReminder?: Pick<
+    AssetReminder,
+    | "id"
+    | "alertDateTime"
+    | "name"
+    | "message"
+    | "recurrenceUnit"
+    | "recurrenceInterval"
+  >;
+  bookings?: Array<AdvancedAssetBooking>;
+  barcodes?: Array<Pick<Barcode, "id" | "type" | "value">>;
+  /** ISO UTC completion time of the latest finished audit covering the asset. */
+  lastAuditDate?: string | null;
+};
+// Type for the entire query result
+export type AdvancedIndexQueryResult = Array<{
+  total_count: number;
+  assets: AdvancedIndexAsset[]; // This is now guaranteed to be an array, never null
+}>;
+
+export interface CustomFieldSorting {
+  name: string;
+  valueKey: string;
+  alias: string;
+  fieldType?: CustomFieldType;
+}
+
+/**
+ * The "active vs archived" view dimension for asset lists. This is orthogonal
+ * to the per-status (AVAILABLE/IN_CUSTODY/CHECKED_OUT) filter — see issue #382.
+ * - `active`   → only non-archived assets (the default everywhere).
+ * - `archived` → only archived assets (the "Archived" view).
+ * - `all`      → both.
+ */
+export type ArchivedFilter = "active" | "archived" | "all";

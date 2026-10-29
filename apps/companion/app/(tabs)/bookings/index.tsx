@@ -1,0 +1,1061 @@
+import { BookingCalendar } from "@/components/bookings/booking-calendar";
+import { BOOKING_STATUS_LABELS } from "@shelf/labels";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useLayoutEffect,
+  useRef,
+} from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  ScrollView,
+  FlatList,
+  TouchableOpacity,
+  ActivityIndicator,
+  RefreshControl,
+  Animated,
+  Platform,
+  ActionSheetIOS,
+  Alert,
+} from "react-native";
+import * as Haptics from "expo-haptics";
+import { useNavigation, useRouter } from "expo-router";
+import { useFocusEffect, useScrollToTop } from "@react-navigation/native";
+import { Ionicons } from "@expo/vector-icons";
+import { api, type BookingListItem } from "@/lib/api";
+import { useOrg } from "@/lib/org-context";
+import {
+  fontSize,
+  spacing,
+  borderRadius,
+  formatStatus,
+  bookingCountdown,
+  hitSlop,
+} from "@/lib/constants";
+import { useDateFormatter } from "@/lib/use-date-formatter";
+import { useTheme } from "@/lib/theme-context";
+import { createStyles } from "@/lib/create-styles";
+import { ErrorBoundary } from "@/components/error-boundary";
+import { BookingListSkeleton } from "@/components/skeleton-loader";
+import { useSwipeFilters } from "@/lib/use-swipe-filters";
+import { announce } from "@/lib/a11y";
+import { pushIntoTab } from "@/lib/navigation";
+import {
+  consumeBookingsListDirty,
+  markBookingsListDirty,
+} from "@/lib/booking-refresh";
+
+const PAGE_SIZE = 20;
+const bookingKeyExtractor = (item: BookingListItem) => item.id;
+
+/** One status filter pill, plus the copy its empty state renders. */
+type StatusFilter = {
+  /** Chip text. Status filters read from `@shelf/labels`; groups are prose. */
+  label: string;
+  /** Comma-separated `BookingStatus` subset sent to the list route. */
+  value: string;
+  /** Empty-state heading shown when this filter matches nothing. */
+  emptyTitle: string;
+  /** Empty-state body shown under `emptyTitle`. */
+  emptyHint: string;
+};
+
+/**
+ * Status filter pills. The mobile list route already accepts any
+ * comma-separated subset of statuses, so we expose the field-critical
+ * individual statuses (Reserved = upcoming, Ongoing = in progress, Overdue =
+ * needs attention) alongside the grouped Active/Complete/All — letting a tech
+ * isolate exactly what they care about on a job.
+ *
+ * why: the empty-state copy is spelled out per filter instead of being derived
+ * from `label`. Deriving it broke in two directions — a chip label is a noun
+ * ("Complete") where the sentence needs a participle ("No completed bookings"),
+ * and the grouped filters have no grammatical form at all ("No all bookings").
+ * Pairing the copy with the filter also removes the hardcoded indices the old
+ * empty state branched on, which silently went stale when this array grew.
+ */
+const STATUS_FILTERS: StatusFilter[] = [
+  // DRAFT counts as active: a booking being built (e.g. scan-to-add) must
+  // not vanish from the default view the moment the user leaves it.
+  {
+    label: "Active",
+    value: "DRAFT,RESERVED,ONGOING,OVERDUE",
+    emptyTitle: "No active bookings",
+    emptyHint: "Active bookings will appear here when created",
+  },
+  // why: the four single-status chips below read from @shelf/labels rather
+  // than being hand-typed. The COMPLETE one is where that drifted visibly — it
+  // said "Completed" while the badge on the very same row said "Complete",
+  // because badges go through formatStatus and these did not.
+  {
+    label: BOOKING_STATUS_LABELS.RESERVED,
+    value: "RESERVED",
+    emptyTitle: "No reserved bookings",
+    emptyHint: "Try selecting a different status filter",
+  },
+  {
+    label: BOOKING_STATUS_LABELS.ONGOING,
+    value: "ONGOING",
+    emptyTitle: "No ongoing bookings",
+    emptyHint: "Try selecting a different status filter",
+  },
+  {
+    label: BOOKING_STATUS_LABELS.OVERDUE,
+    value: "OVERDUE",
+    emptyTitle: "No overdue bookings",
+    emptyHint: "Nothing is past its due date — nothing to chase",
+  },
+  {
+    label: BOOKING_STATUS_LABELS.COMPLETE,
+    value: "COMPLETE",
+    emptyTitle: "No completed bookings",
+    emptyHint: "Try selecting a different status filter",
+  },
+  {
+    label: "All",
+    value: "DRAFT,RESERVED,ONGOING,OVERDUE,COMPLETE,ARCHIVED,CANCELLED",
+    emptyTitle: "No bookings",
+    // why: "All" is already the broadest filter, so telling the user to try a
+    // different one is a dead end.
+    emptyHint: "Bookings you create will appear here",
+  },
+];
+
+/**
+ * Sort options surfaced in the sort menu. Each maps to the list route's
+ * allowlisted `sortBy`/`sortOrder` params (default = the first entry, which
+ * matches the route's own default of `from asc`). Directions are chosen to be
+ * the useful one per column (soonest dates first, names A–Z, newest created).
+ */
+const SORT_OPTIONS: {
+  label: string;
+  sortBy: string;
+  sortOrder: "asc" | "desc";
+}[] = [
+  { label: "Start date (earliest)", sortBy: "from", sortOrder: "asc" },
+  { label: "Due date (soonest)", sortBy: "to", sortOrder: "asc" },
+  { label: "Name (A–Z)", sortBy: "name", sortOrder: "asc" },
+  { label: "Recently created", sortBy: "createdAt", sortOrder: "desc" },
+];
+
+export default function BookingsListScreen() {
+  return (
+    <ErrorBoundary screenName="Bookings">
+      <BookingsListContent />
+    </ErrorBoundary>
+  );
+}
+
+function BookingsListContent() {
+  const router = useRouter();
+  const {
+    currentOrg,
+    organizations,
+    setCurrentOrg,
+    isLoading: orgLoading,
+    error: orgError,
+    refresh: refreshOrg,
+  } = useOrg();
+  const { colors, bookingStatusBadge } = useTheme();
+  const styles = useStyles();
+  const { formatDateTime } = useDateFormatter();
+  const [bookings, setBookings] = useState<BookingListItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [activeFilter, setActiveFilter] = useState(0);
+  const [searchInput, setSearchInput] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [sortIndex, setSortIndex] = useState(0);
+  const [totalPages, setTotalPages] = useState(0);
+  const nextPage = useRef(1);
+  const listRef = useRef<FlatList>(null);
+
+  /**
+   * List or calendar. The calendar is the same bookings through a different
+   * lens, so it lives here rather than as a sixth tab: the tab bar stays at
+   * five, and someone looking for bookings already comes to this screen.
+   */
+  const [view, setView] = useState<"list" | "calendar">("list");
+  /**
+   * Bumped when a booking is mutated elsewhere, so the calendar drops its
+   * cached months and refetches the one on screen.
+   */
+  const [calendarRefreshToken, setCalendarRefreshToken] = useState(0);
+  const navigation = useNavigation();
+
+  /**
+   * The lens switch lives in the header, not in the body.
+   *
+   * why: it used to sit under the search box as a third stacked control row,
+   * which pushed the actual bookings down and read as clutter. It also changes
+   * the WHOLE screen, so it belongs with the title rather than among the
+   * filters it replaces. Both options stay visible, since a segmented control
+   * is discoverable in a way a single toggling icon is not, and this is a
+   * feature nobody knows exists yet.
+   */
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <View style={styles.lens}>
+          {(["list", "calendar"] as const).map((v) => (
+            <TouchableOpacity
+              key={v}
+              style={styles.lensItem}
+              onPress={() => setView(v)}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: view === v }}
+              accessibilityLabel={v === "list" ? "List view" : "Calendar view"}
+              hitSlop={hitSlop.sm}
+            >
+              <Ionicons
+                name={v === "list" ? "list-outline" : "calendar-outline"}
+                size={20}
+                color={view === v ? colors.primary : colors.mutedLight}
+              />
+            </TouchableOpacity>
+          ))}
+        </View>
+      ),
+    });
+  }, [navigation, view, styles, colors]);
+  useScrollToTop(listRef);
+
+  // Swipe-to-filter gesture (Instagram-style horizontal swipe between filters)
+  const {
+    panHandlers: swipePanHandlers,
+    animatedStyle: swipeAnimatedStyle,
+    syncIndex,
+  } = useSwipeFilters(STATUS_FILTERS.length, (newIndex) => {
+    Haptics.selectionAsync();
+    setActiveFilter(newIndex);
+  });
+
+  // Keep swipe hook in sync with active filter
+  useEffect(() => {
+    syncIndex(activeFilter);
+  }, [activeFilter, syncIndex]);
+
+  const fetchBookings = useCallback(
+    async (pageNum: number, reset: boolean): Promise<boolean> => {
+      // Personal workspaces have no bookings surface; the screen shows the
+      // switch-workspace state instead of firing a request that cannot succeed.
+      if (!currentOrg || currentOrg.type === "PERSONAL") return false;
+      const { data, error: fetchErr } = await api.bookings(currentOrg.id, {
+        status: STATUS_FILTERS[activeFilter].value,
+        search: debouncedSearch || undefined,
+        sortBy: SORT_OPTIONS[sortIndex].sortBy,
+        sortOrder: SORT_OPTIONS[sortIndex].sortOrder,
+        page: pageNum,
+        perPage: PAGE_SIZE,
+      });
+      // Request cancelled (navigation): ignore, treat as not-refreshed.
+      if (!data && !fetchErr) return false;
+      if (fetchErr || !data) {
+        setError(fetchErr || "Failed to load bookings");
+        return false;
+      }
+      setError(null);
+      setTotalPages(data.totalPages);
+      nextPage.current = pageNum + 1;
+      if (reset) {
+        setBookings(data.bookings);
+        lastLoadedCountRef.current = data.bookings.length;
+      } else setBookings((prev) => [...prev, ...data.bookings]);
+      return true;
+    },
+    [currentOrg, activeFilter, debouncedSearch, sortIndex]
+  );
+
+  // Refresh on tab focus — skip if data is fresh (< 60s old)
+  const hasFetchedBookings = useRef(false);
+  const lastFetchedAt = useRef(0);
+  // Count from the latest successful reset fetch, used for the first-load a11y
+  // summary without reading state inside a setBookings updater (impure).
+  const lastLoadedCountRef = useRef(0);
+
+  // Reset cache when org changes so useFocusEffect refetches
+  useEffect(() => {
+    lastFetchedAt.current = 0;
+    hasFetchedBookings.current = false;
+    setBookings([]);
+    setError(null);
+    nextPage.current = 1;
+  }, [currentOrg?.id]);
+
+  // Debounce the search box (mirrors the assets/kits list debounce).
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(searchInput.trim()), 400);
+    return () => clearTimeout(t);
+  }, [searchInput]);
+
+  /**
+   * Re-fetch immediately when the filter, search, or sort changes.
+   *
+   * Skipped entirely while the calendar is the visible lens: it runs its own
+   * query against the same filters, so every pill tap and every debounced
+   * keystroke was firing BOTH - a findMany and a count for a list that is not
+   * on screen, alongside the calendar's own. `view` is a dependency so
+   * switching back to the list refetches it with whatever the filters became
+   * in the meantime.
+   */
+  useEffect(() => {
+    if (!currentOrg || !hasFetchedBookings.current || view !== "list") return;
+    nextPage.current = 1;
+    fetchBookings(1, true).finally(() => {
+      lastFetchedAt.current = Date.now();
+    });
+  }, [activeFilter, debouncedSearch, sortIndex, view]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!currentOrg) return;
+      // A lifecycle mutation on the detail screen (reserve/cancel/archive/
+      // delete/duplicate) marks the list dirty; bypass the freshness gate so we
+      // don't show stale rows on return.
+      const mustRefresh = consumeBookingsListDirty();
+      // The calendar keeps its own state and its own month cache, so the flag
+      // has to reach it too. Raising a token here rather than letting the
+      // calendar consume the flag itself: it is a one-shot flag, and whichever
+      // consumer ran first would eat it and leave the other stale.
+      if (mustRefresh) setCalendarRefreshToken((t) => t + 1);
+      if (
+        !mustRefresh &&
+        hasFetchedBookings.current &&
+        Date.now() - lastFetchedAt.current < 60_000
+      )
+        return;
+      if (!hasFetchedBookings.current) {
+        setIsLoading(true);
+      }
+      nextPage.current = 1;
+      const isFirstLoad = !hasFetchedBookings.current;
+      fetchBookings(1, true)
+        .then((ok) => {
+          // If a forced (list-dirty) refresh failed or was cancelled, re-mark
+          // so the next focus retries instead of falling back to the 60s gate.
+          if (mustRefresh && !ok) markBookingsListDirty();
+          // First-load a11y summary, only when the fetch succeeded so screen
+          // readers don't announce "No bookings found" while the error/Retry
+          // view is what's actually on screen.
+          if (isFirstLoad && ok) {
+            announce(
+              lastLoadedCountRef.current === 0
+                ? "No bookings found"
+                : lastLoadedCountRef.current + " bookings loaded"
+            );
+          }
+        })
+        .finally(() => {
+          setIsLoading(false);
+          lastFetchedAt.current = Date.now();
+          if (isFirstLoad) {
+            hasFetchedBookings.current = true;
+          }
+        });
+      // why: depend on org id (not full object) to avoid re-runs on identity-only changes
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentOrg?.id, activeFilter, fetchBookings])
+  );
+
+  const onRefresh = async () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setIsRefreshing(true);
+    nextPage.current = 1;
+    await fetchBookings(1, true);
+    setIsRefreshing(false);
+    announce("Content refreshed");
+  };
+
+  const onEndReached = async () => {
+    if (isLoadingMore || nextPage.current > totalPages) return;
+    setIsLoadingMore(true);
+    await fetchBookings(nextPage.current, false);
+    setIsLoadingMore(false);
+  };
+
+  // Cross-platform sort picker: native action sheet on iOS, Alert on Android
+  // (mirrors the image-source picker pattern in assets/new.tsx).
+  const openSortMenu = () => {
+    Haptics.selectionAsync();
+    const labels = SORT_OPTIONS.map((o) => o.label);
+    if (Platform.OS === "ios") {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          title: "Sort bookings",
+          options: ["Cancel", ...labels],
+          cancelButtonIndex: 0,
+        },
+        (i) => {
+          if (i > 0) setSortIndex(i - 1);
+        }
+      );
+    } else {
+      Alert.alert("Sort bookings", undefined, [
+        { text: "Cancel", style: "cancel" },
+        ...SORT_OPTIONS.map((o, i) => ({
+          text: o.label,
+          onPress: () => setSortIndex(i),
+        })),
+      ]);
+    }
+  };
+
+  const renderBooking = useCallback(
+    ({ item }: { item: BookingListItem }) => {
+      const badge = bookingStatusBadge[item.status] ?? {
+        bg: colors.backgroundTertiary,
+        text: colors.muted,
+      };
+
+      const isUrgent = item.status === "OVERDUE";
+      const isActive = item.status === "ONGOING" || item.status === "RESERVED";
+      const countdown = bookingCountdown(item.from, item.to, item.status);
+
+      return (
+        <TouchableOpacity
+          style={[styles.bookingCard, isUrgent && styles.bookingCardUrgent]}
+          onPress={() => router.push(`/(tabs)/bookings/${item.id}`)}
+          activeOpacity={0.6}
+          accessibilityLabel={`Booking: ${item.name}, ${formatStatus(
+            item.status
+          )}, ${item.assetCount} assets${
+            (item.outstandingModelUnitCount ?? 0) > 0
+              ? `, ${item.outstandingModelUnitCount} reserved`
+              : ""
+          }`}
+          accessibilityRole="button"
+        >
+          <View style={styles.bookingHeader}>
+            <View style={styles.bookingTitleRow}>
+              <Text style={styles.bookingName} numberOfLines={1}>
+                {item.name}
+              </Text>
+              <View style={[styles.statusBadge, { backgroundColor: badge.bg }]}>
+                <View
+                  style={[styles.statusDot, { backgroundColor: badge.text }]}
+                />
+                <Text style={[styles.statusText, { color: badge.text }]}>
+                  {formatStatus(item.status)}
+                </Text>
+              </View>
+            </View>
+          </View>
+
+          <View style={styles.bookingMeta}>
+            <View style={styles.metaRow}>
+              <Ionicons
+                name="calendar-outline"
+                size={13}
+                color={colors.mutedLight}
+              />
+              <Text style={styles.metaText}>
+                {formatDateTime(item.from)} → {formatDateTime(item.to)}
+              </Text>
+            </View>
+
+            {countdown && (
+              <View style={styles.metaRow}>
+                <Ionicons
+                  name={countdown.urgent ? "alert-circle" : "time-outline"}
+                  size={13}
+                  color={countdown.urgent ? colors.error : colors.mutedLight}
+                />
+                <Text
+                  style={[
+                    styles.metaText,
+                    countdown.urgent && styles.metaTextUrgent,
+                  ]}
+                >
+                  {countdown.text}
+                </Text>
+              </View>
+            )}
+
+            <View style={styles.metaRow}>
+              <Ionicons
+                name="cube-outline"
+                size={13}
+                color={colors.mutedLight}
+              />
+              <Text style={styles.metaText}>
+                {item.assetCount} {item.assetCount === 1 ? "asset" : "assets"}
+                {/* A booking can hold reserved units with no concrete asset
+                    behind them yet, and `assetCount` only counts concrete
+                    rows. Without this the card reads "0 assets" while the
+                    action hint below says "Assign assets to check out" — and
+                    the reserved units are genuinely held, unavailable to
+                    everyone else. Same signal, every surface. */}
+                {(item.outstandingModelUnitCount ?? 0) > 0
+                  ? ` · ${item.outstandingModelUnitCount} reserved`
+                  : ""}
+              </Text>
+            </View>
+
+            {item.custodianName && (
+              <View style={styles.metaRow}>
+                <Ionicons
+                  name="person-outline"
+                  size={13}
+                  color={colors.mutedLight}
+                />
+                <Text style={styles.metaText} numberOfLines={1}>
+                  {item.custodianName}
+                </Text>
+              </View>
+            )}
+          </View>
+
+          {isActive && (
+            <View style={styles.actionHint}>
+              {/* A RESERVED booking is "ready to check out" as soon as it holds
+                  a concrete asset: check-out needs one item to go out, and
+                  reserved units still unassigned stay open on the booking
+                  (the card's "N reserved" already shows them). With no asset
+                  yet, the honest next step is to assign reserved units or
+                  add assets, so the hint points there instead of promising
+                  a check-out that has nothing to send out. */}
+              <Ionicons
+                name={
+                  item.status !== "RESERVED"
+                    ? "log-in-outline"
+                    : item.assetCount > 0
+                    ? "log-out-outline"
+                    : (item.outstandingModelCount ?? 0) > 0
+                    ? "cube-outline"
+                    : "add-outline"
+                }
+                size={14}
+                color={colors.iconDefault}
+              />
+              <Text style={styles.actionHintText}>
+                {item.status !== "RESERVED"
+                  ? "Tap to check in"
+                  : item.assetCount > 0
+                  ? "Ready to check out"
+                  : (item.outstandingModelCount ?? 0) > 0
+                  ? "Assign assets to check out"
+                  : "Add assets to check out"}
+              </Text>
+            </View>
+          )}
+        </TouchableOpacity>
+      );
+    },
+    [router, colors, bookingStatusBadge, styles, formatDateTime]
+  );
+
+  if (orgLoading) {
+    return (
+      <View style={styles.centered}>
+        <ActivityIndicator
+          size="large"
+          color={colors.muted}
+          accessibilityLabel="Loading bookings"
+        />
+      </View>
+    );
+  }
+
+  if (orgError) {
+    return (
+      <View style={styles.centered}>
+        <Ionicons
+          name="cloud-offline-outline"
+          size={48}
+          color={colors.mutedLight}
+        />
+        <Text style={styles.emptyText}>{orgError}</Text>
+        <TouchableOpacity
+          style={styles.retryButton}
+          onPress={() => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+            refreshOrg();
+          }}
+          activeOpacity={0.7}
+          accessibilityLabel="Retry loading"
+          accessibilityRole="button"
+        >
+          <Ionicons name="refresh" size={16} color={colors.primaryForeground} />
+          <Text style={styles.retryText}>Retry</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // Bookings belong to team workspaces. In a personal workspace, explain that
+  // and hand the user the shortest path to one instead of an empty list.
+  if (currentOrg?.type === "PERSONAL") {
+    const teamOrgs = organizations.filter((org) => org.type === "TEAM");
+    const onlyTeam = teamOrgs.length === 1 ? teamOrgs[0] : null;
+    return (
+      <View style={styles.centered}>
+        <Ionicons name="calendar-outline" size={48} color={colors.border} />
+        <Text style={styles.emptyTitle}>Bookings live in team workspaces</Text>
+        <Text style={styles.emptyText}>
+          {teamOrgs.length > 0
+            ? "Your personal workspace tracks your own gear. Switch to a team workspace to plan and reserve equipment."
+            : "Your personal workspace tracks your own gear. Create a team workspace on the web to plan and reserve equipment."}
+        </Text>
+        {teamOrgs.length > 0 ? (
+          <TouchableOpacity
+            style={styles.retryButton}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              if (onlyTeam) {
+                setCurrentOrg(onlyTeam);
+              } else {
+                // Several teams: the workspace picker lives in Settings.
+                pushIntoTab("/(tabs)/settings");
+              }
+            }}
+            activeOpacity={0.7}
+            accessibilityLabel={
+              onlyTeam ? `Switch to ${onlyTeam.name}` : "Switch workspace"
+            }
+            accessibilityRole="button"
+          >
+            <Ionicons
+              name="swap-horizontal"
+              size={16}
+              color={colors.primaryForeground}
+            />
+            <Text style={styles.retryText}>
+              {onlyTeam ? `Switch to ${onlyTeam.name}` : "Switch workspace"}
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      {/* Keyword search + sort.
+          why here rather than inside the list branch: search and the status
+          pills say WHAT you are looking at, and the header switch says HOW.
+          They compose. Hiding them in calendar mode meant a filter you had
+          set was silently ignored the moment you switched lens, and the two
+          views disagreed by default — the list opens on Active (four
+          statuses) while the calendar was drawing five. Web applies the same
+          filter set to its calendar; this now matches. */}
+      <View style={styles.searchRow}>
+        <View style={styles.searchContainer}>
+          <Ionicons name="search" size={18} color={colors.mutedLight} />
+          <TextInput
+            style={styles.searchInput}
+            value={searchInput}
+            onChangeText={setSearchInput}
+            placeholder="Search bookings..."
+            placeholderTextColor={colors.mutedLight}
+            autoCorrect={false}
+            autoCapitalize="none"
+            returnKeyType="search"
+            accessibilityLabel="Search bookings"
+          />
+          {searchInput.length > 0 ? (
+            <TouchableOpacity
+              onPress={() => setSearchInput("")}
+              hitSlop={hitSlop.sm}
+              accessibilityLabel="Clear search"
+              accessibilityRole="button"
+            >
+              <Ionicons
+                name="close-circle"
+                size={18}
+                color={colors.mutedLight}
+              />
+            </TouchableOpacity>
+          ) : null}
+        </View>
+        {/* why list-only: sort orders rows. A calendar is positioned by
+                date, so there is nothing for it to order. */}
+        {view === "list" && (
+          <TouchableOpacity
+            style={styles.sortButton}
+            onPress={openSortMenu}
+            accessibilityLabel="Sort bookings"
+            accessibilityRole="button"
+          >
+            <Ionicons name="swap-vertical" size={20} color={colors.muted} />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {/* Status filter pills — scrollable: more statuses than fit one row */}
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.filterScroll}
+        contentContainerStyle={styles.filterRow}
+        accessibilityRole="tablist"
+      >
+        {STATUS_FILTERS.map((f, i) => (
+          <TouchableOpacity
+            key={f.value}
+            style={[
+              styles.filterPill,
+              activeFilter === i && styles.filterPillActive,
+            ]}
+            onPress={() => {
+              Haptics.selectionAsync();
+              setActiveFilter(i);
+            }}
+            hitSlop={hitSlop.sm}
+            accessibilityLabel={`Filter: ${f.label}`}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: activeFilter === i }}
+          >
+            <Text
+              style={[
+                styles.filterPillText,
+                activeFilter === i && styles.filterPillTextActive,
+              ]}
+            >
+              {f.label}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+
+      {view === "calendar" ? (
+        <BookingCalendar
+          orgId={currentOrg?.id}
+          statuses={STATUS_FILTERS[activeFilter].value}
+          search={debouncedSearch}
+          refreshToken={calendarRefreshToken}
+          canCreate={currentOrg?.type === "TEAM"}
+        />
+      ) : (
+        /* Swipeable content area — swipe left/right to cycle filter pills */
+        <View style={styles.flexFill} {...swipePanHandlers}>
+          <Animated.View style={[styles.flexFill, swipeAnimatedStyle]}>
+            {error ? (
+              <View style={styles.centered}>
+                <Ionicons
+                  name="alert-circle-outline"
+                  size={48}
+                  color={colors.error}
+                />
+                <Text style={styles.emptyText}>{error}</Text>
+                <TouchableOpacity
+                  style={styles.retryButton}
+                  onPress={onRefresh}
+                  accessibilityLabel="Retry loading bookings"
+                  accessibilityRole="button"
+                >
+                  <Text style={styles.retryText}>Retry</Text>
+                </TouchableOpacity>
+              </View>
+            ) : isLoading && bookings.length === 0 ? (
+              <BookingListSkeleton />
+            ) : bookings.length === 0 ? (
+              <View style={styles.centered}>
+                <Ionicons
+                  name="calendar-outline"
+                  size={48}
+                  color={colors.border}
+                />
+                <Text style={styles.emptyTitle}>
+                  {STATUS_FILTERS[activeFilter].emptyTitle}
+                </Text>
+                <Text style={styles.emptyText}>
+                  {STATUS_FILTERS[activeFilter].emptyHint}
+                </Text>
+              </View>
+            ) : (
+              <FlatList
+                ref={listRef}
+                data={bookings}
+                renderItem={renderBooking}
+                keyExtractor={bookingKeyExtractor}
+                contentContainerStyle={styles.list}
+                removeClippedSubviews
+                maxToRenderPerBatch={10}
+                windowSize={5}
+                initialNumToRender={10}
+                refreshControl={
+                  <RefreshControl
+                    refreshing={isRefreshing}
+                    onRefresh={onRefresh}
+                    tintColor={colors.muted}
+                    accessibilityLabel="Pull to refresh"
+                  />
+                }
+                onEndReached={onEndReached}
+                onEndReachedThreshold={0.5}
+                ListFooterComponent={
+                  isLoadingMore ? (
+                    <ActivityIndicator
+                      style={styles.footer}
+                      color={colors.muted}
+                    />
+                  ) : null
+                }
+              />
+            )}
+          </Animated.View>
+        </View>
+      )}
+
+      {/* Create booking — only TEAM workspaces can use bookings (matches the
+          server premium gate; personal workspaces 403 on create).
+          Not in the calendar: anchored bottom right it lands in the middle of
+          the day panel and covers the first row's status pill, so that view
+          carries the same action in its panel header instead. */}
+      {currentOrg?.type === "TEAM" && view === "list" && (
+        <TouchableOpacity
+          style={styles.fab}
+          onPress={() => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+            router.push("/(tabs)/bookings/new");
+          }}
+          accessibilityLabel="Create booking"
+          accessibilityRole="button"
+        >
+          <Ionicons name="add" size={28} color={colors.primaryForeground} />
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+}
+
+const useStyles = createStyles((colors, shadows) => ({
+  flexFill: {
+    flex: 1,
+  },
+  container: {
+    flex: 1,
+    backgroundColor: colors.backgroundSecondary,
+  },
+  centered: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+
+  // Keyword search box + sort button
+  /**
+   * Two-state lens switch in the native header.
+   *
+   * why: no track. A grey track on a white header is nearly invisible, and the
+   * active chip inside it was white on near-white, so the selected state did
+   * not read at all. Colour carries the state instead, using exactly the
+   * active/inactive language of the tab bar directly below, which users already
+   * understand without being taught.
+   */
+  lens: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+  },
+  // No active-state style: the selected lens is carried by the icon colour
+  // alone, matching the tab bar directly below (see the note above).
+  lensItem: {
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
+    borderRadius: borderRadius.sm,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  searchRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginHorizontal: spacing.lg,
+    marginTop: spacing.md,
+  },
+  searchContainer: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingHorizontal: 14,
+    height: 44,
+    borderRadius: borderRadius.lg,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: fontSize.md,
+    color: colors.foreground,
+    padding: 0,
+  },
+  sortButton: {
+    width: 44,
+    height: 44,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: borderRadius.lg,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+
+  // Filter pills
+  filterScroll: {
+    flexGrow: 0,
+  },
+  filterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    gap: spacing.sm,
+  },
+  filterPill: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 16,
+    height: 34,
+    borderRadius: borderRadius.pill,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  filterPillActive: {
+    backgroundColor: colors.filterPillActiveBg,
+    borderColor: colors.filterPillActiveBg,
+  },
+  filterPillText: {
+    fontSize: fontSize.sm,
+    fontWeight: "500",
+    color: colors.muted,
+  },
+  filterPillTextActive: {
+    color: colors.filterPillActiveText,
+  },
+
+  // List
+  list: {
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.lg,
+  },
+  bookingCard: {
+    backgroundColor: colors.white,
+    borderRadius: borderRadius.lg,
+    padding: spacing.lg,
+    marginBottom: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: spacing.sm,
+  },
+  bookingCardUrgent: {
+    borderColor: colors.errorBorder,
+  },
+  bookingHeader: {
+    gap: 4,
+  },
+  bookingTitleRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  bookingName: {
+    flex: 1,
+    fontSize: fontSize.md,
+    fontWeight: "600",
+    color: colors.foreground,
+  },
+
+  // Status badge
+  statusBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: borderRadius.pill,
+    gap: 4,
+  },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  statusText: {
+    fontSize: fontSize.xs,
+    fontWeight: "500",
+  },
+
+  // Meta info
+  bookingMeta: {
+    gap: 4,
+  },
+  metaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+  },
+  metaText: {
+    fontSize: fontSize.sm,
+    color: colors.muted,
+  },
+  metaTextUrgent: {
+    color: colors.error,
+    fontWeight: "600",
+  },
+
+  // Action hint
+  actionHint: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingTop: spacing.xs,
+    borderTopWidth: 1,
+    borderTopColor: colors.borderLight,
+  },
+  actionHintText: {
+    fontSize: fontSize.sm,
+    color: colors.buttonGhostText,
+    fontWeight: "500",
+  },
+
+  // Empty / error
+  emptyTitle: {
+    fontSize: fontSize.lg,
+    fontWeight: "600",
+    color: colors.foreground,
+    textAlign: "center",
+  },
+  emptyText: {
+    fontSize: fontSize.base,
+    color: colors.muted,
+    textAlign: "center",
+    paddingHorizontal: spacing.xxxl,
+  },
+  retryButton: {
+    backgroundColor: colors.primary,
+    paddingHorizontal: spacing.xxl,
+    paddingVertical: 10,
+    borderRadius: borderRadius.md,
+    marginTop: spacing.sm,
+  },
+  retryText: {
+    color: colors.primaryForeground,
+    fontWeight: "600",
+    fontSize: fontSize.base,
+  },
+  footer: {
+    paddingVertical: spacing.lg,
+  },
+  fab: {
+    position: "absolute",
+    right: spacing.lg,
+    bottom: spacing.xl,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: colors.primary,
+    alignItems: "center",
+    justifyContent: "center",
+    ...shadows.lg,
+  },
+}));

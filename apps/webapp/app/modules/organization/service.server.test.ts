@@ -1,0 +1,1395 @@
+import {
+  AssetIndexMode,
+  OrganizationRoles,
+  OrganizationType,
+  Roles,
+} from "@prisma/client";
+import type { Organization, Prisma, TierId, User } from "@prisma/client";
+import type Stripe from "stripe";
+
+import { db } from "~/database/db.server";
+import { sendEmail } from "~/emails/mail.server";
+import { DEFAULT_MAX_IMAGE_UPLOAD_SIZE } from "~/utils/constants";
+import { ADMIN_EMAIL } from "~/utils/env";
+import type { ErrorLabel } from "~/utils/error";
+import {
+  isLikeShelfError,
+  rethrowIfClientError,
+  ShelfError,
+} from "~/utils/error";
+import { assertUploadedImageContentType } from "~/utils/image-upload.server";
+import { Logger } from "~/utils/logger";
+import { emailMatchesDomains } from "~/utils/misc";
+import { holdsRoleWhere } from "~/utils/permissions/membership-access";
+import { isWorkspaceOwner, rolesWhere } from "~/utils/permissions/role-access";
+import {
+  createStripeCustomer,
+  customerHasPaymentMethod,
+  getUserActiveSubscription,
+  getUserActiveSubscriptions,
+  premiumIsEnabled,
+  transferSubscriptionToCustomer,
+} from "~/utils/stripe.server";
+import { resolveUserDisplayName } from "~/utils/user";
+import { newOwnerEmailText, previousOwnerEmailText } from "./email";
+import { recordEvent } from "../activity-event/service.server";
+import { defaultColumnsForWorkspace } from "../asset-index-settings/helpers";
+import { defaultUserCategories } from "../category/default-categories";
+import { updateUserTierId } from "../tier/service.server";
+import { USER_NAME_SELECT } from "../user/fields";
+import { lockMembership } from "../user/membership-lock.server";
+import { getDefaultWeeklySchedule } from "../working-hours/service.server";
+
+const label: ErrorLabel = "Organization";
+
+export async function getOrganizationById<T extends Prisma.OrganizationInclude>(
+  id: Organization["id"],
+  extraIncludes?: T
+) {
+  try {
+    return (await db.organization.findUniqueOrThrow({
+      where: { id },
+      include: extraIncludes,
+    })) as Prisma.OrganizationGetPayload<{ include: T }>;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "No organization found with this ID",
+      additionalData: { id },
+      label,
+    });
+  }
+}
+
+export const getOrganizationByUserId = async ({
+  userId,
+  orgType,
+}: {
+  userId: User["id"];
+  orgType: OrganizationType;
+}) => {
+  try {
+    return await db.organization.findFirstOrThrow({
+      where: {
+        owner: {
+          is: {
+            id: userId,
+          },
+        },
+        type: orgType,
+      },
+      select: {
+        id: true,
+        name: true,
+        type: true,
+        currency: true,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "No organization found for this user.",
+      additionalData: {
+        userId,
+        orgType,
+      },
+      label,
+    });
+  }
+};
+
+/**
+ * Gets organizations that use the email domain for SSO
+ * Supports multiple domains per organization via comma-separated domain strings
+ * @param emailDomain - Email domain to check
+ * @returns Array of organizations that use this domain for SSO
+ */
+export async function getOrganizationsBySsoDomain(emailDomain: string) {
+  try {
+    if (!emailDomain) {
+      throw new ShelfError({
+        cause: null,
+        message: "Email domain is required",
+        additionalData: { emailDomain },
+        label: "SSO",
+      });
+    }
+
+    // Query for organizations where the domain field contains the email domain
+    const organizations = await db.organization.findMany({
+      where: {
+        ssoDetails: {
+          isNot: null,
+        },
+        AND: [
+          {
+            ssoDetails: {
+              domain: {
+                contains: emailDomain,
+                // Stored casing is unconstrained, so a case-sensitive filter
+                // would drop "ACME.com" here and the exact-match filter below
+                // would never see it.
+                mode: "insensitive" as const,
+              },
+            },
+          },
+        ],
+      },
+      include: {
+        ssoDetails: true,
+      },
+    });
+
+    // Filter to ensure exact domain matches
+    return organizations.filter((org) =>
+      org.ssoDetails?.domain
+        ? emailMatchesDomains(emailDomain, org.ssoDetails.domain)
+        : false
+    );
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to get organizations by SSO domain",
+      additionalData: { emailDomain },
+      label: "SSO",
+    });
+  }
+}
+
+/**
+ * Reads an uploaded workspace logo and pairs its bytes with the content type
+ * they prove.
+ *
+ * The type comes from the bytes, never from the caller's `File.type`: the row
+ * is served back inline by `api+/image.$imageId`, so the stored type decides
+ * how a browser renders it.
+ *
+ * @param image - The uploaded file
+ * @param userId - Acting user, for the error context
+ * @returns The bytes to persist and the content type to persist them under
+ * @throws {ShelfError} 400 when the bytes are not a supported image format
+ */
+async function readValidatedLogo(image: File, userId: User["id"]) {
+  const blob = new Uint8Array(await image.arrayBuffer());
+
+  return {
+    blob,
+    contentType: assertUploadedImageContentType(blob, {
+      userId,
+      field: "image",
+    }),
+  };
+}
+
+export async function createOrganization({
+  name,
+  userId,
+  image,
+  currency,
+}: Pick<Organization, "name" | "currency"> & {
+  userId: User["id"];
+  image: File | null;
+}) {
+  try {
+    const owner = await db.user.findFirstOrThrow({
+      where: { id: userId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      },
+    });
+
+    /**
+     * Validated before anything is written. The workspace counts against the
+     * caller's plan limit from the moment it exists, and nothing cleans one up,
+     * so a logo this service is going to refuse must not cost the caller a slot.
+     */
+    const logo =
+      image?.size && image.size > 0
+        ? await readValidatedLogo(image, userId)
+        : null;
+
+    const data = {
+      name,
+      currency,
+      type: OrganizationType.TEAM,
+      hasSequentialIdsMigrated: true, // New organizations don't need migration
+      categories: {
+        create: defaultUserCategories.map((c) => ({ ...c, userId })),
+      },
+      userOrganizations: {
+        create: {
+          userId,
+          roles: [OrganizationRoles.OWNER],
+        },
+      },
+      owner: {
+        connect: {
+          id: userId,
+        },
+      },
+      /**
+       * Creating a teamMember when a new organization/workspace is created
+       * so that the owner appear in the list by default
+       */
+      members: {
+        create: {
+          name: `${resolveUserDisplayName(owner)} (Owner)`,
+          user: { connect: { id: owner.id } },
+        },
+      },
+
+      assetIndexSettings: {
+        create: {
+          mode: AssetIndexMode.ADVANCED,
+          // A new workspace has no assets yet, so no quantity-tracked ones.
+          columns: defaultColumnsForWorkspace({ hasQuantityAssets: false }),
+          user: {
+            connect: {
+              id: userId,
+            },
+          },
+        },
+      },
+
+      workingHours: {
+        create: {
+          enabled: false,
+          weeklySchedule: getDefaultWeeklySchedule(),
+        },
+      },
+
+      bookingSettings: {
+        create: {
+          bufferStartTime: 0,
+        },
+      },
+    } satisfies Prisma.OrganizationCreateInput;
+
+    const org = await db.organization.create({ data });
+
+    if (logo) {
+      await db.image.create({
+        data: {
+          blob: logo.blob,
+          contentType: logo.contentType,
+          ownerOrg: {
+            connect: {
+              id: org.id,
+            },
+          },
+          organization: {
+            connect: {
+              id: org.id,
+            },
+          },
+          user: {
+            connect: {
+              id: userId,
+            },
+          },
+        },
+      });
+    }
+
+    return org;
+  } catch (cause) {
+    // A refused logo is a deliberate 400 with a message written for the user;
+    // the generic wrapper below would tell them to retry a request that cannot
+    // succeed.
+    rethrowIfClientError(cause);
+
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while creating the organization. Please try again or contact support.",
+      additionalData: { name, userId },
+      label,
+    });
+  }
+}
+export async function updateOrganization({
+  id,
+  name,
+  image,
+  userId,
+  currency,
+  ssoDetails,
+  hasSequentialIdsMigrated,
+  qrIdDisplayPreference,
+  showShelfBranding,
+  showQrCodesOnPdfs,
+  customEmailFooter,
+}: Pick<Organization, "id"> & {
+  currency?: Organization["currency"];
+  name?: string;
+  userId: User["id"];
+  image?: File | null;
+  ssoDetails?: {
+    selfServiceGroupId: string | null;
+    adminGroupId: string | null;
+    managerGroupId: string | null;
+    baseUserGroupId: string | null;
+  };
+  hasSequentialIdsMigrated?: Organization["hasSequentialIdsMigrated"];
+  qrIdDisplayPreference?: Organization["qrIdDisplayPreference"];
+  showShelfBranding?: Organization["showShelfBranding"];
+  showQrCodesOnPdfs?: Organization["showQrCodesOnPdfs"];
+  customEmailFooter?: string | null;
+}) {
+  try {
+    const data = {
+      name,
+      ...(currency && { currency }),
+      ...(qrIdDisplayPreference && { qrIdDisplayPreference }),
+      ...(hasSequentialIdsMigrated !== undefined && {
+        hasSequentialIdsMigrated,
+      }),
+      ...(typeof showShelfBranding === "boolean" && {
+        showShelfBranding,
+      }),
+      ...(typeof showQrCodesOnPdfs === "boolean" && {
+        showQrCodesOnPdfs,
+      }),
+      ...(customEmailFooter !== undefined && { customEmailFooter }),
+      ...(ssoDetails && {
+        ssoDetails: {
+          update: ssoDetails,
+        },
+      }),
+    };
+
+    if (image?.size && image?.size > 0) {
+      if (image.size > DEFAULT_MAX_IMAGE_UPLOAD_SIZE) {
+        throw new ShelfError({
+          cause: null,
+          message: `Image size exceeds maximum allowed size of ${
+            DEFAULT_MAX_IMAGE_UPLOAD_SIZE / (1024 * 1024)
+          }MB`,
+          additionalData: { id, userId, field: "image" },
+          label,
+          shouldBeCaptured: false,
+          status: 400,
+        });
+      }
+
+      const blob = Buffer.from(await image.arrayBuffer());
+
+      const imageData = {
+        blob,
+        // Derived from the bytes, never from the caller's `File.type`: this
+        // row is served back inline by `api+/image.$imageId`, so the stored
+        // content type decides how a browser renders it.
+        contentType: assertUploadedImageContentType(blob, {
+          userId,
+          organizationId: id,
+          field: "image",
+        }),
+        ownerOrg: {
+          connect: {
+            id: id,
+          },
+        },
+        user: {
+          connect: {
+            id: userId,
+          },
+        },
+      };
+
+      Object.assign(data, {
+        image: {
+          upsert: {
+            create: imageData,
+            update: imageData,
+          },
+        },
+      });
+    }
+
+    // Wrap the previous-value read + update + activity event in one transaction
+    // per `.claude/rules/use-record-event.md` and
+    // `.claude/rules/record-event-payload-shapes.md`. Reading the previous
+    // value OUTSIDE the tx would leave a race window: a concurrent write
+    // between the read and the update would produce a stale `fromValue` in
+    // the audit event (and could emit a redundant event for a no-op).
+    // The atomic wrap means the read sees what the update will overwrite.
+    const updated = await db.$transaction(async (tx) => {
+      const previousQrIdDisplayPreference =
+        qrIdDisplayPreference !== undefined
+          ? (
+              await tx.organization.findUnique({
+                where: { id },
+                select: { qrIdDisplayPreference: true },
+              })
+            )?.qrIdDisplayPreference ?? null
+          : null;
+
+      const next = await tx.organization.update({
+        where: { id },
+        data: data,
+      });
+
+      if (
+        qrIdDisplayPreference !== undefined &&
+        qrIdDisplayPreference !== previousQrIdDisplayPreference
+      ) {
+        await recordEvent(
+          {
+            organizationId: id,
+            actorUserId: userId,
+            action: "ORGANIZATION_QR_ID_DISPLAY_PREFERENCE_CHANGED",
+            entityType: "ORGANIZATION",
+            entityId: id,
+            field: "qrIdDisplayPreference",
+            fromValue: previousQrIdDisplayPreference,
+            toValue: qrIdDisplayPreference,
+          },
+          tx
+        );
+      }
+
+      return next;
+    });
+
+    return updated;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: isLikeShelfError(cause)
+        ? cause.message
+        : "Something went wrong while updating the organization. Please try again or contact support.",
+      additionalData: { id, userId, name },
+      label,
+    });
+  }
+}
+
+const ORGANIZATION_SELECT_FIELDS = {
+  id: true,
+  type: true,
+  name: true,
+  imageId: true,
+  userId: true,
+  updatedAt: true,
+  currency: true,
+  enabledSso: true,
+  owner: {
+    select: {
+      id: true,
+      email: true,
+    },
+  },
+  ssoDetails: true,
+  workspaceDisabled: true,
+  selfServiceCanSeeCustody: true,
+  selfServiceCanSeeBookings: true,
+  baseUserCanSeeCustody: true,
+  baseUserCanSeeBookings: true,
+  barcodesEnabled: true,
+  usedBarcodeTrial: true,
+  auditsEnabled: true,
+  usedAuditTrial: true,
+  hasSequentialIdsMigrated: true,
+  qrIdDisplayPreference: true,
+  showShelfBranding: true,
+  showQrCodesOnPdfs: true,
+  customEmailFooter: true,
+};
+
+export type OrganizationFromUser = Prisma.OrganizationGetPayload<{
+  select: typeof ORGANIZATION_SELECT_FIELDS;
+}>;
+
+/**
+ * Whether a user signs in through SSO.
+ *
+ * Each membership carries its user's flag, so an already-fetched membership list
+ * answers without another query. A user with no memberships at all has nothing
+ * to read it from, and that is precisely the SSO user who belongs on the
+ * pending-assignment page — so the user row answers instead of defaulting to
+ * "not SSO".
+ *
+ * @param userId - The user in question
+ * @param userOrganizations - Their memberships, as `getUserOrganizations` returns them
+ * @returns `true` when the user is an SSO user
+ */
+export async function isSsoUser({
+  userId,
+  userOrganizations,
+}: {
+  userId: string;
+  userOrganizations: Array<{ user: { sso: boolean } }>;
+}): Promise<boolean> {
+  if (userOrganizations.length > 0) {
+    return userOrganizations[0].user.sso === true;
+  }
+
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: { sso: true },
+  });
+  return user?.sso === true;
+}
+
+export async function getUserOrganizations({ userId }: { userId: string }) {
+  try {
+    return await db.userOrganization.findMany({
+      where: { userId },
+      select: {
+        organizationId: true,
+        roles: true,
+        organization: {
+          select: ORGANIZATION_SELECT_FIELDS,
+        },
+        user: {
+          select: { lastSelectedOrganizationId: true, sso: true },
+        },
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while fetching user organizations. Please try again or contact support.",
+      additionalData: { userId },
+      label,
+    });
+  }
+}
+
+/** A workspace-wide notification audience, named after its policy field. */
+export type NotificationAudience = "orgBookingBroadcasts" | "inventoryAlerts";
+
+/**
+ * The users of an organization who receive one kind of workspace-wide
+ * notification, with the fields a notification needs: `id` (so the resolver
+ * can exclude the editor), `email`, the name fields, and the four raw
+ * format-preference columns so each email resolves its recipient's own date
+ * and time formatting from the loaded row.
+ *
+ * The roles come from the policy table (`notifications.<audience>`), so a role
+ * that should hear about bookings but not about stock is one field away.
+ *
+ * @param args.organizationId - The organization
+ * @param args.audience - `orgBookingBroadcasts` (new-reservation "pickup"
+ *   alerts) or `inventoryAlerts` (low stock)
+ * @returns The audience's users
+ * @throws {ShelfError} when the query fails
+ */
+export async function getOrganizationNotificationAudience({
+  organizationId,
+  audience,
+}: {
+  organizationId: string;
+  audience: NotificationAudience;
+}) {
+  try {
+    const members = await db.userOrganization.findMany({
+      where: {
+        organizationId,
+        roles: { hasSome: rolesWhere((p) => p.notifications[audience]) },
+      },
+      select: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            ...USER_NAME_SELECT,
+            // Format-preference columns so the notification resolver can carry
+            // them onto each recipient and resolve recipient-specific email
+            // date/time formatting from the loaded row (no per-recipient DB
+            // fetch). See `NotificationRecipient`.
+            dateFormat: true,
+            timeFormat: true,
+            weekStart: true,
+            timeZone: true,
+          },
+        },
+      },
+    });
+
+    return members.map((m) => m.user);
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while fetching who to notify. Please try again or contact support.",
+      additionalData: { organizationId, audience },
+      label,
+    });
+  }
+}
+
+export async function toggleOrganizationSso({
+  organizationId,
+  enabledSso,
+}: {
+  organizationId: string;
+  enabledSso: boolean;
+}) {
+  try {
+    return await db.organization.update({
+      where: { id: organizationId, type: OrganizationType.TEAM },
+      data: {
+        enabledSso,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while toggling organization SSO. Please try again or contact support.",
+      additionalData: { organizationId, enabledSso },
+      label,
+    });
+  }
+}
+
+export async function toggleWorkspaceDisabled({
+  organizationId,
+  workspaceDisabled,
+}: {
+  organizationId: string;
+  workspaceDisabled: boolean;
+}) {
+  try {
+    return await db.organization.update({
+      where: { id: organizationId, type: OrganizationType.TEAM },
+      data: {
+        workspaceDisabled,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while toggling workspace disabled. Please try again or contact support.",
+      additionalData: { organizationId, workspaceDisabled },
+      label,
+    });
+  }
+}
+
+export async function toggleBarcodeEnabled({
+  organizationId,
+  barcodesEnabled,
+}: {
+  organizationId: string;
+  barcodesEnabled: boolean;
+}) {
+  try {
+    return await db.organization.update({
+      where: { id: organizationId },
+      data: {
+        barcodesEnabled,
+        barcodesEnabledAt: barcodesEnabled ? new Date() : null,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while toggling barcode functionality. Please try again or contact support.",
+      additionalData: { organizationId, barcodesEnabled },
+      label,
+    });
+  }
+}
+
+export async function toggleAuditEnabled({
+  organizationId,
+  auditsEnabled,
+}: {
+  organizationId: string;
+  auditsEnabled: boolean;
+}) {
+  try {
+    return await db.organization.update({
+      where: { id: organizationId },
+      data: {
+        auditsEnabled,
+        auditsEnabledAt: auditsEnabled ? new Date() : null,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while toggling audit functionality. Please try again or contact support.",
+      additionalData: { organizationId, auditsEnabled },
+      label,
+    });
+  }
+}
+
+/**
+ * Sets the "Require SSO login" switch (`SsoDetails.requireSsoLogin`) on a
+ * workspace's SSO setup. While every workspace linked to an SSO domain has it
+ * off, unconverted accounts on the domain keep password, email code and
+ * password reset sign-in (see `~/modules/auth/sso-enforcement.server`).
+ * Staff-only: callers must already have checked the admin role.
+ *
+ * The switch lives on the `SsoDetails` row, which several workspaces can
+ * share, so it changes for every workspace on that row.
+ *
+ * @param args.organizationId - the workspace whose SSO setup is changed
+ * @param args.requireSsoLogin - `true` to refuse legacy sign-in, `false` to
+ *   allow it while SSO is being set up and tested
+ * @param args.actorUserId - the staff member making the change, logged so a
+ *   relaxed domain can be traced to who relaxed it
+ * @returns the updated `SsoDetails` row
+ * @throws {ShelfError} 400 when the workspace has no SSO details; 500 when the
+ *   lookup or the update fails
+ */
+export async function setRequireSsoLogin({
+  organizationId,
+  requireSsoLogin,
+  actorUserId,
+}: {
+  organizationId: string;
+  requireSsoLogin: boolean;
+  actorUserId: string;
+}) {
+  try {
+    const organization = await db.organization.findUnique({
+      where: { id: organizationId },
+      select: { ssoDetailsId: true },
+    });
+
+    if (!organization?.ssoDetailsId) {
+      throw new ShelfError({
+        cause: null,
+        title: "No SSO details",
+        message:
+          "This workspace has no SSO details yet. Save the SSO details first.",
+        additionalData: { organizationId, requireSsoLogin },
+        label,
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const updated = await db.ssoDetails.update({
+      where: { id: organization.ssoDetailsId },
+      data: { requireSsoLogin },
+    });
+
+    Logger.info(
+      `SSO: Require SSO login set to ${requireSsoLogin} on SSO details ${organization.ssoDetailsId} (workspace ${organizationId}) by ${actorUserId}`
+    );
+
+    return updated;
+  } catch (cause) {
+    rethrowIfClientError(cause);
+
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while changing the Require SSO login setting. Please try again or contact support.",
+      additionalData: { organizationId, requireSsoLogin },
+      label,
+    });
+  }
+}
+
+/** Permissions functions */
+
+/**
+ * Gets the permissions columns in the organization table
+ * Columns:
+ * - selfServiceCanSeeCustody
+ * - selfServiceCanSeeBookings
+ * - baseUserCanSeeCustody
+ * - baseUserCanSeeBookings
+ */
+export function getOrganizationPermissionColumns(id: string) {
+  return db.organization.findUnique({
+    where: { id },
+    select: {
+      selfServiceCanSeeCustody: true,
+      selfServiceCanSeeBookings: true,
+      baseUserCanSeeCustody: true,
+      baseUserCanSeeBookings: true,
+    },
+  });
+}
+
+/**
+ * Updates the permissions columns in the organization table
+ * Updated columns:
+ * - selfServiceCanSeeCustody
+ * - selfServiceCanSeeBookings
+ * - baseUserCanSeeCustody
+ * - baseUserCanSeeBookings
+ */
+export function updateOrganizationPermissions({
+  id,
+  configuration,
+}: {
+  id: string;
+  configuration: Pick<
+    Organization,
+    | "selfServiceCanSeeCustody"
+    | "selfServiceCanSeeBookings"
+    | "baseUserCanSeeCustody"
+    | "baseUserCanSeeBookings"
+  >;
+}) {
+  return db.organization.update({
+    where: { id },
+    data: {
+      ...configuration,
+    },
+  });
+}
+
+/**
+ * Members who may be chosen as the new owner in an ownership transfer
+ * (`membership.eligibleAsNewOwner`). `transferOwnership` re-checks the same
+ * policy, so the candidate list and the transfer cannot disagree.
+ *
+ * @param args.organizationId - The workspace being transferred
+ * @returns The eligible members' users
+ * @throws {ShelfError} If the query fails
+ */
+export async function getOrganizationAdmins({
+  organizationId,
+}: {
+  organizationId: Organization["id"];
+}) {
+  try {
+    const admins = await db.userOrganization.findMany({
+      where: {
+        organizationId,
+        roles: {
+          hasSome: rolesWhere((p) => p.membership.eligibleAsNewOwner),
+        },
+      },
+      select: {
+        user: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            displayName: true,
+            email: true,
+          },
+        },
+      },
+    });
+
+    return admins.map((a) => a.user);
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while fetching organization admins.",
+      label,
+    });
+  }
+}
+
+export async function transferOwnership({
+  currentOrganization,
+  newOwnerId,
+  userId,
+  transferSubscription = false,
+}: {
+  currentOrganization: Pick<Organization, "id" | "name" | "type">;
+  newOwnerId: User["id"];
+  userId: User["id"];
+  /** Whether to transfer the owner's subscription to the new owner */
+  transferSubscription?: boolean;
+}) {
+  try {
+    if (currentOrganization.type === OrganizationType.PERSONAL) {
+      throw new ShelfError({
+        cause: null,
+        message: "Personal workspaces cannot be transferred.",
+        label,
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const user = await db.user
+      .findUniqueOrThrow({
+        where: { id: userId },
+        select: { id: true, roles: true },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message: "Something went wrong while fetching current user.",
+          label,
+        });
+      });
+
+    const isCurrentUserShelfAdmin = user.roles.some(
+      (role) => role.name === Roles.ADMIN
+    );
+
+    /**
+     * To transfer ownership, we need to:
+     * 1. Update the owner of the organization
+     * 2. Update the role of both users in the current organization
+     * 3. Optionally transfer the subscription
+     */
+    const userOrganization = await db.userOrganization.findMany({
+      where: {
+        organizationId: currentOrganization.id,
+        OR: [
+          { userId: newOwnerId },
+          {
+            roles: {
+              hasSome: rolesWhere((p) => p.membership.ownsWorkspace),
+            },
+          },
+        ],
+      },
+      select: {
+        id: true,
+        user: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            displayName: true,
+            email: true,
+            roles: true,
+            customerId: true,
+            tierId: true,
+            usedFreeTrial: true,
+          },
+        },
+        roles: true,
+      },
+    });
+
+    /**
+     * The organization's CURRENT owner — i.e. the user losing ownership.
+     *
+     * This is deliberately NOT the requesting user: it is the record that gets
+     * demoted to ADMIN below, whose subscription is optionally transferred, and
+     * who receives the "you are no longer the owner" email. A Shelf platform
+     * admin can drive this flow without being a member of the organization at
+     * all, so the two identities must stay separate.
+     */
+    const currentOwnerUserOrg = userOrganization.find((userOrg) =>
+      isWorkspaceOwner(userOrg.roles)
+    );
+    if (!currentOwnerUserOrg) {
+      throw new ShelfError({
+        cause: null,
+        message: "Organization does not have an owner.",
+        label,
+      });
+    }
+
+    /**
+     * Validate that the REQUESTING user may transfer ownership: either they are
+     * the current owner, or they are a Shelf platform admin.
+     *
+     * Comparing identities is the entire check. A workspace ADMIN passes
+     * `requirePermission` on the settings route because ADMIN and OWNER share
+     * every permission, so this is the only place the two are distinguished —
+     * previously this compared the owner's role against itself, which is always
+     * true, and let any ADMIN take over the workspace.
+     */
+    if (currentOwnerUserOrg.user.id !== userId && !isCurrentUserShelfAdmin) {
+      throw new ShelfError({
+        cause: null,
+        message: "Current user is not the owner of the organization.",
+        label,
+        status: 403,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const newOwnerUserOrg = userOrganization.find(
+      (userOrg) => userOrg.user.id === newOwnerId
+    );
+    if (!newOwnerUserOrg) {
+      throw new ShelfError({
+        cause: null,
+        message: "New owner is not a member of the organization.",
+        label,
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    /** The new owner must hold a role eligible to own the workspace */
+    if (
+      !holdsRoleWhere(
+        newOwnerUserOrg.roles,
+        (p) => p.membership.eligibleAsNewOwner
+      )
+    ) {
+      throw new ShelfError({
+        cause: null,
+        message: "New owner is not an admin of the organization.",
+        label,
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    // Check if new owner already has an active subscription (BLOCK transfer)
+    // This applies regardless of whether subscription transfer is requested,
+    // as we don't want two owners with separate active subscriptions
+    if (premiumIsEnabled) {
+      const newOwnerActiveSubscription =
+        await getUserActiveSubscription(newOwnerId);
+      if (newOwnerActiveSubscription) {
+        throw new ShelfError({
+          cause: null,
+          message:
+            "Cannot transfer ownership to a user who already has an active subscription.",
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+        });
+      }
+    }
+
+    // Track subscription transfer info for emails
+    let subscriptionTransferred = false;
+    const currentOwnerTierId: TierId = currentOwnerUserOrg.user.tierId;
+
+    await db.$transaction(async (tx) => {
+      /**
+       * The checks above read both memberships before this transaction, so a
+       * concurrent role change could have committed since: a demotion of the
+       * new owner, or the current owner's role moving. Lock both memberships
+       * (the same lock every role-changing path takes first) in `userId`
+       * order, so two transfers between the same pair cannot deadlock, then
+       * decide again from the locked rows before writing either role.
+       */
+      const [firstUserId, secondUserId] = [
+        currentOwnerUserOrg.user.id,
+        newOwnerUserOrg.user.id,
+      ].sort();
+      const lockedRoles = new Map([
+        [
+          firstUserId,
+          await lockMembership(tx, {
+            userId: firstUserId,
+            organizationId: currentOrganization.id,
+          }),
+        ],
+        [
+          secondUserId,
+          await lockMembership(tx, {
+            userId: secondUserId,
+            organizationId: currentOrganization.id,
+          }),
+        ],
+      ]);
+      const lockedOwner = lockedRoles.get(currentOwnerUserOrg.user.id);
+      const lockedNewOwner = lockedRoles.get(newOwnerUserOrg.user.id);
+
+      if (!lockedOwner || !isWorkspaceOwner(lockedOwner.roles)) {
+        throw new ShelfError({
+          cause: null,
+          title: "Ownership changed",
+          message:
+            "The workspace owner changed while this transfer was being made. Please reload and try again.",
+          additionalData: { organizationId: currentOrganization.id },
+          label,
+          status: 409,
+          shouldBeCaptured: false,
+        });
+      }
+
+      if (
+        !lockedNewOwner ||
+        !holdsRoleWhere(
+          lockedNewOwner.roles,
+          (p) => p.membership.eligibleAsNewOwner
+        )
+      ) {
+        throw new ShelfError({
+          cause: null,
+          message: "New owner is not an admin of the organization.",
+          additionalData: {
+            organizationId: currentOrganization.id,
+            newOwnerId,
+          },
+          label,
+          status: 400,
+          shouldBeCaptured: false,
+        });
+      }
+
+      /** Update the owner of the organization */
+      await tx.organization.update({
+        where: { id: currentOrganization.id },
+        data: {
+          owner: { connect: { id: newOwnerUserOrg.user.id } },
+        },
+      });
+
+      /** Update the role of current owner to ADMIN */
+      await tx.userOrganization.update({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: currentOwnerUserOrg comes from the `userOrganization` findMany above scoped by `organizationId: currentOrganization.id` (lines 758-765), so this id is already org-proven
+        where: { id: currentOwnerUserOrg.id },
+        data: { roles: { set: [OrganizationRoles.ADMIN] } },
+      });
+
+      /** Update the role of new owner to OWNER */
+      await tx.userOrganization.update({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: newOwnerUserOrg comes from the `userOrganization` findMany above scoped by `organizationId: currentOrganization.id` (lines 758-765), so this id is already org-proven
+        where: { id: newOwnerUserOrg.id },
+        data: { roles: { set: [OrganizationRoles.OWNER] } },
+      });
+
+      /**
+       * A free trial belongs to the person, not to the workspace: once the
+       * outgoing owner has spent theirs, whoever receives the workspace does
+       * not get a second one on the same equipment.
+       *
+       * This runs for EVERY transfer, including the ones that carry no
+       * subscription. A workspace whose plan has already ended or been
+       * cancelled has nothing left to hand over, yet it still arrives full of
+       * assets the new owner would otherwise trial on. It rides in the
+       * ownership transaction so the workspace and the spent trial can never
+       * come apart.
+       *
+       * The flag is written whether or not billing is switched on, so the
+       * record of who has already had their trial stays true on any instance.
+       */
+      if (
+        currentOwnerUserOrg.user.usedFreeTrial &&
+        !newOwnerUserOrg.user.usedFreeTrial
+      ) {
+        await tx.user.update({
+          where: { id: newOwnerId },
+          data: { usedFreeTrial: true },
+          select: { id: true },
+        });
+      }
+    });
+
+    // Handle subscription transfer AFTER the ownership transfer succeeds
+    // Wrapped in try/catch to ensure ownership transfer completes even if subscription transfer fails
+    let subscriptionTransferError: Error | null = null;
+    if (premiumIsEnabled && transferSubscription) {
+      try {
+        const activeSubscriptions = await getUserActiveSubscriptions(
+          currentOwnerUserOrg.user.id
+        );
+
+        // Filter to subscriptions relevant to this workspace:
+        // - Tier subscriptions (always relevant)
+        // - Addon subscriptions linked to THIS workspace
+        const relevantSubscriptions = filterRelevantSubscriptions(
+          activeSubscriptions,
+          currentOrganization.id
+        );
+
+        if (relevantSubscriptions.length > 0) {
+          // Ensure new owner has a Stripe customer ID (only once)
+          let newOwnerCustomerId: string | null | undefined =
+            newOwnerUserOrg.user.customerId;
+          if (!newOwnerCustomerId) {
+            newOwnerCustomerId = await createStripeCustomer({
+              email: newOwnerUserOrg.user.email,
+              name: resolveUserDisplayName(newOwnerUserOrg.user),
+              userId: newOwnerId,
+            });
+          }
+
+          if (newOwnerCustomerId) {
+            // Transfer each relevant subscription
+            for (const sub of relevantSubscriptions) {
+              await transferSubscriptionToCustomer({
+                subscriptionId: sub.id,
+                newCustomerId: newOwnerCustomerId,
+              });
+            }
+
+            // Update tier if a tier subscription was transferred
+            const hasTierSubscription = relevantSubscriptions.some((sub) =>
+              isTierSubscription(sub)
+            );
+            if (hasTierSubscription) {
+              await updateUserTierId(newOwnerId, currentOwnerTierId);
+              await updateUserTierId(currentOwnerUserOrg.user.id, "free");
+            }
+
+            subscriptionTransferred = true;
+
+            // Check if new owner has a payment method on their Stripe customer
+            // If not, set the warning flag so they see the banner
+            const hasPaymentMethod =
+              await customerHasPaymentMethod(newOwnerCustomerId);
+            if (!hasPaymentMethod) {
+              await db.user.update({
+                where: { id: newOwnerId },
+                data: { warnForNoPaymentMethod: true },
+                select: { id: true },
+              });
+            }
+          }
+        }
+      } catch (error) {
+        // Capture the error but don't throw - ownership transfer should still succeed
+        subscriptionTransferError = error as Error;
+      }
+    }
+
+    /** Send email to new owner */
+    sendEmail({
+      subject: `🎉 You're now the Owner of ${currentOrganization.name} - Shelf`,
+      to: newOwnerUserOrg.user.email,
+      text: newOwnerEmailText({
+        newOwnerName: resolveUserDisplayName(newOwnerUserOrg.user),
+        workspaceName: currentOrganization.name,
+        subscriptionTransferred,
+      }),
+    });
+
+    /** Send email to previous owner */
+    sendEmail({
+      subject: `🔁 You've Transferred Ownership of ${currentOrganization.name}`,
+      to: currentOwnerUserOrg.user.email,
+      text: previousOwnerEmailText({
+        previousOwnerName: resolveUserDisplayName(currentOwnerUserOrg.user),
+        newOwnerName: resolveUserDisplayName(newOwnerUserOrg.user),
+        workspaceName: currentOrganization.name,
+        subscriptionTransferred,
+      }),
+    });
+
+    /** Send admin notification */
+    if (ADMIN_EMAIL) {
+      const subscriptionStatus = subscriptionTransferError
+        ? `Failed - ${subscriptionTransferError.message}`
+        : subscriptionTransferred
+        ? "Yes"
+        : "No (not requested)";
+
+      sendEmail({
+        subject: subscriptionTransferError
+          ? `⚠️ Workspace transferred with errors: ${currentOrganization.name}`
+          : `Workspace transferred: ${currentOrganization.name}`,
+        to: ADMIN_EMAIL,
+        text: `A workspace ownership transfer has occurred.
+
+Workspace: ${currentOrganization.name}
+Workspace ID: ${currentOrganization.id}
+
+Previous Owner: ${resolveUserDisplayName(currentOwnerUserOrg.user)} (${
+          currentOwnerUserOrg.user.email
+        })
+New Owner: ${resolveUserDisplayName(newOwnerUserOrg.user)} (${
+          newOwnerUserOrg.user.email
+        })
+
+Subscription transferred: ${subscriptionStatus}
+${
+  subscriptionTransferError
+    ? `\nError details: ${
+        subscriptionTransferError.stack || subscriptionTransferError.message
+      }`
+    : ""
+}`,
+      });
+    }
+
+    return {
+      newOwner: newOwnerUserOrg.user,
+      subscriptionTransferred,
+      subscriptionTransferError: subscriptionTransferError?.message,
+    };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: isLikeShelfError(cause)
+        ? cause.message
+        : "Something went wrong while transferring ownership. Please try again or contact support.",
+      additionalData: { currentOrganization, newOwnerId },
+      label,
+    });
+  }
+}
+
+/**
+ * Resets showShelfBranding to true for all personal workspaces owned by a user.
+ * Called when Plus user downgrades to free tier.
+ *
+ * @param userId - The ID of the user whose personal workspaces should be reset
+ * @returns Promise resolving to the update result
+ */
+export async function resetPersonalWorkspaceBranding(userId: User["id"]) {
+  try {
+    return await db.organization.updateMany({
+      where: {
+        userId,
+        type: OrganizationType.PERSONAL,
+      },
+      data: {
+        showShelfBranding: true,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while resetting personal workspace branding.",
+      additionalData: { userId },
+      label,
+    });
+  }
+}
+
+/**
+ * Checks if a Stripe subscription is a tier subscription
+ * by looking at its line-item product metadata.
+ */
+function isTierSubscription(sub: Stripe.Subscription): boolean {
+  return sub.items.data.some((item) => {
+    const product = item.price?.product;
+    if (typeof product === "object" && product && "metadata" in product) {
+      return !!(product as Stripe.Product).metadata?.shelf_tier;
+    }
+    return false;
+  });
+}
+
+/**
+ * Checks if a Stripe subscription is an addon linked to a specific workspace.
+ */
+function isAddonForOrganization(
+  sub: Stripe.Subscription,
+  organizationId: string
+): boolean {
+  const subOrgId = sub.metadata?.organizationId;
+  if (subOrgId !== organizationId) return false;
+
+  return sub.items.data.some((item) => {
+    const product = item.price?.product;
+    if (typeof product === "object" && product && "metadata" in product) {
+      return (product as Stripe.Product).metadata?.product_type === "addon";
+    }
+    return false;
+  });
+}
+
+/**
+ * Filters subscriptions to those relevant to a workspace transfer:
+ * - Tier subscriptions (always relevant)
+ * - Addon subscriptions linked to the specific workspace
+ */
+function filterRelevantSubscriptions(
+  subscriptions: Stripe.Subscription[],
+  organizationId: string
+): Stripe.Subscription[] {
+  return subscriptions.filter(
+    (sub) =>
+      isTierSubscription(sub) || isAddonForOrganization(sub, organizationId)
+  );
+}

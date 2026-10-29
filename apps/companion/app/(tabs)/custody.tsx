@@ -1,0 +1,533 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  View,
+  Text,
+  FlatList,
+  TextInput,
+  TouchableOpacity,
+  ActivityIndicator,
+  RefreshControl,
+} from "react-native";
+import * as Haptics from "expo-haptics";
+import { Image } from "expo-image";
+import { pushIntoTab } from "@/lib/navigation";
+import { useFocusEffect } from "@react-navigation/native";
+import { Ionicons } from "@expo/vector-icons";
+import { api, type AssetListItem } from "@/lib/api";
+import { useOrg } from "@/lib/org-context";
+import {
+  formatStatus,
+  fontSize,
+  spacing,
+  borderRadius,
+  hitSlop,
+} from "@/lib/constants";
+import { useTheme } from "@/lib/theme-context";
+import { createStyles } from "@/lib/create-styles";
+import { ErrorBoundary } from "@/components/error-boundary";
+import { AssetListSkeleton } from "@/components/skeleton-loader";
+import { announce } from "@/lib/a11y";
+import { createLatestRequest } from "@/lib/latest-request";
+
+const custodyKeyExtractor = (item: AssetListItem) => item.id;
+
+const PAGE_SIZE = 20;
+
+export default function MyCustodyScreen() {
+  return (
+    <ErrorBoundary screenName="My Custody">
+      <MyCustodyContent />
+    </ErrorBoundary>
+  );
+}
+
+function MyCustodyContent() {
+  const { currentOrg, isLoading: orgLoading, error: orgError } = useOrg();
+  const { colors, statusBadge } = useTheme();
+  const styles = useStyles();
+  const [assets, setAssets] = useState<AssetListItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [searchInput, setSearchInput] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [totalPages, setTotalPages] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
+  const nextPage = useRef(1);
+  const latestRequest = useRef(createLatestRequest()).current;
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(searchInput.trim()), 400);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
+  const fetchAssets = useCallback(
+    async (pageNum: number, reset: boolean, signal: AbortSignal) => {
+      if (!currentOrg) return;
+      const { data, error: fetchErr } = await api.assets(
+        currentOrg.id,
+        {
+          search: debouncedSearch || undefined,
+          page: pageNum,
+          perPage: PAGE_SIZE,
+          myCustody: true,
+        },
+        { signal }
+      );
+      // Refused two ways. An abort answers with neither data nor error, and a
+      // response that landed before the abort but after this request was
+      // superseded still carries rows for a query the operator has moved past.
+      if (signal.aborted || (!data && !fetchErr)) return;
+      if (fetchErr || !data) {
+        setError(fetchErr || "Failed to load custody items");
+        return;
+      }
+      setError(null);
+      setTotalPages(data.totalPages);
+      setTotalCount(data.totalCount);
+      nextPage.current = pageNum + 1;
+      if (reset) setAssets(data.assets);
+      else setAssets((prev) => [...prev, ...data.assets]);
+    },
+    [currentOrg, debouncedSearch]
+  );
+
+  // Refresh on search change (including clearing search)
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    if (!currentOrg) return;
+    setIsLoading(true);
+    nextPage.current = 1;
+    const signal = latestRequest.beginReset();
+    fetchAssets(1, true, signal).finally(() => {
+      latestRequest.endReset(signal);
+      // The signal identifies this request. An abandoned one must not stamp
+      // freshness or clear the spinner: the request that replaced it is still
+      // running and will do both when it answers.
+      if (signal.aborted) return;
+      setIsLoading(false);
+    });
+    // why: debounced search drives this effect; fetchAssets and currentOrg captured stably
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch]);
+
+  // Refresh on tab focus — skip if data is fresh (< 60s old)
+  const hasFetchedCustody = useRef(false);
+  const lastFetchedAt = useRef(0);
+
+  // Reset cache when org changes so useFocusEffect refetches
+  useEffect(() => {
+    // An answer about the workspace being left must not land afterwards and
+    // refill the list with another workspace's custody items.
+    latestRequest.cancel();
+    lastFetchedAt.current = 0;
+    hasFetchedCustody.current = false;
+    setAssets([]);
+    setError(null);
+    nextPage.current = 1;
+  }, [currentOrg?.id, latestRequest]);
+  useFocusEffect(
+    useCallback(() => {
+      if (!currentOrg) return;
+      if (
+        hasFetchedCustody.current &&
+        Date.now() - lastFetchedAt.current < 60_000
+      )
+        return;
+      if (!hasFetchedCustody.current) {
+        setIsLoading(true);
+      }
+      nextPage.current = 1;
+      const signal = latestRequest.beginReset();
+      fetchAssets(1, true, signal).finally(() => {
+        latestRequest.endReset(signal);
+        // The signal identifies this request. An abandoned one must not stamp
+        // freshness or clear the spinner: the request that replaced it is still
+        // running and will do both when it answers.
+        if (signal.aborted) return;
+        setIsLoading(false);
+        lastFetchedAt.current = Date.now();
+        hasFetchedCustody.current = true;
+      });
+      // why: depend on org id (not full object) to avoid re-runs on identity-only changes
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentOrg?.id, fetchAssets, latestRequest])
+  );
+
+  const onRefresh = async () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setIsRefreshing(true);
+    nextPage.current = 1;
+    const signal = latestRequest.beginReset();
+    await fetchAssets(1, true, signal);
+    latestRequest.endReset(signal);
+    // The operator pulled this spinner, so it stops either way.
+    setIsRefreshing(false);
+    // The shared skeleton belongs to whichever request is still current. A
+    // newer one is mid-flight and will clear it when it answers; clearing it
+    // here would show the empty state until then. Nothing supersedes the
+    // newest request, so it is always the one that gets here unaborted.
+    if (!signal.aborted) {
+      setIsLoading(false);
+      announce("Content refreshed");
+    }
+  };
+
+  const onEndReached = async () => {
+    if (isLoadingMore || nextPage.current > totalPages) return;
+    // The rows on screen are about to be replaced, so there is nothing
+    // meaningful to add a page to. Claiming the slot here would also abandon
+    // that reset and leave both queries' rows on screen together.
+    if (latestRequest.isResetPending()) return;
+    setIsLoadingMore(true);
+    const signal = latestRequest.begin();
+    await fetchAssets(nextPage.current, false, signal);
+    setIsLoadingMore(false);
+    if (!signal.aborted) setIsLoading(false);
+  };
+
+  const renderAsset = useCallback(
+    ({ item }: { item: AssetListItem }) => {
+      const badge = statusBadge[item.status] ?? {
+        bg: colors.backgroundTertiary,
+        text: colors.muted,
+      };
+
+      return (
+        <TouchableOpacity
+          style={styles.assetCard}
+          onPress={() =>
+            pushIntoTab("/(tabs)/assets", `/(tabs)/assets/${item.id}`)
+          }
+          activeOpacity={0.6}
+          accessibilityLabel={`${item.title}, ${formatStatus(item.status)}${
+            item.category ? `, ${item.category.name}` : ""
+          }${item.location ? `, ${item.location.name}` : ""}`}
+          accessibilityRole="button"
+        >
+          {item.thumbnailImage || item.mainImage ? (
+            <Image
+              source={{ uri: item.thumbnailImage || item.mainImage! }}
+              style={styles.assetImage}
+              contentFit="cover"
+            />
+          ) : (
+            <View style={[styles.assetImage, styles.assetImagePlaceholder]}>
+              <Ionicons name="cube-outline" size={22} color={colors.gray300} />
+            </View>
+          )}
+
+          <View style={styles.assetInfo}>
+            <Text style={styles.assetTitle} numberOfLines={1}>
+              {item.title}
+            </Text>
+            <View style={styles.assetMeta}>
+              {item.category && (
+                <Text style={styles.assetCategory} numberOfLines={1}>
+                  {item.category.name}
+                </Text>
+              )}
+              {item.location && (
+                <View style={styles.locationRow}>
+                  <Ionicons
+                    name="location-outline"
+                    size={11}
+                    color={colors.mutedLight}
+                  />
+                  <Text style={styles.assetLocation} numberOfLines={1}>
+                    {item.location.name}
+                  </Text>
+                </View>
+              )}
+            </View>
+          </View>
+
+          <View style={[styles.statusBadge, { backgroundColor: badge.bg }]}>
+            <View style={[styles.statusDot, { backgroundColor: badge.text }]} />
+            <Text style={[styles.statusText, { color: badge.text }]}>
+              {formatStatus(item.status)}
+            </Text>
+          </View>
+        </TouchableOpacity>
+      );
+    },
+    [colors, statusBadge, styles]
+  );
+
+  if (orgLoading) {
+    return (
+      <View style={styles.centered}>
+        <ActivityIndicator size="large" color={colors.muted} />
+      </View>
+    );
+  }
+
+  if (orgError) {
+    return (
+      <View style={styles.centered}>
+        <Ionicons
+          name="cloud-offline-outline"
+          size={48}
+          color={colors.mutedLight}
+        />
+        <Text style={styles.emptyText}>{orgError}</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      {/* Header info */}
+      <View style={styles.headerInfo}>
+        <Ionicons name="hand-left-outline" size={18} color={colors.inCustody} />
+        <Text style={styles.headerInfoText}>
+          {isLoading
+            ? "Loading..."
+            : `${totalCount} item${
+                totalCount !== 1 ? "s" : ""
+              } in your custody`}
+        </Text>
+      </View>
+
+      {/* Search bar */}
+      <View style={styles.searchContainer}>
+        <Ionicons name="search" size={16} color={colors.mutedLight} />
+        <TextInput
+          style={styles.searchInput}
+          value={searchInput}
+          onChangeText={setSearchInput}
+          placeholder="Search your items..."
+          placeholderTextColor={colors.placeholderText}
+          returnKeyType="search"
+          autoCorrect={false}
+          accessibilityLabel="Search custody items"
+        />
+        {searchInput.trim() !== debouncedSearch && searchInput.length > 0 && (
+          <ActivityIndicator size="small" color={colors.mutedLight} />
+        )}
+        {searchInput.length > 0 && (
+          <TouchableOpacity
+            onPress={() => setSearchInput("")}
+            hitSlop={hitSlop.md}
+            accessibilityLabel="Clear search"
+            accessibilityRole="button"
+          >
+            <Ionicons name="close-circle" size={16} color={colors.mutedLight} />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {error ? (
+        <View style={styles.centered}>
+          <Ionicons
+            name="alert-circle-outline"
+            size={48}
+            color={colors.error}
+          />
+          <Text style={styles.emptyText}>{error}</Text>
+          <TouchableOpacity
+            style={styles.retryButton}
+            onPress={onRefresh}
+            accessibilityLabel="Retry loading custody"
+            accessibilityRole="button"
+          >
+            <Text style={styles.retryText}>Retry</Text>
+          </TouchableOpacity>
+        </View>
+      ) : isLoading && assets.length === 0 ? (
+        <AssetListSkeleton />
+      ) : assets.length === 0 ? (
+        <View style={styles.centered}>
+          <Ionicons name="hand-left-outline" size={48} color={colors.border} />
+          <Text style={styles.emptyTitle}>No items in your custody</Text>
+          <Text style={styles.emptyText}>
+            {debouncedSearch
+              ? "No custody items match your search"
+              : "Assets assigned to you will appear here"}
+          </Text>
+        </View>
+      ) : (
+        <FlatList
+          data={assets}
+          renderItem={renderAsset}
+          keyExtractor={custodyKeyExtractor}
+          contentContainerStyle={styles.list}
+          keyboardDismissMode="on-drag"
+          removeClippedSubviews
+          maxToRenderPerBatch={10}
+          windowSize={5}
+          initialNumToRender={10}
+          refreshControl={
+            <RefreshControl
+              refreshing={isRefreshing}
+              onRefresh={onRefresh}
+              tintColor={colors.muted}
+              accessibilityLabel="Pull to refresh"
+            />
+          }
+          onEndReached={onEndReached}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={
+            isLoadingMore ? (
+              <ActivityIndicator style={styles.footer} color={colors.muted} />
+            ) : null
+          }
+        />
+      )}
+    </View>
+  );
+}
+
+const useStyles = createStyles((colors, shadows) => ({
+  container: {
+    flex: 1,
+    backgroundColor: colors.backgroundSecondary,
+  },
+  centered: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+
+  // Header info
+  headerInfo: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    gap: spacing.sm,
+  },
+  headerInfoText: {
+    fontSize: fontSize.base,
+    color: colors.muted,
+    fontWeight: "500",
+  },
+
+  // Search
+  searchContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.white,
+    marginHorizontal: spacing.lg,
+    marginTop: spacing.sm,
+    marginBottom: spacing.sm,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: borderRadius.sm,
+    borderWidth: 1,
+    borderColor: colors.gray300,
+    gap: spacing.sm,
+    ...shadows.sm,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: fontSize.lg,
+    color: colors.foreground,
+  },
+
+  // List
+  list: {
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.lg,
+  },
+  assetCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.white,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: spacing.md,
+  },
+  assetImage: {
+    width: 44,
+    height: 44,
+    borderRadius: borderRadius.sm,
+  },
+  assetImagePlaceholder: {
+    backgroundColor: colors.backgroundTertiary,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  assetInfo: {
+    flex: 1,
+    gap: 3,
+  },
+  assetTitle: {
+    fontSize: fontSize.base,
+    fontWeight: "600",
+    color: colors.foreground,
+  },
+  assetMeta: {
+    gap: 2,
+  },
+  assetCategory: {
+    fontSize: fontSize.sm,
+    color: colors.muted,
+  },
+  locationRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 2,
+  },
+  assetLocation: {
+    fontSize: fontSize.xs,
+    color: colors.mutedLight,
+  },
+
+  // Status badge
+  statusBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: borderRadius.pill,
+    gap: 4,
+  },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  statusText: {
+    fontSize: fontSize.xs,
+    fontWeight: "500",
+  },
+
+  // Empty / error states
+  emptyTitle: {
+    fontSize: fontSize.lg,
+    fontWeight: "600",
+    color: colors.foreground,
+    textAlign: "center",
+  },
+  emptyText: {
+    fontSize: fontSize.base,
+    color: colors.muted,
+    textAlign: "center",
+    paddingHorizontal: spacing.xxxl,
+  },
+  retryButton: {
+    backgroundColor: colors.primary,
+    paddingHorizontal: spacing.xxl,
+    paddingVertical: 10,
+    borderRadius: borderRadius.md,
+    marginTop: spacing.sm,
+  },
+  retryText: {
+    color: colors.primaryForeground,
+    fontWeight: "600",
+    fontSize: fontSize.base,
+  },
+  footer: {
+    paddingVertical: spacing.lg,
+  },
+}));

@@ -1,0 +1,544 @@
+import type {
+  Organization,
+  Prisma,
+  Tag,
+  TeamMember,
+  User,
+} from "@prisma/client";
+import { BookingStatus, TagUseFor } from "@prisma/client";
+import loadash from "lodash";
+import { db } from "~/database/db.server";
+import { bookingDraftVisibilityClause } from "~/modules/booking/draft-visibility";
+import {
+  assertBulkDeleteConfirmed,
+  assertDeleteConfirmedFor,
+} from "~/utils/delete-confirmation.server";
+import type { ErrorLabel } from "~/utils/error";
+import {
+  isNotFoundError,
+  ShelfError,
+  maybeUniqueConstraintViolation,
+  rethrowIfClientError,
+} from "~/utils/error";
+import { getRandomColor } from "~/utils/get-random-color";
+import { getCurrentSearchParams } from "~/utils/http.server";
+import { ALL_SELECTED_KEY } from "~/utils/list";
+import type { CreateAssetFromContentImportPayload } from "../asset/types";
+
+const label: ErrorLabel = "Tag";
+
+/**
+ * Builds the Prisma filter for a tag list.
+ *
+ * Shared deliberately between {@link getTags}, which renders the list, and
+ * {@link bulkDeleteTags}, which acts on a "select all" over that same list. Two
+ * separate builders is how the equivalent locations helper drifted out of sync
+ * with its list query — the list matched on name, description and address while
+ * "select all" matched on name only, so a bulk action silently missed rows the
+ * user could see. Keeping one function means the two cannot disagree.
+ *
+ * @param args - Organization scope plus the raw filter values from the list
+ * @returns A where-clause always scoped to the organization
+ */
+function buildTagsWhereInput({
+  organizationId,
+  search,
+  useFor,
+}: {
+  organizationId: Organization["id"];
+  search?: string | null;
+  useFor?: string | null;
+}): Prisma.TagWhereInput {
+  /** Default value of where. Takes the items belonging to current user */
+  const where: Prisma.TagWhereInput = { organizationId };
+
+  /** If the search string exists, add it to the where object */
+  if (search) {
+    where.name = {
+      contains: search,
+      mode: "insensitive",
+    };
+  }
+
+  if (useFor) {
+    where.useFor = { has: useFor as TagUseFor };
+  }
+
+  return where;
+}
+
+export async function getTags(params: {
+  organizationId: Organization["id"];
+  /** Page number. Starts at 1 */
+  page?: number;
+  /** Items to be loaded per page */
+  perPage?: number;
+  search?: string | null;
+  request: Request;
+  /** The viewer: the bookings count includes only their own drafts */
+  userId: User["id"];
+}) {
+  const {
+    organizationId,
+    page = 1,
+    perPage = 8,
+    search,
+    request,
+    userId,
+  } = params;
+
+  try {
+    const searchParams = getCurrentSearchParams(request);
+    const useFor = searchParams.get("useFor");
+
+    const skip = page > 1 ? (page - 1) * perPage : 0;
+    const take = perPage >= 1 ? perPage : 8; // min 1 and max 25 per page
+
+    const where = buildTagsWhereInput({ organizationId, search, useFor });
+
+    const [tags, totalTags] = await Promise.all([
+      /** Get the items */
+      db.tag.findMany({
+        skip,
+        take,
+        where,
+        orderBy: { updatedAt: "desc" },
+        include: {
+          /**
+           * What the tags list links each count to, counted the way those
+           * lists show by default: the asset index hides archived assets, the
+           * bookings index hides archived and cancelled bookings and other
+           * people's drafts.
+           */
+          _count: {
+            select: {
+              assets: { where: { archivedAt: null } },
+              bookings: {
+                where: {
+                  status: {
+                    notIn: [BookingStatus.ARCHIVED, BookingStatus.CANCELLED],
+                  },
+                  ...bookingDraftVisibilityClause(userId),
+                },
+              },
+            },
+          },
+        },
+      }),
+
+      /** Count them */
+      db.tag.count({ where }),
+    ]);
+
+    return { tags, totalTags };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while fetching the tags",
+      additionalData: { ...params },
+      label,
+    });
+  }
+}
+
+export async function createTag({
+  name,
+  description,
+  color,
+  userId,
+  organizationId,
+  useFor,
+}: Pick<Tag, "description" | "name" | "organizationId" | "color"> & {
+  userId: User["id"];
+  useFor: TagUseFor[];
+}) {
+  try {
+    return await db.tag.create({
+      data: {
+        name: loadash.trim(name),
+        description,
+        useFor,
+        color,
+        user: {
+          connect: {
+            id: userId,
+          },
+        },
+        organization: {
+          connect: {
+            id: organizationId,
+          },
+        },
+      },
+    });
+  } catch (cause) {
+    throw maybeUniqueConstraintViolation(cause, "Tag", {
+      additionalData: {
+        userId,
+        organizationId,
+      },
+    });
+  }
+}
+
+/** What carries a tag: everything a delete would change. */
+export type TagUsage = { assets: number; bookings: number };
+
+/**
+ * Reads a tag's name and what carries it, for the delete dialog and the delete
+ * action. Counted for the one tag being deleted, on demand, so the tags index
+ * never pays for it.
+ *
+ * @param params.id - The tag
+ * @param params.organizationId - The caller's organization
+ * @returns The name and usage counts, or null when the tag is not found
+ * @throws {ShelfError} If the lookup fails
+ */
+export async function getTagUsage({
+  id,
+  organizationId,
+}: Pick<Tag, "id"> & { organizationId: Organization["id"] }): Promise<{
+  name: string;
+  usage: TagUsage;
+} | null> {
+  try {
+    const tag = await db.tag.findFirst({
+      where: { id, organizationId },
+      select: {
+        name: true,
+        _count: { select: { assets: true, bookings: true } },
+      },
+    });
+
+    return tag ? { name: tag.name, usage: tag._count } : null;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while checking what uses the tag.",
+      additionalData: { id, organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * Refuses a single tag delete unless the user typed its name, when any asset
+ * or booking carries it. An unused tag deletes with one click, and one that is
+ * already gone passes so the delete itself reports it.
+ *
+ * @param params.id - The tag to delete
+ * @param params.organizationId - The caller's organization
+ * @param params.confirmation - What the user typed in the dialog
+ * @throws {ShelfError} 400 when the tag is in use and the confirmation does
+ *   not match
+ */
+export async function assertTagDeleteConfirmed({
+  id,
+  organizationId,
+  confirmation,
+}: Pick<Tag, "id"> & {
+  organizationId: Organization["id"];
+  confirmation: string | null | undefined;
+}) {
+  await assertDeleteConfirmedFor({
+    confirmation,
+    findName: async () => {
+      const found = await getTagUsage({ id, organizationId });
+      return found && Object.values(found.usage).some((n) => n > 0)
+        ? found.name
+        : null;
+    },
+    label,
+  });
+}
+
+export async function deleteTag({
+  id,
+  organizationId,
+}: Pick<Tag, "id"> & { organizationId: Organization["id"] }) {
+  try {
+    return await db.tag.deleteMany({
+      where: { id, organizationId },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while deleting the tag",
+      additionalData: { id, organizationId },
+      label,
+    });
+  }
+}
+
+export const buildTagsSet = (tags: string | undefined) =>
+  /** This checks if tags are passed and build the object needed to set tags to an asset  */
+  tags && tags !== ""
+    ? {
+        set: tags?.split(",").map((t) => ({ id: t })) || [],
+      }
+    : { set: [] };
+
+export async function createTagsIfNotExists({
+  data,
+  userId,
+  organizationId,
+}: {
+  data: CreateAssetFromContentImportPayload[];
+  userId: User["id"];
+  organizationId: Organization["id"];
+}): Promise<Record<string, TeamMember["id"]>> {
+  try {
+    const tags = data
+      .filter(({ tags }) => tags && tags.length > 0)
+      .reduce((acc: Record<string, string>, curr) => {
+        curr.tags!.forEach((tag) => tag !== "" && (acc[tag.trim()] = ""));
+        return acc;
+      }, {});
+    // Handle the case where there are no tags
+    if (!Object.keys(tags).length) {
+      return {};
+    }
+
+    // now we loop through the categories and check if they exist
+    for (const tag of Object.keys(tags)) {
+      const existingTag = await db.tag.findFirst({
+        where: {
+          name: { equals: tag, mode: "insensitive" },
+          organizationId,
+        },
+      });
+
+      if (!existingTag) {
+        // if the tag doesn't exist, we create a new one
+        const newTag = await db.tag.create({
+          data: {
+            name: tag as string,
+            color: getRandomColor(),
+            user: {
+              connect: {
+                id: userId,
+              },
+            },
+            organization: {
+              connect: {
+                id: organizationId,
+              },
+            },
+          },
+        });
+        tags[tag] = newTag.id;
+      } else {
+        // if the tag exists, we just update the id
+        tags[tag] = existingTag.id;
+      }
+    }
+
+    return tags;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while creating the tags. Seems like some of the tag data in your import file is invalid. Please check and try again.",
+      additionalData: { userId, organizationId },
+      label,
+      /** No need to capture those. They are mostly related to malformed CSV data */
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+export async function getTag({
+  id,
+  organizationId,
+}: Pick<Tag, "id" | "organizationId">) {
+  try {
+    return await db.tag.findUniqueOrThrow({
+      where: {
+        id,
+        organizationId,
+      },
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      title: "Tag not found",
+      message:
+        "The tag you are trying to access does not exist or you do not have permission to access it.",
+      additionalData: { id, organizationId },
+      label,
+      // Suppress only true Prisma not-found (P2025); let DB / connectivity
+      // failures bubble up to Sentry.
+      shouldBeCaptured: !isNotFoundError(cause),
+    });
+  }
+}
+
+export async function updateTag({
+  id,
+  organizationId,
+  name,
+  description,
+  color,
+  useFor,
+}: Pick<Tag, "id" | "organizationId" | "name" | "description" | "color"> & {
+  useFor?: TagUseFor[];
+}) {
+  try {
+    return await db.tag.update({
+      where: {
+        id,
+        organizationId,
+      },
+      data: {
+        name: loadash.trim(name),
+        description,
+        color,
+        useFor: {
+          set: useFor,
+        },
+      },
+    });
+  } catch (cause) {
+    throw maybeUniqueConstraintViolation(cause, "Tag", {
+      additionalData: {
+        id,
+        organizationId,
+      },
+    });
+  }
+}
+
+/**
+ * Deletes tags in bulk, either by explicit ids or across a filtered list.
+ *
+ * When `tagIds` carries the `ALL_SELECTED_KEY` sentinel the user picked "select
+ * all" on a list they were looking at, so the delete reproduces that list's
+ * filters through {@link buildTagsWhereInput}, the builder the index uses.
+ * `currentSearchParams` carries those filters over. The ids are read first and
+ * the delete is scoped to them, so the count the user confirmed is the count
+ * removed.
+ *
+ * @param args - Ids (or the select-all sentinel), org scope, the list's
+ *   filters as a raw query string, and the typed confirmation
+ * @returns Prisma's batch payload, whose `count` is the number actually deleted
+ * @throws {ShelfError} 400 when the confirmation does not match, see
+ *   {@link assertBulkDeleteConfirmed}; 500 if the delete fails
+ */
+export async function bulkDeleteTags({
+  tagIds,
+  organizationId,
+  currentSearchParams,
+  confirmation,
+}: {
+  tagIds: Tag["id"][];
+  organizationId: Organization["id"];
+  currentSearchParams?: string | null;
+  confirmation: string | null | undefined;
+}) {
+  try {
+    const searchParams = new URLSearchParams(currentSearchParams ?? "");
+
+    const tags = await db.tag.findMany({
+      where: tagIds.includes(ALL_SELECTED_KEY)
+        ? buildTagsWhereInput({
+            organizationId,
+            search: searchParams.get("s"),
+            useFor: searchParams.get("useFor"),
+          })
+        : { id: { in: tagIds }, organizationId },
+      select: { id: true },
+    });
+
+    // Before any write: the typed count must be the number about to go.
+    assertBulkDeleteConfirmed({
+      selectedIds: tagIds,
+      confirmation,
+      matchedCount: tags.length,
+      noun: { one: "tag", many: "tags" },
+      label,
+    });
+
+    return await db.tag.deleteMany({
+      where: { id: { in: tags.map((tag) => tag.id) }, organizationId },
+    });
+  } catch (cause) {
+    // A refused confirmation carries the count to type in its additionalData.
+    rethrowIfClientError(cause);
+
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while bulk deleting tags.",
+      additionalData: { tagIds, organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * This function fetches tags that can be used for booking tags filter, which is used in the booking create forms as well as in the bookings filters
+ */
+export async function getTagsForBookingTagsFilter({
+  organizationId,
+}: {
+  organizationId: Organization["id"];
+}) {
+  try {
+    const tags = await db.tag.findMany({
+      where: {
+        organizationId,
+        OR: [
+          { useFor: { isEmpty: true } },
+          { useFor: { has: TagUseFor.BOOKING } },
+        ],
+      },
+    });
+
+    return { tags, totalTags: tags.length };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while fetching tags for booking filter",
+      additionalData: { organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * Fetches the tags assignable to ASSETS (tags whose `useFor` is empty or
+ * contains ASSET), used by the companion app's create-asset tag picker.
+ *
+ * Mirrors {@link getTagsForBookingTagsFilter} so the asset and booking tag
+ * sources stay structurally identical, and matches the web asset form's tag
+ * scope (tags default to `[ASSET]`).
+ *
+ * @param params.organizationId - The workspace whose asset tags to list.
+ * @returns `{ tags, totalTags }` for the picker.
+ * @throws {ShelfError} If the query fails.
+ */
+export async function getTagsForAssetTagsFilter({
+  organizationId,
+}: {
+  organizationId: Organization["id"];
+}) {
+  try {
+    const tags = await db.tag.findMany({
+      where: {
+        organizationId,
+        OR: [
+          { useFor: { isEmpty: true } },
+          { useFor: { has: TagUseFor.ASSET } },
+        ],
+      },
+    });
+
+    return { tags, totalTags: tags.length };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while fetching tags for asset filter",
+      additionalData: { organizationId },
+      label,
+    });
+  }
+}

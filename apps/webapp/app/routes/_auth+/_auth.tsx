@@ -1,0 +1,349 @@
+import { InviteStatuses } from "@prisma/client";
+import type { LoaderFunctionArgs } from "react-router";
+import {
+  data,
+  redirect,
+  Form,
+  useActionData,
+  useLoaderData,
+} from "react-router";
+import { z } from "zod";
+import { Button } from "~/components/shared/button";
+import { db } from "~/database/db.server";
+import { useSearchParams } from "~/hooks/search-params";
+import { useDisabled } from "~/hooks/use-disabled";
+import { signInWithEmail } from "~/modules/auth/service.server";
+import {
+  createSsoRequiredError,
+  getLegacyLoginDecision,
+} from "~/modules/auth/sso-enforcement.server";
+import {
+  generateRandomCode,
+  normalizeInviteEmail,
+} from "~/modules/invite/helpers";
+import {
+  checkUserAndInviteMatch,
+  updateInviteStatus,
+} from "~/modules/invite/service.server";
+import { setSelectedOrganizationIdCookie } from "~/modules/organization/context.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { detectFormatPrefsForPersistence } from "~/utils/client-hints";
+import { expireListPreferenceCookies, setCookie } from "~/utils/cookies.server";
+import { INVITE_TOKEN_SECRET, SUPPORT_EMAIL } from "~/utils/env";
+import { ShelfError, makeShelfError } from "~/utils/error";
+import {
+  payload,
+  error,
+  getParams,
+  parseData,
+  safeRedirect,
+} from "~/utils/http.server";
+import jwt from "~/utils/jsonwebtoken.server";
+import { resolveUserDisplayName } from "~/utils/user";
+
+export async function loader({ context, params }: LoaderFunctionArgs) {
+  const { inviteId } = getParams(params, z.object({ inviteId: z.string() }), {
+    additionalData: { inviteId: params.inviteId },
+  });
+  try {
+    /** We get the invite based on the id of the params */
+    const invite = await db.invite
+      .findFirstOrThrow({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: pre-org invite-acceptance flow; the viewer is not yet a member of the org, so there is no caller organizationId to scope by — the invite record itself establishes the org relationship (and authenticated users are additionally validated via checkUserAndInviteMatch below)
+        where: {
+          id: inviteId,
+        },
+        include: {
+          organization: {
+            select: {
+              name: true,
+            },
+          },
+          inviter: {
+            select: {
+              firstName: true,
+              lastName: true,
+              displayName: true,
+            },
+          },
+        },
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          title: "Invite not found",
+          message:
+            "The invitation you are trying to accept is either not found or expired",
+          label: "Invite",
+        });
+      });
+
+    /** Here we have to do a check based on the session of the current user
+     * If the user is already signed in, we have to make sure the invite sent, is for the same user
+     */
+    if (context.isAuthenticated) {
+      await checkUserAndInviteMatch({
+        context,
+        invite,
+      });
+    }
+
+    return payload({
+      inviter: resolveUserDisplayName(invite.inviter),
+      workspace: `${invite.organization.name}`,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    throw data(
+      error({ ...reason, title: reason.title || "Accept team invite" }),
+      {
+        status: reason.status,
+      }
+    );
+  }
+}
+
+export const meta = () => [{ title: appendToMetaTitle("Accept team invite") }];
+
+export async function action({ context, params, request }: LoaderFunctionArgs) {
+  try {
+    const { inviteId } = getParams(params, z.object({ inviteId: z.string() }), {
+      additionalData: { inviteId: params.inviteId },
+    });
+
+    const { token } = parseData(
+      await request.formData(),
+      z.object({ token: z.string() }),
+      {
+        message:
+          "The invitation link doesn't have a token provided. Please try clicking the link in your email again or request a new invite. If the issue persists, feel free to contact support",
+      }
+    );
+
+    const decodedInvite = jwt.verify(token, INVITE_TOKEN_SECRET) as {
+      id: string;
+    };
+
+    /**
+     * The loader renders the organization name from the URL's `inviteId`, but
+     * acceptance acts on the invite named by the TOKEN. Nothing tied the two
+     * together, so a crafted link could display one workspace and join another
+     * — and because `updateInviteStatus` performs no session check and the
+     * route then signs the browser in as the accepted invite's `inviteeEmail`,
+     * an unauthenticated victim could land in the ATTACKER's account rather
+     * than merely the wrong organization.
+     *
+     * Requiring the two to agree cannot break a real invite: `inviteUser`
+     * signs `{ id: invite.id }` and both link builders put that same
+     * `invite.id` in the path.
+     */
+    if (decodedInvite.id !== inviteId) {
+      throw new ShelfError({
+        cause: null,
+        title: "Invalid invite token",
+        // Deliberately does not name the invite the token pointed at — the
+        // value is attacker-chosen and echoing it confirms what was rejected.
+        message:
+          "This invitation link is invalid. Please click the link in your email again or request a new invite. If the issue persists, feel free to contact support",
+        additionalData: { inviteId },
+        label: "Invite",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+    /**
+     * Accepting creates an email/password account for an invitee who has none,
+     * then signs in with it. On an SSO domain that account could never be used:
+     * every legacy sign-in on the domain is refused. So an address the decision
+     * refuses for its domain is told to use SSO before anything is created, and
+     * the invite stays pending.
+     *
+     * An `sso_account` refusal is not a reason to stop: an SSO user accepting
+     * an invite is only attached to the workspace (no account is created), and
+     * then signs in with SSO.
+     */
+    const invite = await db.invite.findFirst({
+      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: pre-org invite-acceptance flow; the id comes from the invite JWT verified above and matched to the URL, and there is no caller organizationId to scope by
+      where: { id: decodedInvite.id },
+      select: { inviteeEmail: true },
+    });
+    if (invite) {
+      const decision = await getLegacyLoginDecision(
+        normalizeInviteEmail(invite.inviteeEmail)
+      );
+      if (!decision.allowed && decision.reason === "sso_domain") {
+        throw createSsoRequiredError(decision.reason);
+      }
+    }
+
+    const password = generateRandomCode(10);
+    // Detect the accepter's prefs from browser hints so their brand-new user
+    // row is stamped at creation. timeZone is left null when the CH-time-zone
+    // cookie hasn't round-tripped yet (see detectFormatPrefsForPersistence), so
+    // the lazy backfill fills the real zone later rather than sticking on "UTC".
+    const formatPrefs = detectFormatPrefsForPersistence(request);
+    const updatedInvite = await updateInviteStatus({
+      id: decodedInvite.id,
+      status: InviteStatuses.ACCEPTED,
+      password,
+      formatPrefs,
+    });
+
+    if (updatedInvite.status !== InviteStatuses.ACCEPTED) {
+      throw new ShelfError({
+        cause: null,
+        message:
+          "Something went wrong with updating your invite. Please try again",
+        label: "Invite",
+      });
+    }
+
+    /** A signed-in user goes to their role's landing page in the invited workspace */
+    if (context.isAuthenticated) {
+      return redirect(safeRedirect("/"), {
+        headers: [
+          setCookie(
+            await setSelectedOrganizationIdCookie(updatedInvite.organizationId)
+          ),
+        ],
+      });
+    }
+
+    /**
+     * Sign in the user.
+     *
+     * `updateInviteStatus` keys the account on the normalised address, so the
+     * sign-in has to use the same form: a stored invite can still hold the
+     * capitals of the CSV row it came from.
+     */
+    const authSession = await signInWithEmail(
+      normalizeInviteEmail(updatedInvite.inviteeEmail),
+      password
+    ).catch(
+      // We don't care about the error here, let the user login if he's already registered
+      () => null
+    );
+
+    /**
+     * User could already be registered and hence login in with our password failed,
+     * redirect to home and let user login or go to home */
+    if (!authSession) {
+      return redirect("/login?acceptedInvite=yes");
+    }
+
+    // Commit the session
+    context.setSession(authSession);
+
+    return redirect(
+      safeRedirect(
+        `/onboarding?organizationId=${updatedInvite.organizationId}`
+      ),
+      {
+        headers: [
+          // A new session: whatever lists this browser remembers belong to
+          // whoever used it last.
+          ...(await expireListPreferenceCookies(request, { event: "sign-in" })),
+          setCookie(
+            await setSelectedOrganizationIdCookie(updatedInvite.organizationId)
+          ),
+        ],
+      }
+    );
+  } catch (cause) {
+    const reason = makeShelfError(cause);
+    let titleOverride = null;
+    if (cause instanceof Error && cause.name === "JsonWebTokenError") {
+      titleOverride = "Invalid invite token";
+      reason.message =
+        "The invitation link is invalid. Please try clicking the link in your email again or request a new invite. If the issue persists, feel free to contact support";
+    }
+
+    return data(
+      error({
+        ...reason,
+        title: titleOverride ?? (reason.title || "Accept team invite"),
+      }),
+      {
+        status: reason.status,
+      }
+    );
+  }
+}
+
+/**
+ * Splits a multi-line error message into objects with stable, position-based
+ * ids so the rendered list has unique keys that don't depend on the array
+ * index expression (satisfies react-doctor/no-array-index-as-key).
+ */
+function splitIntoStableLines(message: string) {
+  let offset = 0;
+  return message.split("\n").map((content) => {
+    const id = `line-${offset}`;
+    offset += content.length + 1;
+    return { id, content };
+  });
+}
+
+export default function AcceptInvite() {
+  const { inviter, workspace } = useLoaderData<typeof loader>();
+  const [searchParams] = useSearchParams();
+  const disabled = useDisabled();
+  const actionData = useActionData<typeof action>();
+  const error = actionData?.error;
+  return (
+    <>
+      <div className=" flex flex-col items-center text-center">
+        {error ? (
+          <div>
+            <h2>{error.title}</h2>
+            {/*
+             * Render the error message as text (not HTML) to avoid any XSS
+             * surface. Newlines are preserved via <br/> so multi-line error
+             * copy keeps its visual structure.
+             */}
+            <p className="mx-4 mb-3 mt-2 md:mx-[-200px]">
+              {splitIntoStableLines(error.message).map((line, i) => (
+                <span key={line.id}>
+                  {i > 0 && <br />}
+                  {line.content}
+                </span>
+              ))}
+            </p>
+            <Button to="/" variant={"secondary"}>
+              Back to home
+            </Button>
+          </div>
+        ) : (
+          <div>
+            <h2>Accept invite</h2>
+            <p className="mt-2">
+              <strong>{inviter}</strong> invites you to join Shelf as a member
+              of <strong>{workspace}’s</strong> workspace.
+            </p>
+            <Form method="post" className="my-3">
+              <input
+                type="hidden"
+                name="token"
+                value={searchParams.get("token") || ""}
+              />
+
+              <Button type="submit" disabled={disabled || error}>
+                {disabled ? "Validating token..." : "Accept invite"}
+              </Button>
+            </Form>
+          </div>
+        )}
+      </div>
+      <div className=" mx-4 mt-20 flex flex-col items-center text-center text-gray-600 md:mx-[-200px]">
+        <p>
+          If you have any questions or need assistance, please don't hesitate to
+          contact our support team at{" "}
+          <Button variant={"link-gray"} to={`mailto:${SUPPORT_EMAIL}`}>
+            {SUPPORT_EMAIL}
+          </Button>
+          .
+        </p>
+      </div>
+    </>
+  );
+}

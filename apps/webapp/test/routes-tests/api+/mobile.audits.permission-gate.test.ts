@@ -1,0 +1,269 @@
+/**
+ * Test suite for POST /api/mobile/audits/record-scan.
+ * Covers scan recording, permission checks, and the paid Audits add-on
+ * enforcement (403 when disabled).
+ */
+import { action } from "~/routes/api+/mobile+/audits.record-scan";
+import { mobileUserContext } from "@helpers/mobile-user-context";
+import { createActionArgs } from "@mocks/remix";
+
+// @vitest-environment node
+
+// why: mocking Remix's data() function to return Response objects for React Router v7 single fetch
+const createDataMock = vi.hoisted(() => {
+  return () =>
+    vi.fn((body: unknown, init?: ResponseInit) => {
+      return new Response(JSON.stringify(body), {
+        status: init?.status || 200,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init?.headers || {}),
+        },
+      });
+    });
+});
+
+vi.mock("react-router", async () => {
+  const actual = await vi.importActual("react-router");
+  return {
+    ...actual,
+    data: createDataMock(),
+  };
+});
+
+// why: external auth — we don't want to hit Supabase in tests
+vi.mock("~/modules/api/mobile-auth.server", () => ({
+  requireMobileAuth: vi.fn(),
+  requireOrganizationAccess: vi.fn(),
+  getMobileUserContext: vi.fn(),
+  requireMobilePermission: vi.fn(),
+}));
+
+// why: external service — we mock audit scan recording to avoid database calls
+vi.mock("~/modules/audit/service.server", () => ({
+  recordAuditScan: vi.fn(),
+  requireAuditAssignee: vi.fn(),
+}));
+
+// why: we need to control error formatting in the catch block
+vi.mock("~/utils/error", () => ({
+  makeShelfError: vi.fn(),
+  ShelfError: class ShelfError extends Error {
+    status: number;
+    constructor(opts: any) {
+      super(opts.message);
+      this.status = opts.status || 500;
+    }
+  },
+}));
+
+import {
+  requireMobileAuth,
+  requireOrganizationAccess,
+  getMobileUserContext,
+  requireMobilePermission,
+} from "~/modules/api/mobile-auth.server";
+import {
+  recordAuditScan,
+  requireAuditAssignee,
+} from "~/modules/audit/service.server";
+import { makeShelfError } from "~/utils/error";
+
+const mockUser = {
+  id: "user-1",
+  email: "test@example.com",
+  firstName: "Test",
+  lastName: "User",
+};
+
+function createRecordScanRequest(
+  body: Record<string, unknown>,
+  orgId = "org-1"
+) {
+  return new Request(
+    `http://localhost/api/mobile/audits/record-scan?orgId=${orgId}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer token",
+      },
+      body: JSON.stringify(body),
+    }
+  );
+}
+
+describe("POST /api/mobile/audits/record-scan", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    (requireMobileAuth as any).mockResolvedValue({
+      user: mockUser,
+      authUser: { id: "auth-user-1", email: mockUser.email },
+    });
+
+    (requireOrganizationAccess as any).mockResolvedValue("org-1");
+    (getMobileUserContext as any).mockResolvedValue(
+      mobileUserContext({ roles: ["ADMIN"] })
+    );
+    (requireMobilePermission as any).mockResolvedValue(undefined);
+    vi.mocked(requireAuditAssignee).mockResolvedValue(undefined);
+  });
+
+  it("should record a scan and return scan data with counts", async () => {
+    (recordAuditScan as any).mockResolvedValue({
+      scanId: "scan-1",
+      auditAssetId: "audit-asset-1",
+      foundAssetCount: 5,
+      unexpectedAssetCount: 1,
+    });
+
+    const request = createRecordScanRequest({
+      auditSessionId: "session-1",
+      qrId: "qr-abc",
+      assetId: "asset-1",
+      isExpected: true,
+    });
+    const result = await action(createActionArgs({ request }));
+
+    expect(result instanceof Response).toBe(true);
+    const body = await (result as unknown as Response).json();
+    expect(body.success).toBe(true);
+    expect(body.scanId).toBe("scan-1");
+    expect(body.auditAssetId).toBe("audit-asset-1");
+    expect(body.foundAssetCount).toBe(5);
+    expect(body.unexpectedAssetCount).toBe(1);
+
+    // why: the body's `isExpected` is accepted for wire compatibility with
+    // shipped app builds but must NOT be forwarded — the service derives
+    // expectedness from the audit's own AuditAsset row, because a device that
+    // queues scans offline can hold an hours-stale expected list.
+    expect(recordAuditScan).toHaveBeenCalledWith({
+      auditSessionId: "session-1",
+      qrId: "qr-abc",
+      assetId: "asset-1",
+      userId: "user-1",
+      organizationId: "org-1",
+      userAgent: null,
+    });
+
+    // why: an ADMIN is not limited to assigned audits, so admins can scan
+    // into any audit of their workspace
+    expect(requireAuditAssignee).toHaveBeenCalledWith({
+      auditSessionId: "session-1",
+      organizationId: "org-1",
+      userId: "user-1",
+      assignedOnly: false,
+    });
+  });
+
+  it("should return 403 when a BASE user is not assigned to the audit", async () => {
+    (getMobileUserContext as any).mockResolvedValue(
+      mobileUserContext({ roles: ["BASE"] })
+    );
+    const assigneeError = Object.assign(
+      new Error(
+        "Only users assigned to this audit can perform this action. Please contact the audit creator to be assigned."
+      ),
+      { status: 403 }
+    );
+    vi.mocked(requireAuditAssignee).mockRejectedValue(assigneeError);
+    (makeShelfError as any).mockReturnValue({
+      message: assigneeError.message,
+      status: 403,
+    });
+
+    const request = createRecordScanRequest({
+      auditSessionId: "session-1",
+      qrId: "qr-abc",
+      assetId: "asset-1",
+      isExpected: true,
+    });
+    const result = await action(createActionArgs({ request }));
+
+    expect((result as unknown as Response).status).toBe(403);
+    const body = await (result as unknown as Response).json();
+    expect(body.error.message).toContain("assigned to this audit");
+
+    expect(requireAuditAssignee).toHaveBeenCalledWith({
+      auditSessionId: "session-1",
+      organizationId: "org-1",
+      userId: "user-1",
+      assignedOnly: true,
+    });
+    // why: the scan must not be recorded when the assignee gate rejects:
+    // a scan from a user who cannot complete the audit must never land
+    expect(recordAuditScan).not.toHaveBeenCalled();
+  });
+
+  it("should return 403 when user lacks audit update permission", async () => {
+    const permError = new Error("Permission denied");
+    (permError as any).status = 403;
+    (requireMobilePermission as any).mockRejectedValue(permError);
+    (makeShelfError as any).mockReturnValue({
+      message: "Permission denied",
+      status: 403,
+    });
+
+    const request = createRecordScanRequest({
+      auditSessionId: "session-1",
+      qrId: "qr-abc",
+      assetId: "asset-1",
+      isExpected: true,
+    });
+    const result = await action(createActionArgs({ request }));
+
+    expect(result instanceof Response).toBe(true);
+    expect((result as unknown as Response).status).toBe(403);
+    const body = await (result as unknown as Response).json();
+    expect(body.error.message).toContain("Permission denied");
+
+    expect(recordAuditScan).not.toHaveBeenCalled();
+  });
+
+  it("should return 403 when the Audits add-on is disabled", async () => {
+    (getMobileUserContext as any).mockResolvedValue(
+      mobileUserContext({ roles: ["ADMIN"], canUseAudits: false })
+    );
+
+    const request = createRecordScanRequest({
+      auditSessionId: "session-1",
+      qrId: "qr-abc",
+      assetId: "asset-1",
+      isExpected: true,
+    });
+    const result = await action(createActionArgs({ request }));
+
+    expect((result as unknown as Response).status).toBe(403);
+    const body = await (result as unknown as Response).json();
+    expect(body.error.message).toContain("not enabled");
+    expect(recordAuditScan).not.toHaveBeenCalled();
+  });
+
+  it("a [SELF_SERVICE, ADMIN] membership is not limited to assigned audits", async () => {
+    // The scope follows the effective role, not the first role listed.
+    (getMobileUserContext as any).mockResolvedValue(
+      mobileUserContext({ roles: ["SELF_SERVICE", "ADMIN"] })
+    );
+    (recordAuditScan as any).mockResolvedValue({
+      scanId: "scan-1",
+      auditAssetId: "audit-asset-1",
+      foundAssetCount: 1,
+      unexpectedAssetCount: 0,
+    });
+
+    await action(
+      createActionArgs({
+        request: createRecordScanRequest({
+          auditSessionId: "session-1",
+          qrId: "qr-abc",
+          assetId: "asset-1",
+        }),
+      })
+    );
+
+    expect(requireAuditAssignee).toHaveBeenCalledWith(
+      expect.objectContaining({ assignedOnly: false })
+    );
+  });
+});

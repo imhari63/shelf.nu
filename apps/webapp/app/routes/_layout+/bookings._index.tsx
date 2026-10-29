@@ -1,0 +1,80 @@
+/** CSV export route for selected bookings. */
+import { data, type LoaderFunctionArgs } from "react-router";
+import { z } from "zod";
+import { BookingsListSchema } from "~/components/booking/bookings-list-fields";
+import { csvResponse } from "~/utils/csv-utf8";
+import { exportBookingsFromIndexToCsv } from "~/utils/csv.server";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import {
+  buildContentDisposition,
+  error,
+  getCurrentSearchParams,
+  parseData,
+} from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { assertCanUseBookings } from "~/utils/subscription.server";
+
+export const ExportBookingsSchema = z.object({
+  bookingIds: z.array(z.string()).min(1),
+});
+
+/** Exports the requested bookings as a CSV download. */
+export const loader = async ({
+  context,
+  request,
+  params,
+}: LoaderFunctionArgs) => {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    const { organizationId, currentOrganization, access } =
+      await requirePermission({
+        userId: authSession.userId,
+        request,
+        entity: PermissionEntity.booking,
+        action: PermissionAction.export,
+      });
+
+    assertCanUseBookings(currentOrganization);
+
+    const searchParams = getCurrentSearchParams(request);
+    const bookingsIds = searchParams.get("bookingsIds");
+
+    if (!bookingsIds) {
+      throw new ShelfError({
+        cause: null,
+        message: "No bookings selected",
+        label: "Booking",
+      });
+    }
+
+    /** Join the rows with a new line */
+    const csvString = await exportBookingsFromIndexToCsv({
+      request,
+      bookingsIds: bookingsIds.split(","),
+      userId,
+      canSeeAllBookings: access.bookings.seeAll,
+      organizationId,
+      // The list a "Select all" stands for. It only narrows: the export ANDs
+      // it with the workspace and the caller's custody scope.
+      list: parseData(searchParams, BookingsListSchema),
+    });
+
+    return csvResponse(csvString, {
+      headers: {
+        "content-disposition": buildContentDisposition(null, {
+          fallback: "bookings",
+          filename: params.fileName ? `${params.fileName}.csv` : undefined,
+        }),
+      },
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+};

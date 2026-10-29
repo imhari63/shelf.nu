@@ -1,0 +1,653 @@
+import type { Asset, Prisma } from "@prisma/client";
+import { AssetStatus, BookingStatus } from "@prisma/client";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import {
+  data,
+  redirect,
+  Link,
+  useActionData,
+  useLoaderData,
+  useNavigation,
+} from "react-router";
+import { useZorm } from "react-zorm";
+import { z } from "zod";
+import { Form } from "~/components/custom-form";
+import DynamicSelect from "~/components/dynamic-select/dynamic-select";
+import { UserIcon } from "~/components/icons/library";
+import { Button } from "~/components/shared/button";
+import { WarningBox } from "~/components/shared/warning-box";
+import { db } from "~/database/db.server";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { recordEvent } from "~/modules/activity-event/service.server";
+import { getAsset } from "~/modules/asset/service.server";
+import { isQuantityTracked } from "~/modules/asset/utils";
+import { AssignCustodySchema } from "~/modules/custody/schema";
+import {
+  assertNoKitDerivedCustody,
+  assertNotKitMembers,
+  refuseKitMembers,
+} from "~/modules/custody/service.server";
+import { hasCustody } from "~/modules/custody/utils";
+import { createNote } from "~/modules/note/service.server";
+import { getTeamMember } from "~/modules/team-member/service.server";
+import { getUserByID } from "~/modules/user/service.server";
+import styles from "~/styles/layout/custom-modal.css?url";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { ShelfError, makeShelfError } from "~/utils/error";
+import type { AdditionalData } from "~/utils/error";
+import { isFormProcessing } from "~/utils/form";
+import {
+  payload,
+  error,
+  getCurrentSearchParams,
+  getParams,
+  parseData,
+} from "~/utils/http.server";
+import {
+  wrapCustodianForNote,
+  wrapUserLinkForNote,
+} from "~/utils/markdoc-wrappers";
+import {
+  assertAssetsAreNotArchived,
+  userCanReinstateAssets,
+} from "~/utils/org-validation.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+import { resolveTeamMemberName } from "~/utils/user";
+
+export const meta = () => [{ title: appendToMetaTitle("Assign custody") }];
+
+/**
+ * Refuses quantity-tracked assets on this route.
+ *
+ * This route gives the whole asset to one custodian: the action replaces the
+ * asset's operator-assigned custody rows with a single row. A quantity-tracked
+ * asset is held per unit, possibly by several custodians at once, so its
+ * custody goes through the quantity custody dialog
+ * (`/api/assets/assign-quantity-custody`), which takes a unit count.
+ *
+ * Checked in the loader and again in the action, before any write, because a
+ * POST does not have to come from the rendered page. `Asset.type` never
+ * changes after creation, so reading it ahead of the transaction leaves no
+ * window for it to change.
+ *
+ * @throws {ShelfError} 400 when the asset is quantity-tracked
+ */
+function assertNotQuantityTracked(
+  asset: Pick<Asset, "type"> | null | undefined,
+  additionalData: AdditionalData
+) {
+  if (!isQuantityTracked(asset)) return;
+
+  throw new ShelfError({
+    cause: null,
+    title: "Action not allowed",
+    message:
+      "Quantity-tracked assets use the quantity custody dialog, which asks how many units to assign. Open it from the asset's actions menu.",
+    additionalData,
+    label: "Assets",
+    status: 400,
+    shouldBeCaptured: false,
+  });
+}
+
+export async function loader({ context, request, params }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { assetId } = getParams(params, z.object({ assetId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const { organizationId, access, userOrganizations } =
+      await requirePermission({
+        userId,
+        request,
+        entity: PermissionEntity.asset,
+        action: PermissionAction.custody,
+      });
+
+    const asset = await getAsset({
+      id: assetId,
+      organizationId,
+      userOrganizations,
+      request,
+      include: {
+        custody: {
+          select: {
+            id: true,
+          },
+        },
+        bookingAssets: {
+          where: {
+            booking: {
+              status: {
+                in: [BookingStatus.RESERVED],
+              },
+            },
+          },
+          include: {
+            booking: {
+              select: {
+                id: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    assertNotQuantityTracked(asset, { userId, assetId });
+
+    /** If the asset already has a custody, this page should not be visible */
+    if (asset && hasCustody(asset.custody)) {
+      return redirect(`/assets/${assetId}`);
+    }
+
+    /** Archived assets can't be assigned custody (issue #382). */
+    if (asset?.archivedAt) {
+      return redirect(`/assets/${assetId}`);
+    }
+
+    // An individually tracked kit member takes custody through its kit, so the
+    // page refuses to open for one, with the same 400 the action gives. A plain
+    // read: opening a page must not lock the asset row.
+    await refuseKitMembers(db, [assetId], organizationId);
+
+    const searchParams = getCurrentSearchParams(request);
+
+    /** We get all the team members that are part of the user's personal organization */
+    const where = {
+      deletedAt: null,
+      organizationId,
+      userId: access.custody.assign === "self" ? userId : undefined,
+    } satisfies Prisma.TeamMemberWhereInput;
+
+    const teamMembers = await db.teamMember
+      .findMany({
+        where,
+        include: { user: true },
+        orderBy: {
+          userId: "asc",
+        },
+        take: searchParams.get("getAll") === "teamMember" ? undefined : 12,
+      })
+      .catch((cause) => {
+        throw new ShelfError({
+          cause,
+          message:
+            "Something went wrong while fetching team members. Please try again or contact support.",
+          additionalData: { userId, assetId, organizationId },
+          label: "Assets",
+        });
+      });
+
+    // A caller whose custody scope is `self` can only take custody for
+    // themselves. With no team-member profile in this workspace there is
+    // nothing to assign, so short-circuit instead of rendering a dead-end modal
+    // whose POST would then fail validation. Normally unreachable (such a
+    // caller has their own member row), but an empty team-member list must not
+    // crash the modal.
+    if (access.custody.assign === "self" && teamMembers.length === 0) {
+      sendNotification({
+        title: "Cannot take custody",
+        message:
+          "You don't have a team member profile in this workspace, so custody can't be assigned to you. Please contact your workspace admin.",
+        icon: { name: "x", variant: "error" },
+        senderId: userId,
+      });
+      return redirect(`/assets/${assetId}`);
+    }
+
+    const totalTeamMembers = await db.teamMember.count({ where });
+
+    return payload({
+      showModal: true,
+      teamMembers,
+      asset,
+      totalTeamMembers,
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, assetId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { assetId } = getParams(params, z.object({ assetId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const { organizationId, access } = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.asset,
+      action: PermissionAction.custody,
+    });
+
+    /**
+     * Only `type` is needed here, so read it org-scoped rather than through
+     * `getAsset`, whose not-found path carries no status and would surface a
+     * missing asset as a 500.
+     */
+    const targetAsset = await db.asset.findFirst({
+      // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: existence lookup ahead of the archived guard below, which must see archived rows to answer 'archived' rather than 'not found'
+      where: { id: assetId, organizationId },
+      select: { type: true },
+    });
+
+    if (!targetAsset) {
+      throw new ShelfError({
+        cause: null,
+        title: "Asset not found",
+        message: "This asset could not be found in your workspace.",
+        additionalData: { userId, assetId },
+        label: "Assets",
+        status: 404,
+        shouldBeCaptured: false,
+      });
+    }
+
+    assertNotQuantityTracked(targetAsset, { userId, assetId });
+
+    const assignsSelfOnly = access.custody.assign === "self";
+
+    const { custodian } = parseData(
+      await request.formData(),
+      AssignCustodySchema,
+      {
+        additionalData: { userId, assetId },
+        message: "Please select a team member",
+        shouldBeCaptured: false,
+      }
+    );
+
+    const user = await getUserByID(userId, {
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        displayName: true,
+      } satisfies Prisma.UserSelect,
+    });
+
+    /** We send the data from the form as a json string, so we can easily have both the name and id
+     * ID is used to connect the asset to the custodian
+     * Name is used to create the note
+     */
+    const { id: custodianId, name: custodianName } = custodian;
+
+    // Validate that the custodian belongs to the same organization
+    const custodianTeamMember = await getTeamMember({
+      id: custodianId,
+      organizationId,
+      select: {
+        id: true,
+        name: true,
+        userId: true,
+        user: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            displayName: true,
+          },
+        },
+      },
+    }).catch((cause) => {
+      throw new ShelfError({
+        cause,
+        title: "Team member not found",
+        message: "The selected team member could not be found.",
+        additionalData: { userId, assetId, custodianId },
+        label: "Assets",
+        status: 404,
+      });
+    });
+
+    const custodianDisplayName =
+      custodianTeamMember.name?.trim() || custodianName.trim();
+
+    if (assignsSelfOnly && custodianTeamMember.userId !== user.id) {
+      throw new ShelfError({
+        cause: null,
+        title: "Action not allowed",
+        message: "Self user can only assign custody to themselves only.",
+        additionalData: { userId, assetId, custodianId },
+        label: "Assets",
+      });
+    }
+
+    /** Assign custody to an asset inside a transaction so that the
+     * stale-custody cleanup and the new assignment are atomic — if the
+     * update fails the delete is rolled back automatically.
+     * 1. Clear any stale custody record (prevents P2002 unique constraint
+     *    if a previous release updated status but failed to delete custody)
+     * 2. Update the asset status to IN_CUSTODY
+     * 3. Create a new custody record linked to the custodian
+     */
+    // Archived assets can't be assigned custody (issue #382). Guard the action
+    // too (not just the loader) so a crafted POST can't bypass the redirect.
+    // Self-service reaches this route and can't reinstate, so the refusal is
+    // worded for the acting user's role.
+    await assertAssetsAreNotArchived({
+      assetIds: [assetId],
+      organizationId,
+      actorUserId: userId,
+    });
+
+    // Use transaction to ensure custody assignment and activity event are atomic
+    const asset = await db
+      .$transaction(async (tx) => {
+        // Custody of an individually tracked kit member comes from its kit.
+        // First in the transaction, before the status claim below: the guard's
+        // row lock must be taken before this transaction writes the asset row,
+        // or it can deadlock with a concurrent "add to kit" (see
+        // `assertNotKitMembers`).
+        await assertNotKitMembers(tx, [assetId], organizationId);
+
+        /**
+         * Refuse to take custody of an asset that is checked out on a booking.
+         *
+         * `Asset.status` is a single column, so an unguarded write would
+         * silently overwrite `CHECKED_OUT` and the asset would stop being
+         * counted as off the shelf. Precedence is
+         * `CHECKED_OUT` > `IN_CUSTODY` > `AVAILABLE`, per
+         * `reconcileAssetStatusForBookingExit`.
+         *
+         * The predicate lives on the UPDATE itself, not in a preceding read.
+         * Postgres runs at READ COMMITTED here, where a plain `SELECT` takes no
+         * row lock, so a read-then-write leaves exactly the last-writer-wins
+         * window this PR exists to close: a checkout committing between the two
+         * statements would be overwritten. Constraining the UPDATE makes the
+         * check atomic — the same pattern as `checkOutQuantity`,
+         * `releaseQuantity` and every kit custody path.
+         *
+         * `count === 0` means the row was filtered out, so we read only on that
+         * failure path to tell "checked out" apart from "no such asset" and to
+         * name the asset in the message. Rejecting rather than skipping mirrors
+         * `bulkCheckOutAssets`: an INDIVIDUAL asset is one physical item, so a
+         * custody claim while it is out is a real conflict the operator must
+         * see.
+         */
+        const claimed = await tx.asset.updateMany({
+          where: {
+            id: assetId,
+            organizationId,
+            status: { not: AssetStatus.CHECKED_OUT },
+            // The archived check above is a read outside this claim, so an
+            // archive committed in between would otherwise still be handed a
+            // custodian. Riding the predicate on the UPDATE closes that gap;
+            // the zero-row branch below tells the two causes apart.
+            archivedAt: null,
+          },
+          data: { status: AssetStatus.IN_CUSTODY },
+        });
+
+        if (claimed.count === 0) {
+          const blocked = await tx.asset.findFirst({
+            // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: tells the zero-row claim's causes apart, so it must read an archived row's archivedAt
+            where: { id: assetId, organizationId },
+            select: { title: true, archivedAt: true },
+          });
+
+          if (blocked?.archivedAt) {
+            throw new ShelfError({
+              cause: null,
+              title: "Asset is archived",
+              message: `"${
+                blocked.title
+              }" was archived before custody could be assigned. ${
+                (await userCanReinstateAssets({ userId, organizationId }))
+                  ? "Reinstate it first."
+                  : "Ask an admin to reinstate it."
+              }`,
+              additionalData: { userId, assetId, custodianId },
+              label: "Assets",
+              shouldBeCaptured: false,
+              status: 400,
+            });
+          }
+
+          throw new ShelfError({
+            cause: null,
+            title: "Asset is checked out",
+            message: blocked
+              ? `"${blocked.title}" is currently checked out on a booking, so it cannot be given to a custodian. Check the booking in first.`
+              : "This asset could not be found in your workspace.",
+            additionalData: { userId, assetId, custodianId },
+            label: "Assets",
+            shouldBeCaptured: false,
+            status: blocked ? 400 : 404,
+          });
+        }
+
+        // `kitCustodyId: null` — this assign owns only operator-assigned rows.
+        // A row a kit put here belongs to the kit, and deleting it would leave
+        // the KitCustody naming a custodian for an asset that no longer has
+        // the matching row: the same "two answers to who has this?" state the
+        // release path refuses. Scoping the delete keeps the row alive so the
+        // assert below can see it and reject the whole assignment.
+        // why: these two must stay sequential — react-doctor/async-parallel
+        // flags them, and combining them into a `Promise.all` would be wrong
+        // twice: the delete-then-assert ORDER is the guarantee (the assert may
+        // only read once the operator rows are gone), and concurrent queries on
+        // one interactive-transaction client are not safe in Prisma.
+        await tx.custody.deleteMany({
+          where: { assetId, asset: { organizationId }, kitCustodyId: null },
+        });
+
+        await assertNoKitDerivedCustody(tx, [assetId], organizationId);
+
+        const updated = await tx.asset.update({
+          where: {
+            id: assetId,
+            organizationId,
+          } as Prisma.AssetWhereUniqueInput,
+          data: {
+            custody: {
+              create: {
+                custodian: { connect: { id: custodianId } },
+              },
+            },
+          },
+          select: {
+            id: true,
+            title: true,
+          },
+        });
+
+        // Activity event must be inside transaction for atomicity
+        await recordEvent(
+          {
+            organizationId,
+            actorUserId: userId,
+            action: "CUSTODY_ASSIGNED",
+            entityType: "ASSET",
+            entityId: updated.id,
+            assetId: updated.id,
+            teamMemberId: custodianId,
+            targetUserId: custodianTeamMember.user?.id ?? undefined,
+          },
+          tx
+        );
+
+        return updated;
+      })
+      .catch((cause) => {
+        // Deliberate, user-facing failures (the CHECKED_OUT conflict and the
+        // kit guards above) must survive this wrapper. `ShelfError` inherits `title` and `status`
+        // from its cause but ALWAYS assigns its own `message`
+        // (`~/utils/error.ts`), and the form renders only
+        // `actionData.error.message` — so wrapping would swap the specific
+        // instruction for the generic one and the operator would never learn
+        // why the assignment failed.
+        if (cause instanceof ShelfError) {
+          throw cause;
+        }
+
+        throw new ShelfError({
+          cause,
+          message:
+            "Something went wrong while updating asset. Please try again or contact support.",
+          additionalData: { userId, assetId, custodianId },
+          label: "Assets",
+        });
+      });
+
+    /** Once the asset is updated, we create the note */
+    const actor = wrapUserLinkForNote(user);
+
+    const custodianDisplay = wrapCustodianForNote({
+      teamMember: {
+        name: custodianDisplayName,
+        user: custodianTeamMember.user,
+      },
+    });
+
+    const content = assignsSelfOnly
+      ? `${actor} took custody.`
+      : `${actor} assigned custody to ${custodianDisplay}.`;
+
+    await createNote({
+      content,
+      type: "UPDATE",
+      userId: userId,
+      assetId: asset.id,
+      organizationId,
+    });
+
+    sendNotification({
+      title: `‘${asset.title}’ is now in custody of ${custodianDisplayName}`,
+      message:
+        "Remember, this asset will be unavailable until custody is manually released.",
+      icon: { name: "success", variant: "success" },
+      senderId: userId,
+    });
+
+    return redirect(`/assets/${assetId}`);
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId, assetId });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export function links() {
+  return [{ rel: "stylesheet", href: styles }];
+}
+
+export default function Custody() {
+  const { asset, teamMembers } = useLoaderData<typeof loader>();
+  const firstReservedBookingId = asset?.bookingAssets?.[0]?.booking?.id;
+  const actionData = useActionData<typeof action>();
+  const transition = useNavigation();
+  const disabled = isFormProcessing(transition.state);
+  const zo = useZorm("BulkAssignCustody", AssignCustodySchema);
+  const assignsSelfOnly = useRoleAccess().custody.assign === "self";
+  const error = zo.errors.custodian()?.message || actionData?.error?.message;
+
+  return (
+    <>
+      <Form method="post" ref={zo.ref}>
+        <div className="modal-content-wrapper">
+          <div className="mb-4 inline-flex items-center justify-center rounded-full border-8 border-solid border-primary-50 bg-primary-100 p-2 text-primary-600">
+            <UserIcon />
+          </div>
+          <div className="mb-5">
+            <h4>{assignsSelfOnly ? "Take" : "Assign"} custody of asset</h4>
+            <p>
+              This asset is currently available. You’re about to assign custody
+              to {assignsSelfOnly ? "yourself" : "one of your team members"}.
+            </p>
+          </div>
+          <div className="relative z-50 mb-8">
+            <DynamicSelect
+              hidden={assignsSelfOnly}
+              defaultValue={
+                assignsSelfOnly && teamMembers?.length > 0
+                  ? JSON.stringify({
+                      id: teamMembers[0].id,
+                      name: resolveTeamMemberName(teamMembers[0]),
+                    })
+                  : undefined
+              }
+              disabled={disabled || assignsSelfOnly}
+              model={{
+                name: "teamMember",
+                queryKey: "name",
+                deletedAt: null,
+                // ASSET custody: SELF_SERVICE may only take custody itself and
+                // BASE never. Stated explicitly so the behaviour survives a
+                // change to the endpoint's fallback.
+                custodyPurpose: "custody-assignment",
+              }}
+              fieldName="custodian"
+              contentLabel="Team members"
+              initialDataKey="teamMembers"
+              countKey="totalTeamMembers"
+              placeholder="Select a team member"
+              allowClear
+              closeOnSelect
+              showSearch={!assignsSelfOnly}
+              transformItem={(item) => ({
+                ...item,
+                id: JSON.stringify({
+                  id: item.id,
+                  //If there is a user, we use its name, otherwise we use the name of the team member
+                  name: resolveTeamMemberName(item),
+                }),
+              })}
+              renderItem={(item) => resolveTeamMemberName(item, true)}
+            />
+          </div>
+          {error ? (
+            <div className="-mt-8 mb-8 text-sm text-error-500">{error}</div>
+          ) : null}
+
+          {firstReservedBookingId ? (
+            <WarningBox className="-mt-4 mb-8">
+              <>
+                Asset is part of an{" "}
+                <Link
+                  to={`/bookings/${firstReservedBookingId}`}
+                  className="underline"
+                  target="_blank"
+                >
+                  upcoming booking
+                </Link>
+                . You will not be able to check-out your booking if this asset
+                has custody.
+              </>
+            </WarningBox>
+          ) : null}
+
+          <div className="flex gap-3">
+            <Button
+              to=".."
+              variant="secondary"
+              width="full"
+              disabled={disabled}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              width="full"
+              type="submit"
+              disabled={disabled}
+            >
+              Confirm
+            </Button>
+          </div>
+        </div>
+      </Form>
+    </>
+  );
+}

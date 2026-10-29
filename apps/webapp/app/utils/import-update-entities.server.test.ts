@@ -1,0 +1,538 @@
+/**
+ * @file Entity resolution and asset fetching for bulk update via CSV import.
+ * Handles batch database queries for categories, locations, tags, and
+ * asset lookup by identifier. All functions here make database calls.
+ *
+ * @see {@link file://./import-update-types.ts} Types and constants
+ * @see {@link file://./import-update.server.ts} Orchestration (server)
+ */
+import type { Asset, CustomField } from "@prisma/client";
+import { db } from "~/database/db.server";
+import { getPrimaryLocation } from "~/modules/asset/utils";
+import { decodeCsvListCell } from "~/utils/csv-cells";
+import { getRandomColor } from "~/utils/get-random-color";
+import type {
+  AssetChangePreview,
+  AssetForUpdate,
+  HeaderAnalysis,
+} from "./import-update-types";
+
+// ---------------------------------------------------------------------------
+// Asset Fetching
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetches assets by the given identifier field (sequentialId or id).
+ * Returns a map keyed by that identifier value for CSV row lookup.
+ *
+ * @param identifierValues - Array of identifier values to look up
+ * @param organizationId - Organization scope for the query
+ * @param dbField - Which database field to match against
+ * @returns Map of identifier value → asset with relations
+ */
+export async function fetchAssetsForUpdate(
+  identifierValues: string[],
+  organizationId: string,
+  dbField: "sequentialId" | "id"
+): Promise<Map<string, AssetForUpdate>> {
+  const assets = await db.asset.findMany({
+    // eslint-disable-next-line local-rules/require-archived-at-check-on-asset-queries -- why: archived rows must be found so the preview reports them as archived instead of not found
+    where: { [dbField]: { in: identifierValues }, organizationId },
+    include: {
+      category: { select: { name: true } },
+      // Pull location through the pivot and flatten to a singular `location`
+      // below so the CSV-update diff logic keeps its `asset.location` contract.
+      // Ordered deterministically (oldest placement first) so "primary" is
+      // stable across the export query and this update-preview query — an
+      // unordered `assetLocations[0]` let the two disagree on which
+      // placement was "current" for a multi-placement asset (Bug 2).
+      // The `id` tiebreak mirrors the export query's
+      // `ORDER BY al."createdAt" ASC, al.id ASC` exactly. `AssetLocation.createdAt`
+      // defaults to `now()`, which is transaction-start time, so placements
+      // written in one transaction (kit cascade, bulk placement) share a
+      // timestamp — without the tiebreak the two queries can still disagree
+      // on which row is first.
+      assetLocations: {
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        select: { location: { select: { id: true, name: true } } },
+      },
+      tags: { select: { id: true, name: true } },
+      customFields: { include: { customField: true } },
+      // Needed so the diff can compare the CSV `assetModel` cell (a NAME,
+      // per the export) against the asset's current model NAME rather than
+      // its cuid — see `AssetForUpdate.assetModel`.
+      assetModel: { select: { id: true, name: true } },
+    },
+  });
+
+  // Key by the identifier field value so CSV rows can look up their asset
+  return new Map(
+    assets.map((a) => {
+      const raw = a as Asset & {
+        category: { name: string } | null;
+        assetLocations: { location: { id: string; name: string } }[];
+        tags: { id: string; name: string }[];
+        customFields: {
+          id: string;
+          value: unknown;
+          customField: CustomField;
+        }[];
+        assetModel: { id: string; name: string } | null;
+      };
+      // Synthesise the singular `location` the diff code expects.
+      const asset = {
+        ...raw,
+        location: getPrimaryLocation(raw),
+        // Multi-placement guard input — see AssetForUpdate.locationPlacementCount.
+        locationPlacementCount: raw.assetLocations.length,
+        // Every placement's name, so the guard can recognise an untouched
+        // round-trip cell whichever placement the export happened to pick as
+        // "primary" — matching only against `location.name` would re-introduce
+        // the noise intermittently when the two orderings disagree.
+        locationPlacementNames: raw.assetLocations.map(
+          (al) => al.location.name
+        ),
+      };
+      const key = dbField === "id" ? asset.id : asset.sequentialId ?? "";
+      return [key, asset];
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
+// New Entity Detection (for preview warnings)
+// ---------------------------------------------------------------------------
+
+/**
+ * Checks which categories, locations, and tags referenced in the changes
+ * don't exist yet in the organization. These will be created on apply.
+ *
+ * @param assetsToUpdate - Assets with detected changes
+ * @param headerAnalysis - Header classification from analyzeUpdateHeaders
+ * @param organizationId - Organization scope
+ * @returns Lists of entity names that will need to be created
+ */
+export async function detectNewEntities(
+  assetsToUpdate: AssetChangePreview[],
+  headerAnalysis: HeaderAnalysis,
+  organizationId: string
+): Promise<{ categories: string[]; locations: string[]; tags: string[] }> {
+  const categoryNames = new Set<string>();
+  const locationNames = new Set<string>();
+  const tagNames = new Set<string>();
+
+  for (const asset of assetsToUpdate) {
+    for (const change of asset.changes) {
+      // A warning-marked change (e.g. the multi-placement `location`
+      // guard, or assetModel-on-QUANTITY_TRACKED) is never written by the
+      // apply layer — skip it here too, or the preview would falsely
+      // advertise creating an entity (e.g. a location) that will never
+      // actually be created. Mirrors the apply pre-pass's own
+      // `if (change.warning) continue;` guard in `import-update.server.ts`.
+      if (change.warning) continue;
+
+      const col = headerAnalysis.updatableColumns.find(
+        (c) => c.csvHeader === change.field
+      );
+      if (!col) continue;
+
+      if (col.internalKey === "category") {
+        if (change.newValue.toLowerCase() !== "uncategorized") {
+          categoryNames.add(change.newValue.trim());
+        }
+      } else if (col.internalKey === "location") {
+        locationNames.add(change.newValue.trim());
+      } else if (col.internalKey === "tags") {
+        for (const tag of decodeCsvListCell(change.newValue)) {
+          tagNames.add(tag);
+        }
+      }
+    }
+  }
+
+  // Batch check categories (single query instead of N)
+  const categoryNamesArr = Array.from(categoryNames);
+  const existingCats =
+    categoryNamesArr.length > 0
+      ? await db.category.findMany({
+          where: {
+            organizationId,
+            name: { in: categoryNamesArr, mode: "insensitive" },
+          },
+          select: { name: true },
+        })
+      : [];
+  const existingCatNamesLc = new Set(
+    existingCats.map((c) => c.name.toLowerCase())
+  );
+  const newCategories = categoryNamesArr.filter(
+    (n) => !existingCatNamesLc.has(n.toLowerCase())
+  );
+
+  // Batch check locations
+  const locationNamesArr = Array.from(locationNames);
+  const existingLocs =
+    locationNamesArr.length > 0
+      ? await db.location.findMany({
+          where: {
+            organizationId,
+            name: { in: locationNamesArr, mode: "insensitive" },
+          },
+          select: { name: true },
+        })
+      : [];
+  const existingLocNamesLc = new Set(
+    existingLocs.map((l) => l.name.toLowerCase())
+  );
+  const newLocations = locationNamesArr.filter(
+    (n) => !existingLocNamesLc.has(n.toLowerCase())
+  );
+
+  // Batch check tags
+  const tagNamesArr = Array.from(tagNames);
+  const existingTags =
+    tagNamesArr.length > 0
+      ? await db.tag.findMany({
+          where: {
+            organizationId,
+            name: { in: tagNamesArr, mode: "insensitive" },
+          },
+          select: { name: true },
+        })
+      : [];
+  const existingTagNamesLc = new Set(
+    existingTags.map((t) => t.name.toLowerCase())
+  );
+  const newTags = tagNamesArr.filter(
+    (n) => !existingTagNamesLc.has(n.toLowerCase())
+  );
+
+  return {
+    categories: newCategories,
+    locations: newLocations,
+    tags: newTags,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Entity Resolution Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Batch-resolves category names to IDs, creating missing ones.
+ * Uses findMany + createMany + re-fetch to avoid race conditions.
+ *
+ * @param names - Category names from CSV changes
+ * @param userId - User performing the import
+ * @param organizationId - Organization scope
+ * @returns Map of category name → category ID
+ */
+export async function batchResolveCategoryNames(
+  names: string[],
+  userId: string,
+  organizationId: string
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const trimmedNames = names.map((n) => n.trim()).filter(Boolean);
+
+  // Handle "uncategorized" specially
+  for (const name of trimmedNames) {
+    if (name.toLowerCase() === "uncategorized") {
+      result.set(name, "uncategorized");
+    }
+  }
+
+  const namesToResolve = trimmedNames.filter(
+    (n) => n.toLowerCase() !== "uncategorized"
+  );
+  if (namesToResolve.length === 0) return result;
+
+  // Deduplicate case-insensitively — keep first spelling per lowercase key
+  const lcToOriginal = new Map<string, string>();
+  for (const name of namesToResolve) {
+    const lc = name.toLowerCase();
+    if (!lcToOriginal.has(lc)) lcToOriginal.set(lc, name);
+  }
+  const uniqueNames = [...lcToOriginal.values()];
+
+  // Batch fetch existing
+  const existing = await db.category.findMany({
+    where: {
+      organizationId,
+      name: { in: uniqueNames, mode: "insensitive" },
+    },
+    select: { id: true, name: true },
+  });
+  const lcToId = new Map<string, string>();
+  for (const cat of existing) {
+    lcToId.set(cat.name.toLowerCase(), cat.id);
+  }
+
+  // Create missing (one per unique lowercase key)
+  const missingNames = uniqueNames.filter((n) => !lcToId.has(n.toLowerCase()));
+  if (missingNames.length > 0) {
+    await db.category.createMany({
+      data: missingNames.map((name) => ({
+        name,
+        color: getRandomColor(),
+        userId,
+        organizationId,
+      })),
+      skipDuplicates: true,
+    });
+    // Re-fetch to get IDs
+    const created = await db.category.findMany({
+      where: {
+        organizationId,
+        name: { in: missingNames, mode: "insensitive" },
+      },
+      select: { id: true, name: true },
+    });
+    for (const cat of created) {
+      lcToId.set(cat.name.toLowerCase(), cat.id);
+    }
+  }
+
+  // Map all original name variants to their resolved ID
+  for (const name of namesToResolve) {
+    const id = lcToId.get(name.toLowerCase());
+    if (id) result.set(name, id);
+  }
+
+  return result;
+}
+
+/**
+ * Batch-resolves location names to IDs, creating missing ones.
+ * Uses findMany + createMany + re-fetch to avoid race conditions.
+ *
+ * @param names - Location names from CSV changes
+ * @param userId - User performing the import
+ * @param organizationId - Organization scope
+ * @returns Map of location name → location ID
+ */
+export async function batchResolveLocationNames(
+  names: string[],
+  userId: string,
+  organizationId: string
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const trimmedNames = names.map((n) => n.trim()).filter(Boolean);
+  if (trimmedNames.length === 0) return result;
+
+  // Deduplicate case-insensitively — keep first spelling per lowercase key
+  const lcToOriginal = new Map<string, string>();
+  for (const name of trimmedNames) {
+    const lc = name.toLowerCase();
+    if (!lcToOriginal.has(lc)) lcToOriginal.set(lc, name);
+  }
+  const uniqueNames = [...lcToOriginal.values()];
+
+  // Batch fetch existing
+  const existing = await db.location.findMany({
+    where: {
+      organizationId,
+      name: { in: uniqueNames, mode: "insensitive" },
+    },
+    select: { id: true, name: true },
+  });
+  const lcToId = new Map<string, string>();
+  for (const loc of existing) {
+    lcToId.set(loc.name.toLowerCase(), loc.id);
+  }
+
+  // Create missing (one per unique lowercase key)
+  const missingNames = uniqueNames.filter((n) => !lcToId.has(n.toLowerCase()));
+  if (missingNames.length > 0) {
+    await db.location.createMany({
+      data: missingNames.map((name) => ({
+        name,
+        userId,
+        organizationId,
+      })),
+      skipDuplicates: true,
+    });
+    // Re-fetch to get IDs
+    const created = await db.location.findMany({
+      where: {
+        organizationId,
+        name: { in: missingNames, mode: "insensitive" },
+      },
+      select: { id: true, name: true },
+    });
+    for (const loc of created) {
+      lcToId.set(loc.name.toLowerCase(), loc.id);
+    }
+  }
+
+  // Map all original name variants to their resolved ID
+  for (const name of trimmedNames) {
+    const id = lcToId.get(name.toLowerCase());
+    if (id) result.set(name, id);
+  }
+
+  return result;
+}
+
+/**
+ * Batch-resolves asset model names to IDs, creating missing ones.
+ *
+ * Mirrors `batchResolveCategoryNames` (same case-insensitive dedup,
+ * same findMany + createMany + re-fetch shape, same Map return). Used
+ * by the update-import flow to pre-resolve every distinct `assetModel`
+ * cell value across the import in one DB round-trip — avoids N+1
+ * lookups per row.
+ *
+ * Differences from the category resolver:
+ * - No `color` field in the create payload (models don't have one).
+ * - Create payload uses Prisma's nested `connect` for the FK fields
+ *   because the AssetModel schema relation is named `createdBy` /
+ *   `organization` (not `userId` / `organizationId` directly) — match
+ *   the `createAssetModelsIfNotExists` pattern in the content-import
+ *   path so behaviour stays identical.
+ *
+ * Caller responsibility — pre-filter the input to INDIVIDUAL rows. The
+ * `parseQtyTrackedUpdateRow` parser already drops the `assetModel`
+ * cell on QUANTITY_TRACKED rows, so the names array that reaches this
+ * function should only contain INDIVIDUAL-row model names. This
+ * function does NOT re-enforce that gate.
+ *
+ * @param names - AssetModel names from CSV changes
+ * @param userId - User performing the import (links new models via `createdBy`)
+ * @param organizationId - Organization scope for all reads + writes
+ * @returns Map of (original-spelling) model name → AssetModel.id
+ */
+export async function batchResolveAssetModelNames(
+  names: string[],
+  userId: string,
+  organizationId: string
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const trimmedNames = names.map((n) => n.trim()).filter(Boolean);
+  if (trimmedNames.length === 0) return result;
+
+  // Deduplicate case-insensitively — keep first spelling per lowercase key
+  const lcToOriginal = new Map<string, string>();
+  for (const name of trimmedNames) {
+    const lc = name.toLowerCase();
+    if (!lcToOriginal.has(lc)) lcToOriginal.set(lc, name);
+  }
+  const uniqueNames = [...lcToOriginal.values()];
+
+  // Batch fetch existing models
+  const existing = await db.assetModel.findMany({
+    where: {
+      organizationId,
+      name: { in: uniqueNames, mode: "insensitive" },
+    },
+    select: { id: true, name: true },
+  });
+  const lcToId = new Map<string, string>();
+  for (const m of existing) {
+    lcToId.set(m.name.toLowerCase(), m.id);
+  }
+
+  // Create missing (one per unique lowercase key). The AssetModel
+  // schema uses required FK relations (`createdBy`, `organization`),
+  // which `createMany` does not support — fall back to `create()` per
+  // missing model. Volume is bounded by distinct model names in the
+  // CSV (typically small).
+  const missingNames = uniqueNames.filter((n) => !lcToId.has(n.toLowerCase()));
+  if (missingNames.length > 0) {
+    for (const name of missingNames) {
+      const created = await db.assetModel.create({
+        data: {
+          name,
+          createdBy: { connect: { id: userId } },
+          organization: { connect: { id: organizationId } },
+        },
+        select: { id: true, name: true },
+      });
+      lcToId.set(created.name.toLowerCase(), created.id);
+    }
+  }
+
+  // Map all original name variants to their resolved ID
+  for (const name of trimmedNames) {
+    const id = lcToId.get(name.toLowerCase());
+    if (id) result.set(name, id);
+  }
+
+  return result;
+}
+
+/**
+ * Resolves an array of tag names to their IDs, creating any that don't exist.
+ * Uses batched queries to avoid N+1 round-trips.
+ *
+ * @param names - Tag names from CSV changes
+ * @param userId - User performing the import
+ * @param organizationId - Organization scope
+ * @returns Array of `{ id }` objects preserving original order
+ */
+export async function resolveTagNamesToIds(
+  names: string[],
+  userId: string,
+  organizationId: string
+): Promise<{ id: string }[]> {
+  const trimmedNames = names.map((n) => n.trim()).filter((n) => n.length > 0);
+  if (trimmedNames.length === 0) return [];
+
+  // Deduplicate (case-insensitive) while keeping first occurrence
+  const seenLc = new Set<string>();
+  const uniqueNames: string[] = [];
+  for (const name of trimmedNames) {
+    const lc = name.toLowerCase();
+    if (!seenLc.has(lc)) {
+      seenLc.add(lc);
+      uniqueNames.push(name);
+    }
+  }
+
+  // Batch fetch existing tags
+  const existingTags = await db.tag.findMany({
+    where: {
+      organizationId,
+      name: { in: uniqueNames, mode: "insensitive" },
+    },
+    select: { id: true, name: true },
+  });
+
+  const nameToId = new Map<string, string>();
+  for (const tag of existingTags) {
+    nameToId.set(tag.name.toLowerCase(), tag.id);
+  }
+
+  // Create missing tags
+  const toCreate = uniqueNames.filter((n) => !nameToId.has(n.toLowerCase()));
+  if (toCreate.length > 0) {
+    await db.tag.createMany({
+      data: toCreate.map((name) => ({
+        name,
+        userId,
+        organizationId,
+      })),
+      skipDuplicates: true,
+    });
+
+    // Re-fetch to get IDs of newly created tags
+    const newTags = await db.tag.findMany({
+      where: {
+        organizationId,
+        name: { in: toCreate, mode: "insensitive" },
+      },
+      select: { id: true, name: true },
+    });
+    for (const tag of newTags) {
+      nameToId.set(tag.name.toLowerCase(), tag.id);
+    }
+  }
+
+  // Build result preserving original order (including duplicates)
+  const result: { id: string }[] = [];
+  for (const name of trimmedNames) {
+    const id = nameToId.get(name.toLowerCase());
+    if (id) result.push({ id });
+  }
+  return result;
+}

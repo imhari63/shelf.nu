@@ -1,0 +1,272 @@
+import type { Category } from "@prisma/client";
+import type {
+  ActionFunctionArgs,
+  LoaderFunctionArgs,
+  MetaFunction,
+} from "react-router";
+import { data, Link, Outlet, useLoaderData } from "react-router";
+import { z } from "zod";
+import BulkActionsDropdown from "~/components/category/bulk-actions-dropdown";
+import CategoryQuickActions from "~/components/category/category-quick-actions";
+import { ErrorContent } from "~/components/errors";
+import Header from "~/components/layout/header";
+import type { HeaderData } from "~/components/layout/header/types";
+import LineBreakText from "~/components/layout/line-break-text";
+import { List } from "~/components/list";
+import { ListContentWrapper } from "~/components/list/content-wrapper";
+import { Filters } from "~/components/list/filters";
+import { Badge } from "~/components/shared/badge";
+import { Button } from "~/components/shared/button";
+import { Th, Td } from "~/components/table";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { buildAssetIndexFilterHref } from "~/modules/asset-index-settings/filter-href";
+import { getAssetIndexModeForUser } from "~/modules/asset-index-settings/service.server";
+import {
+  assertCategoryDeleteConfirmed,
+  deleteCategory,
+  getCategories,
+} from "~/modules/category/service.server";
+import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import {
+  setCookie,
+  updateCookieWithPerPage,
+  userPrefs,
+} from "~/utils/cookies.server";
+import { DeleteConfirmationSchema } from "~/utils/delete-confirmation";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError } from "~/utils/error";
+import { computeHasActiveFilters } from "~/utils/filter-params";
+import {
+  payload,
+  error,
+  getCurrentSearchParams,
+  parseData,
+} from "~/utils/http.server";
+import { getParamsValues } from "~/utils/list";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { userHasPermission } from "~/utils/permissions/permission.validator.client";
+import { requirePermission } from "~/utils/roles.server";
+
+export async function loader({ context, request }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    const { organizationId, access } = await requirePermission({
+      userId: authSession.userId,
+      request,
+      entity: PermissionEntity.category,
+      action: PermissionAction.read,
+    });
+
+    const searchParams = getCurrentSearchParams(request);
+    const { page, perPageParam, search } = getParamsValues(searchParams);
+    const hasActiveFilters = computeHasActiveFilters(searchParams);
+    const cookie = await updateCookieWithPerPage(request, perPageParam);
+    const { perPage } = cookie;
+
+    const [{ categories, totalCategories }, assetIndexMode] = await Promise.all(
+      [
+        getCategories({
+          organizationId,
+          page,
+          perPage,
+          search,
+        }),
+        // Decides the filter grammar of each row's link into the asset index
+        getAssetIndexModeForUser({
+          userId,
+          organizationId,
+          ui: access.policy.ui,
+        }),
+      ]
+    );
+    const totalPages = Math.ceil(totalCategories / perPage);
+
+    const header: HeaderData = {
+      title: "Categories",
+    };
+    const modelName = {
+      singular: "category",
+      plural: "categories",
+    };
+
+    return data(
+      payload({
+        header,
+        items: categories,
+        search,
+        page,
+        totalItems: totalCategories,
+        totalPages,
+        perPage,
+        modelName,
+        hasActiveFilters,
+        assetIndexMode,
+      }),
+      {
+        headers: [setCookie(await userPrefs.serialize(cookie))],
+      }
+    );
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    throw data(error(reason), { status: reason.status });
+  }
+}
+
+export const meta: MetaFunction<typeof loader> = ({ data }) => [
+  { title: data ? appendToMetaTitle(data.header.title) : "" },
+];
+
+export async function action({ context, request }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+
+  try {
+    const { organizationId } = await requirePermission({
+      userId: authSession.userId,
+      request,
+      entity: PermissionEntity.category,
+      action: PermissionAction.delete,
+    });
+
+    const { id, confirmation } = parseData(
+      await request.formData(),
+      z
+        .object({
+          id: z.string(),
+        })
+        .merge(DeleteConfirmationSchema),
+      {
+        additionalData: { userId },
+      }
+    );
+
+    // A category in use needs its name typed, as the dialog asks; an unused
+    // one deletes with one click.
+    await assertCategoryDeleteConfirmed({ id, organizationId, confirmation });
+
+    await deleteCategory({ id, organizationId });
+
+    sendNotification({
+      title: "Category deleted",
+      message: "Your category has been deleted successfully",
+      icon: { name: "trash", variant: "error" },
+      senderId: userId,
+    });
+
+    return payload({ success: true });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+}
+
+export const handle = {
+  breadcrumb: () => <Link to="/categories">Categories</Link>,
+};
+export const ErrorBoundary = () => <ErrorContent />;
+
+export default function CategoriesPage() {
+  const roles = useOrganizationRoles();
+  // The bulk menu offers Delete only.
+  const showBulkActions = userHasPermission({
+    roles,
+    entity: PermissionEntity.category,
+    action: PermissionAction.delete,
+  });
+
+  return (
+    <>
+      <Header>
+        <Button
+          to="new"
+          role="link"
+          aria-label={`new category`}
+          data-test-id="createNewCategory"
+        >
+          New category
+        </Button>
+      </Header>
+      <ListContentWrapper>
+        <Filters />
+        <Outlet />
+        <List
+          bulkActions={showBulkActions ? <BulkActionsDropdown /> : undefined}
+          customEmptyStateContent={{
+            title: "No categories yet",
+            text: "Categories help you organize assets by type. Create categories to group and filter your inventory.",
+            newButtonRoute: "/categories/new",
+            newButtonContent: "Create your first category",
+          }}
+          ItemComponent={CategoryItem}
+          headerChildren={
+            <>
+              <Th>Description</Th>
+              <Th>Assets</Th>
+              <Th>Actions</Th>
+            </>
+          }
+        />
+      </ListContentWrapper>
+    </>
+  );
+}
+
+/**
+ * One row of the categories list. The asset count links to the asset index
+ * filtered to this category, in the filter grammar of the viewer's index mode.
+ */
+const CategoryItem = ({
+  item,
+}: {
+  item: Pick<Category, "id" | "description" | "name" | "color"> & {
+    _count: {
+      assets: number;
+    };
+  };
+}) => {
+  const { assetIndexMode } = useLoaderData<typeof loader>();
+  const assetCount = item._count.assets;
+
+  return (
+    <>
+      <Td title={`Category: ${item.name}`} className="w-1/4">
+        <Badge color={item.color} withDot={false}>
+          {item.name}
+        </Badge>
+      </Td>
+      <Td className="max-w-62 md:w-3/4">
+        {item.description ? (
+          <LineBreakText
+            className="md:w-3/4"
+            text={item.description}
+            numberOfLines={3}
+            charactersPerLine={60}
+          />
+        ) : null}
+      </Td>
+      <Td>
+        <Button
+          to={buildAssetIndexFilterHref({
+            mode: assetIndexMode,
+            key: "category",
+            value: item.id,
+          })}
+          variant="link-gray"
+          aria-label={`View ${assetCount} ${
+            assetCount === 1 ? "asset" : "assets"
+          } in ${item.name}`}
+        >
+          {assetCount}
+        </Button>
+      </Td>
+      <Td>
+        <CategoryQuickActions category={item} />
+      </Td>
+    </>
+  );
+};

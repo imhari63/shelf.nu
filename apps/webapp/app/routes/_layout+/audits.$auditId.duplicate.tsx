@@ -1,0 +1,173 @@
+import type { ActionFunctionArgs } from "react-router";
+import { data } from "react-router";
+import { z } from "zod";
+import { MarkdownNoteSchema } from "~/components/notes/markdown-note-form";
+import { db } from "~/database/db.server";
+import { createAuditNote } from "~/modules/audit/note-service.server";
+import {
+  createWhileAuditAcceptsComments,
+  requireAuditAssigneeForScopedViewer,
+} from "~/modules/audit/service.server";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError, notAllowedMethod, ShelfError } from "~/utils/error";
+import {
+  error,
+  getActionMethod,
+  getParams,
+  parseData,
+  payload,
+} from "~/utils/http.server";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+
+export async function action({ context, request, params }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const { userId } = authSession;
+  const { auditId } = getParams(params, z.object({ auditId: z.string() }), {
+    additionalData: { userId },
+  });
+
+  try {
+    const permissionResult = await requirePermission({
+      userId,
+      request,
+      entity: PermissionEntity.auditNote,
+      action: PermissionAction.create,
+    });
+
+    const { organizationId, access } = permissionResult;
+
+    // Validate that the audit belongs to the user's organization.
+    // Scope the lookup by organizationId so a cross-org auditId can never
+    // resolve a record (defense-in-depth alongside the explicit check below).
+    const audit = await db.auditSession.findFirst({
+      where: { id: auditId, organizationId },
+      select: {
+        id: true,
+        organizationId: true,
+        assignments: {
+          select: { userId: true },
+        },
+      },
+    });
+
+    if (!audit || audit.organizationId !== organizationId) {
+      throw new ShelfError({
+        cause: null,
+        message: "Audit not found or access denied",
+        additionalData: { userId, auditId },
+        label: "Audit",
+        status: 404,
+      });
+    }
+
+    requireAuditAssigneeForScopedViewer({
+      audit,
+      userId,
+      assignedOnly: !access.audits.seeAll,
+      auditId,
+    });
+
+    const method = getActionMethod(request);
+
+    switch (method) {
+      case "POST": {
+        const { content } = parseData(
+          await request.formData(),
+          MarkdownNoteSchema,
+          {
+            additionalData: { userId, auditId },
+          }
+        );
+
+        // Created only while the audit still accepts comments, checked on the
+        // locked row so a completion cannot slip in between.
+        const note = await createWhileAuditAcceptsComments(
+          { auditSessionId: auditId, organizationId },
+          (tx) =>
+            createAuditNote({
+              content,
+              type: "COMMENT",
+              userId,
+              auditSessionId: auditId,
+              tx,
+            })
+        );
+
+        // After the write, so a refused comment is never announced as created.
+        sendNotification({
+          title: "Note created",
+          message: "Your audit note has been created successfully",
+          icon: { name: "success", variant: "success" },
+          senderId: authSession.userId,
+        });
+
+        return data(payload({ note }));
+      }
+      case "DELETE": {
+        const { noteId } = parseData(
+          await request.formData(),
+          z.object({
+            noteId: z.string(),
+          }),
+          {
+            additionalData: { userId, auditId },
+          }
+        );
+
+        // deleteMany, not delete: `delete` needs a unique where, and the
+        // organization scope has to come through the parent audit session
+        // (AuditNote has no organizationId column).
+        //
+        // Only COMMENT notes are deletable. The audit's own activity entries —
+        // started, scanned, removed, completed — are UPDATE notes that record
+        // the acting user's id, so an author filter alone would let someone
+        // erase the trail of what they did. Scoped to the audit in the URL too.
+        const deleted = await db.auditNote.deleteMany({
+          where: {
+            id: noteId,
+            userId, // Ensure user can only delete their own notes
+            type: "COMMENT",
+            auditSessionId: auditId,
+            auditSession: { organizationId },
+          },
+        });
+
+        if (deleted.count === 0) {
+          throw new ShelfError({
+            cause: null,
+            message:
+              "Note not found or you don't have permission to delete it.",
+            additionalData: { noteId, organizationId },
+            label: "Audit",
+            status: 403,
+            shouldBeCaptured: false,
+          });
+        }
+
+        // After the zero-count check, not before: a refused cross-org delete
+        // would otherwise report success while returning 403.
+        sendNotification({
+          title: "Note deleted",
+          message: "Your audit note has been deleted successfully",
+          icon: { name: "trash", variant: "error" },
+          senderId: authSession.userId,
+        });
+
+        return data(payload(null));
+      }
+    }
+
+    throw notAllowedMethod(method);
+  } catch (cause) {
+    const reason = makeShelfError(cause, {
+      userId,
+      auditId,
+      label: "Audit Note",
+    });
+    return data(error(reason), { status: reason.status });
+  }
+}

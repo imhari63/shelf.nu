@@ -1,0 +1,1451 @@
+import type { Organization, User } from "@prisma/client";
+import Stripe from "stripe";
+import type { PriceWithProduct } from "~/components/subscription/prices";
+import { config } from "~/config/shelf.config";
+import { db } from "~/database/db.server";
+import type { AddonType } from "~/modules/billing/price-validation.server";
+import { getOrganizationByUserId } from "~/modules/organization/service.server";
+import {
+  getOrganizationTierLimit,
+  updateUserTierId,
+} from "~/modules/tier/service.server";
+import { formatDate, type ResolvedFormatPrefs } from "./date-format";
+import { SERVER_URL, STRIPE_SECRET_KEY } from "./env";
+import type { ErrorLabel } from "./error";
+import { ShelfError } from "./error";
+import type { UserNameFields } from "./user";
+
+const label: ErrorLabel = "Stripe";
+export const premiumIsEnabled = config.enablePremiumFeatures;
+
+export type CustomerWithSubscriptions = Stripe.Customer & {
+  subscriptions: {
+    has_more?: boolean;
+    data: Stripe.Subscription[];
+  };
+};
+
+let _stripe: Stripe;
+
+function getStripeServerClient() {
+  if (
+    !_stripe &&
+    premiumIsEnabled &&
+    STRIPE_SECRET_KEY !== "" &&
+    typeof STRIPE_SECRET_KEY === "string"
+  ) {
+    // Reference : https://github.com/stripe/stripe-node#usage-with-typescript
+    _stripe = new Stripe(STRIPE_SECRET_KEY, {
+      apiVersion: "2026-04-22.dahlia",
+    });
+  }
+  return _stripe;
+}
+
+export const stripe = getStripeServerClient();
+
+export type StripeEvent = ReturnType<Stripe["webhooks"]["constructEvent"]>;
+
+// copied from (https://github.com/kentcdodds/kentcdodds.com/blob/ebb36d82009685e14da3d4b5d0ce4d577ed09c63/app/utils/misc.tsx#L229-L237)
+export function getDomainUrl(request: Request) {
+  const host =
+    request.headers.get("X-Forwarded-Host") ?? request.headers.get("host");
+
+  if (!host) {
+    throw new ShelfError({
+      cause: null,
+      message: "Could not determine domain URL.",
+
+      label,
+    });
+  }
+
+  const protocol =
+    request.headers.get("X-Forwarded-Proto") ??
+    new URL(request.url).protocol.replace(":", "");
+
+  return `${protocol}://${host}`;
+}
+
+/**
+ * Creates a Stripe Checkout session for a tier subscription, with any add-ons
+ * as extra line items. A Team subscription is linked to the workspace of the
+ * customer's previous Team subscription when there is one.
+ */
+export async function createStripeCheckoutSession({
+  priceId,
+  userId,
+  domainUrl,
+  customerId,
+  intent,
+  shelfTier,
+  auditPriceId,
+  barcodePriceId,
+}: {
+  priceId: Stripe.Price["id"];
+  userId: User["id"];
+  domainUrl: string;
+  customerId: string;
+  intent: "trial" | "subscribe";
+  shelfTier: "tier_1" | "tier_2";
+  auditPriceId?: string;
+  barcodePriceId?: string;
+}): Promise<string> {
+  try {
+    if (!stripe) {
+      throw new ShelfError({
+        cause: null,
+        message: "Stripe not initialized",
+        additionalData: { priceId, userId, domainUrl, customerId },
+        label,
+      });
+    }
+
+    const SECRET_KEY = STRIPE_SECRET_KEY;
+
+    if (!SECRET_KEY) {
+      throw new ShelfError({
+        cause: null,
+        message: "Stripe secret key not found",
+        additionalData: { priceId, userId, domainUrl, customerId },
+        label,
+      });
+    }
+
+    const lineItems: { price: string; quantity: number }[] = [
+      {
+        price: priceId,
+        quantity: 1,
+      },
+    ];
+
+    if (auditPriceId) {
+      lineItems.push({ price: auditPriceId, quantity: 1 });
+    }
+
+    if (barcodePriceId) {
+      lineItems.push({ price: barcodePriceId, quantity: 1 });
+    }
+
+    const successUrl = await generateReturnUrl({
+      userId,
+      shelfTier,
+      intent,
+      domainUrl,
+      hasAuditAddon: !!auditPriceId,
+      hasBarcodeAddon: !!barcodePriceId,
+    });
+
+    // A Team owner coming back (after a paused trial or a cancelled plan)
+    // gets a new subscription; it keeps the workspace link of the old one so
+    // its bundled add-ons still reach that workspace.
+    const organizationId =
+      shelfTier === "tier_2"
+        ? await findWorkspaceOfPreviousTierSubscription({ customerId, userId })
+        : null;
+
+    const metadata = {
+      ...(organizationId && { organizationId }),
+      ...(intent === "trial" && auditPriceId && { includesAuditAddon: "true" }),
+      ...(intent === "trial" &&
+        barcodePriceId && { includesBarcodeAddon: "true" }),
+    };
+
+    const { url } = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: lineItems,
+      success_url: successUrl,
+      cancel_url: `${domainUrl}/account-details/subscription?canceled=true`,
+      client_reference_id: userId,
+      customer: customerId,
+      ...((intent === "trial" || Object.keys(metadata).length > 0) && {
+        subscription_data: {
+          ...(intent === "trial" && {
+            trial_settings: {
+              end_behavior: {
+                missing_payment_method: "pause" as const,
+              },
+            },
+            trial_period_days: config.freeTrialDays,
+          }),
+          ...(Object.keys(metadata).length > 0 && { metadata }),
+        },
+      }),
+      ...(intent === "trial" && {
+        payment_method_collection: "if_required" as const,
+      }),
+    });
+
+    if (!url) {
+      throw new ShelfError({
+        cause: null,
+        message: "No url found in stripe checkout session response",
+        additionalData: { priceId, userId, domainUrl, customerId },
+        label,
+      });
+    }
+    return url;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while creating a checkout session. Please try again later or contact support.",
+      additionalData: { priceId, userId, domainUrl, customerId },
+      label,
+    });
+  }
+}
+
+/**
+ * Fetches prices and products from Stripe. Returns empty arrays when premium features are disabled.
+ */
+export async function getStripePricesAndProducts() {
+  try {
+    if (!premiumIsEnabled) {
+      return {
+        month: [],
+        year: [],
+      };
+    }
+    if (!stripe) {
+      throw new ShelfError({
+        cause: null,
+        message: "Stripe not initialized",
+        label,
+      });
+    }
+
+    const pricesResponse = await stripe.prices.list({
+      active: true,
+      type: "recurring",
+      expand: ["data.product"],
+      limit: 100, // Increase limit to see more results
+    });
+
+    // Filter prices to only include those that should be shown on table and are not legacy
+    const filteredPrices = pricesResponse.data.filter(
+      (p) =>
+        p.metadata.show_on_table &&
+        p.metadata.show_on_table === "true" &&
+        p.metadata.legacy !== "true"
+    ) as PriceWithProduct[];
+
+    return groupPricesByInterval(filteredPrices);
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while fetching prices and products from Stripe. Please try again later or contact support.",
+      label,
+    });
+  }
+}
+
+/** Fetches prices and products from stripe */
+export async function getStripePricesForTrialPlanSelection() {
+  try {
+    const pricesResponse = await stripe.prices.list({
+      active: true,
+      type: "recurring",
+      expand: ["data.product"],
+      limit: 100, // Increase limit to see more results
+    });
+
+    const groupedPrices = groupPricesByInterval(
+      pricesResponse.data as PriceWithProduct[]
+    );
+    return [
+      ...groupedPrices.month.filter(
+        (price) =>
+          price.product.metadata.shelf_tier === "tier_2" &&
+          price.metadata.show_on_table === "true" &&
+          price.metadata.legacy !== "true"
+      ),
+      ...groupedPrices.year.filter(
+        (price) =>
+          price.product.metadata.shelf_tier === "tier_2" &&
+          price.metadata.show_on_table === "true" &&
+          price.metadata.legacy !== "true"
+      ),
+    ];
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while fetching prices and products from Stripe. Please try again later or contact support.",
+      label,
+    });
+  }
+}
+
+// Function to group prices by recurring interval
+function groupPricesByInterval(prices: PriceWithProduct[]) {
+  const groupedPrices: { [key: string]: PriceWithProduct[] } = {};
+
+  for (const price of prices) {
+    if (price?.recurring?.interval) {
+      const interval = price?.recurring?.interval;
+      if (!groupedPrices[interval]) {
+        groupedPrices[interval] = [];
+      }
+      groupedPrices[interval].push(price);
+    }
+  }
+
+  // Sort the prices within each group by unit_amount
+  for (const interval in groupedPrices) {
+    if (Object.prototype.hasOwnProperty.call(groupedPrices, interval)) {
+      // @ts-ignore
+      groupedPrices[interval].sort((a, b) => a.unit_amount - b.unit_amount);
+    }
+  }
+
+  return groupedPrices;
+}
+
+/**
+ * We create the stripe customer on onboarding,
+ * however we keep this to double check in case something went wrong
+ * If the customerId is not found, we create a new customer in Stripe
+ * and return the customerId.
+ * @param user - The user object containing id, email, firstName, lastName, and customerId
+ * @returns The customerId of the user in Stripe
+ * @throws ShelfError if no customerId is found for the user
+ */
+export async function getOrCreateCustomerId(
+  user: Pick<User, "id" | "email" | "firstName" | "lastName" | "customerId">
+) {
+  /**
+   * We create the stripe customer on onboarding,
+   * however we keep this to double check in case something went wrong
+   */
+  const customerId = user.customerId
+    ? user.customerId
+    : await createStripeCustomer({
+        email: user.email,
+        // why: out of the display-name rule — this names the billing customer
+        // on invoices and in Stripe's records, where the legal name is the one
+        // that has to appear.
+        name: `${user.firstName} ${user.lastName}`,
+        userId: user.id,
+      });
+
+  if (!customerId) {
+    throw new ShelfError({
+      cause: null,
+      message: "No customer ID found for user",
+      additionalData: { user },
+      label: "Subscription",
+    });
+  }
+  return customerId;
+}
+
+/** Creates customer entry in stripe */
+export const createStripeCustomer = async ({
+  name,
+  email,
+  userId,
+}: {
+  name: string;
+  email: User["email"];
+  userId: User["id"];
+}) => {
+  try {
+    if (premiumIsEnabled && stripe) {
+      const { id: customerId } = await stripe.customers.create({
+        email,
+        name,
+        metadata: {
+          userId,
+        },
+      });
+
+      await db.user.update({
+        where: { id: userId },
+        data: { customerId },
+        select: { id: true },
+      });
+
+      return customerId;
+    }
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to create customer in Stripe",
+      additionalData: { email, name, userId },
+      label,
+    });
+  }
+};
+
+/** Fetches customer based on ID */
+export const getStripeCustomer = async (customerId: string) => {
+  try {
+    return await stripe.customers.retrieve(customerId, {
+      expand: ["subscriptions"],
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to retrieve customer from Stripe",
+      additionalData: { customerId },
+      label,
+    });
+  }
+};
+
+/** Fetches subscriptions for a customer with expanded product details */
+export const getCustomerSubscriptionsWithProducts = async (
+  customerId: string
+) => {
+  try {
+    if (!stripe) return [];
+
+    // First, get the list of subscription IDs, page by page: Stripe hands out
+    // 10 per page by default, and a customer with several workspaces can hold
+    // more subscriptions than one page.
+    const listed: Stripe.Subscription[] = [];
+    let startingAfter: string | undefined;
+    do {
+      const page = await stripe.subscriptions.list({
+        customer: customerId,
+        limit: 100,
+        ...(startingAfter && { starting_after: startingAfter }),
+      });
+      listed.push(...page.data);
+      startingAfter = page.has_more
+        ? page.data[page.data.length - 1]?.id
+        : undefined;
+    } while (startingAfter);
+
+    // Then fetch each subscription individually with product expansion
+    // (Stripe limits list expansion to 4 levels, but retrieve allows it)
+    const subscriptions = await Promise.all(
+      listed.map((sub) =>
+        stripe.subscriptions.retrieve(sub.id, {
+          expand: ["items.data.price.product"],
+        })
+      )
+    );
+
+    return subscriptions;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to retrieve subscriptions from Stripe",
+      additionalData: { customerId },
+      label,
+    });
+  }
+};
+
+/**
+ * Reads a customer's subscriptions at most once.
+ *
+ * `getCustomerSubscriptionsWithProducts` lists the subscriptions and then
+ * retrieves each one, so one webhook event that asks several questions about
+ * them (an add-on still paid elsewhere, the plan still granted) shares a single
+ * read through this loader. The first call starts the read; later calls get
+ * the same promise.
+ *
+ * @param customerId - The Stripe customer whose subscriptions to read
+ * @returns A function resolving to the subscriptions, products expanded
+ */
+export function createCustomerSubscriptionsLoader(
+  customerId: string
+): () => Promise<Stripe.Subscription[]> {
+  let pending: Promise<Stripe.Subscription[]> | undefined;
+  return () => (pending ??= getCustomerSubscriptionsWithProducts(customerId));
+}
+
+/**
+ * Whether another live subscription of this customer still carries the add-on
+ * for the same workspace.
+ *
+ * A workspace can hold an add-on twice: bundled on its Team subscription and
+ * as a standalone add-on subscription, for instance one bought while the
+ * bundled one was lapsed. The organization flag is a single bit for both, so
+ * before an event on one subscription switches the add-on off, the other
+ * subscription is checked; otherwise a still-paid add-on goes dark until the
+ * next webhook happens to switch it back on.
+ *
+ * The subscription the event is about is skipped: its own status is what
+ * triggered the check. Product metadata is read the same way as in
+ * `getDataFromStripeEvent`, so an archived add-on product on a live
+ * subscription still counts.
+ *
+ * @param args.customerId - The Stripe customer the subscriptions belong to
+ * @param args.organizationId - The workspace whose add-on flag is at stake
+ * @param args.addonType - Which add-on to look for
+ * @param args.exceptSubscriptionId - The subscription that raised the event
+ * @param args.loadSubscriptions - Reads the customer's subscriptions; pass the
+ *   webhook's shared loader (`createCustomerSubscriptionsLoader`) so one event
+ *   lists them once. Defaults to a fresh read.
+ * @returns `true` if another active or trialing subscription linked to the
+ *   workspace carries the add-on
+ */
+export async function customerHasOtherActiveAddonSubscription({
+  customerId,
+  organizationId,
+  addonType,
+  exceptSubscriptionId,
+  loadSubscriptions = () => getCustomerSubscriptionsWithProducts(customerId),
+}: {
+  customerId: string;
+  organizationId: string;
+  addonType: AddonType;
+  exceptSubscriptionId: string;
+  loadSubscriptions?: () => Promise<Stripe.Subscription[]>;
+}): Promise<boolean> {
+  const subscriptions = await loadSubscriptions();
+
+  return subscriptions.some(
+    (sub) =>
+      sub.id !== exceptSubscriptionId &&
+      (sub.status === "active" || sub.status === "trialing") &&
+      sub.metadata?.organizationId === organizationId &&
+      sub.items.data.some((item) => {
+        const product = item.price?.product;
+        return (
+          typeof product === "object" &&
+          product !== null &&
+          !product.deleted &&
+          product.metadata?.product_type === "addon" &&
+          product.metadata?.addon_type === addonType
+        );
+      })
+  );
+}
+
+/**
+ * Finds the Team workspace an earlier tier subscription of this customer was
+ * linked to, so a new tier subscription can carry the same link.
+ *
+ * Bundled add-ons reach their workspace only through the subscription's
+ * `metadata.organizationId`, which workspace creation writes once. A
+ * subscription bought later through Checkout (after a trial paused, or after
+ * the plan was cancelled) is a new subscription with no metadata, so every
+ * webhook about it would skip the add-ons. Copying the link keeps them tied to
+ * the workspace they belonged to.
+ *
+ * Only a workspace the user still owns counts: a transferred workspace keeps
+ * its old link on the previous owner's subscriptions.
+ *
+ * @param args.customerId - The Stripe customer about to subscribe
+ * @param args.userId - The user the customer belongs to
+ * @returns The organization id of the most recent linked tier subscription,
+ *   or `null` when there is none
+ */
+export async function findWorkspaceOfPreviousTierSubscription({
+  customerId,
+  userId,
+}: {
+  customerId: string;
+  userId: User["id"];
+}): Promise<string | null> {
+  const linked: Stripe.Subscription[] = [];
+  let startingAfter: string | undefined;
+  do {
+    const page = await stripe.subscriptions.list({
+      customer: customerId,
+      status: "all",
+      limit: 100,
+      ...(startingAfter && { starting_after: startingAfter }),
+    });
+    linked.push(...page.data.filter((sub) => sub.metadata?.organizationId));
+    startingAfter = page.has_more
+      ? page.data[page.data.length - 1]?.id
+      : undefined;
+  } while (startingAfter);
+  if (linked.length === 0) return null;
+
+  const ownedTeamWorkspaces = await db.organization.findMany({
+    where: {
+      id: { in: linked.map((sub) => sub.metadata.organizationId) },
+      userId,
+      type: "TEAM",
+    },
+    select: { id: true },
+  });
+  const ownedIds = new Set(ownedTeamWorkspaces.map((org) => org.id));
+
+  // Newest first; standalone add-on subscriptions carry the link too, so each
+  // candidate has to hold a tier item to count.
+  const candidates = linked
+    .filter((sub) => ownedIds.has(sub.metadata.organizationId))
+    .sort((a, b) => b.created - a.created);
+  for (const sub of candidates) {
+    for (const item of sub.items.data) {
+      const productId =
+        typeof item.price.product === "string"
+          ? item.price.product
+          : item.price.product?.id;
+      if (!productId) continue;
+      const product = await stripe.products.retrieve(productId);
+      if (
+        product.metadata?.shelf_tier &&
+        product.metadata?.product_type !== "addon"
+      ) {
+        return sub.metadata.organizationId;
+      }
+    }
+  }
+  return null;
+}
+
+export async function createBillingPortalSession({
+  customerId,
+}: {
+  customerId: string;
+}) {
+  try {
+    const { url } = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${SERVER_URL}/account-details/subscription`,
+    });
+
+    return { url };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while creating a billing portal session. Please try again later or contact support.",
+      additionalData: { customerId },
+      label,
+    });
+  }
+}
+
+/** Gets the customer's paid subscription */
+export function getCustomerPaidSubscription({
+  customer,
+}: {
+  customer: CustomerWithSubscriptions | null;
+}) {
+  return (
+    customer?.subscriptions?.data.find((sub) => sub.status === "active") || null
+  );
+}
+
+/** Gets the trial subscription from customers subscription */
+export function getCustomerTrialSubscription({
+  customer,
+}: {
+  customer: CustomerWithSubscriptions | null;
+}) {
+  return (
+    customer?.subscriptions?.data.find((sub) => sub.status === "trialing") ||
+    null
+  );
+}
+
+export function getCustomerActiveSubscription({
+  customer,
+}: {
+  customer: CustomerWithSubscriptions | null;
+}) {
+  /** Get the trial subscription */
+  const trialSubscription = getCustomerTrialSubscription({ customer });
+
+  /** Get a normal subscription */
+  const paidSubscription = getCustomerPaidSubscription({ customer });
+
+  /** WE prioritize active subscrption over trial */
+  return paidSubscription || trialSubscription;
+}
+
+export async function fetchStripeSubscription(id: string) {
+  try {
+    return await stripe.subscriptions.retrieve(id, {
+      expand: ["items.data.plan.product"],
+    });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to fetch subscription from Stripe",
+      additionalData: { id },
+      label,
+    });
+  }
+}
+
+export async function getDataFromStripeEvent(event: Stripe.Event) {
+  try {
+    // Here we need to update the user's tier in the database based on the subscription they created
+    const subscription = event.data.object as Stripe.Subscription;
+    const customerId = subscription.customer as string;
+
+    // Iterate all subscription items to find tier and addon products
+    const items = await Promise.all(
+      subscription.items.data.map(async (item) => {
+        const productId = item.plan.product as string;
+        const product = await stripe.products.retrieve(productId);
+        return {
+          product,
+          tierId: product?.metadata?.shelf_tier,
+          productType: product?.metadata?.product_type,
+          addonType: product?.metadata?.addon_type,
+        };
+      })
+    );
+
+    // The tier item is the one with a shelf_tier metadata
+    const tierItem = items.find((i) => i.tierId);
+    // The audit addon item is the one marked as addon with audits type
+    const auditItem = items.find(
+      (i) => i.productType === "addon" && i.addonType === "audits"
+    );
+    // The barcode addon item is the one marked as addon with barcodes type
+    const barcodeItem = items.find(
+      (i) => i.productType === "addon" && i.addonType === "barcodes"
+    );
+
+    // For backward compat: return tier product info, or fall back to first item
+    const primaryItem = tierItem || items[0];
+
+    return {
+      subscription,
+      customerId,
+      tierId: primaryItem.tierId,
+      productType: primaryItem.productType,
+      product: primaryItem.product,
+      hasAuditAddon: !!auditItem,
+      hasBarcodeAddon: !!barcodeItem,
+    };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Something went wrong while fetching data from Stripe event",
+      additionalData: { event },
+      label,
+      status: 500,
+    });
+  }
+}
+
+export const disabledTeamOrg = async ({
+  currentOrganization,
+  organizations,
+  url,
+}: {
+  organizations: Pick<
+    Organization,
+    "id" | "type" | "name" | "imageId" | "userId"
+  >[];
+  currentOrganization: Pick<Organization, "id" | "type">;
+  url: string;
+}) => {
+  if (!premiumIsEnabled) return false;
+  /**
+   * We need to check a few things before disabling team orgs
+   *
+   * 1. The current organization is a team
+   * 2. The current tier has to be tier_2. Anything else is not allowed
+   * 3. We need to check the url as the user should be allowed to access certain urls, even if the current org is a team org and they are Self service
+   */
+
+  /** All account details routes should be accessible always */
+  if (url.includes("account-details")) return false;
+  const tierLimit = await getOrganizationTierLimit({
+    organizationId: currentOrganization.id,
+    organizations,
+  });
+
+  return (
+    currentOrganization.type === "TEAM" &&
+    ["free", "tier_1"].includes(tierLimit?.id)
+  );
+};
+
+/** Creates a team trial subscription directly via the Stripe API (no checkout) */
+export async function createTeamTrialSubscription({
+  customerId,
+  priceId,
+  userId,
+  auditPriceId,
+  barcodePriceId,
+}: {
+  customerId: string;
+  priceId: string;
+  userId: User["id"];
+  auditPriceId?: string;
+  barcodePriceId?: string;
+}) {
+  try {
+    if (!stripe) {
+      throw new ShelfError({
+        cause: null,
+        message: "Stripe not initialized",
+        additionalData: { customerId, priceId, userId },
+        label,
+      });
+    }
+
+    const lineItems: { price: string }[] = [{ price: priceId }];
+    if (auditPriceId) {
+      lineItems.push({ price: auditPriceId });
+    }
+    if (barcodePriceId) {
+      lineItems.push({ price: barcodePriceId });
+    }
+
+    // If the customer already has a payment method, attach it so Stripe
+    // can auto-charge when the trial ends.
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: customerId,
+      limit: 1,
+    });
+    const defaultPaymentMethod = paymentMethods.data[0]?.id;
+
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: lineItems,
+      trial_period_days: config.freeTrialDays,
+      trial_settings: {
+        end_behavior: {
+          missing_payment_method: "pause",
+        },
+      },
+      ...(defaultPaymentMethod && {
+        default_payment_method: defaultPaymentMethod,
+      }),
+      metadata: {
+        userId,
+        createdByAction: "true",
+        ...(auditPriceId && { includesAuditAddon: "true" }),
+        ...(barcodePriceId && { includesBarcodeAddon: "true" }),
+      },
+    });
+
+    return { subscription, hasPaymentMethod: !!defaultPaymentMethod };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while creating team trial subscription. Please try again later or contact support.",
+      additionalData: { customerId, priceId, userId },
+      label,
+    });
+  }
+}
+
+/** Generates the redirect URL based on relevant data */
+export async function generateReturnUrl({
+  userId,
+  shelfTier,
+  intent,
+  domainUrl,
+  hasAuditAddon,
+  hasBarcodeAddon,
+}: {
+  userId: User["id"];
+  shelfTier: "tier_1" | "tier_2" | "free" | "custom";
+  intent: "trial" | "subscribe";
+  domainUrl: string;
+  hasAuditAddon?: boolean;
+  hasBarcodeAddon?: boolean;
+}) {
+  /**
+   * Here we have a few cases:
+   * 1. If its trial and tier_2, and they dont own team workspaces we redirect them to create a team workspace - we can safely assume that is their first entrance
+   * 3. If its any other tier, we redirect them to /account-details/subscription
+   */
+
+  /** We do a small try/catch to prevent throwing as we just need to continue */
+  let userTeamOrg;
+  try {
+    userTeamOrg = await getOrganizationByUserId({
+      userId,
+      orgType: "TEAM",
+    });
+  } catch (_cause) {
+    userTeamOrg = null;
+  }
+
+  const urlSearchParams = new URLSearchParams({
+    success: "true",
+    team: shelfTier === "tier_2" ? "true" : "",
+    ...(intent === "trial" && { trial: "true" }),
+    ...(userTeamOrg && { hasExistingWorkspace: "true" }),
+    ...(hasAuditAddon && { includesAudits: "true" }),
+    ...(hasBarcodeAddon && { includesBarcodes: "true" }),
+  });
+
+  return shelfTier === "tier_2" && !userTeamOrg // If the user is on tier_2, and they dont already OWN a team org we redirect them to create a team workspace
+    ? `${domainUrl}/account-details/workspace/new?${urlSearchParams.toString()}`
+    : `${domainUrl}/account-details/subscription?${urlSearchParams.toString()}`;
+}
+
+/** Fetches open (unpaid) invoices for a customer */
+export async function getCustomerOpenInvoices(customerId: string) {
+  try {
+    if (!stripe) return [];
+    const invoices = await stripe.invoices.list({
+      customer: customerId,
+      status: "open",
+      limit: 10,
+    });
+    return invoices.data;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to fetch open invoices",
+      additionalData: { customerId },
+      label,
+    });
+  }
+}
+
+/**
+ * Whether a subscription in this status still grants its plan.
+ *
+ * Active and trialing subscriptions do, and so does a `past_due` one: a failed
+ * renewal is a grace period, not a lapse (see `validateSubscriptionIsActive`).
+ * Page-load access and every webhook decision about the plan a customer keeps
+ * read this, so they agree on which subscriptions count.
+ *
+ * Raising a user to a higher plan on a subscription update asks more: the
+ * update's subscription must be `active`. A plan is granted once it is paid
+ * for and kept through a grace period, so a switch to Team whose first invoice
+ * fails (`past_due`) does not open Team.
+ *
+ * @param status - The subscription's Stripe status
+ * @returns `true` for `active`, `trialing` and `past_due`
+ */
+export function subscriptionStatusGrantsPlan(
+  status: Stripe.Subscription.Status
+): boolean {
+  return status === "active" || status === "trialing" || status === "past_due";
+}
+
+/**
+ * Downgrades a user to Free when their Stripe customer holds no subscription
+ * that still grants access.
+ *
+ * Access lasts while a subscription is active or trialing, and also while it
+ * is `past_due`: a failed renewal opens a grace period in which Stripe keeps
+ * retrying the card and the app asks the user to update their payment method.
+ * The grace period ends when Stripe cancels the subscription or marks it
+ * unpaid after the last retry, or when `invoice.overdue` fires, whichever the
+ * Stripe settings reach first; the add-ons follow the same rule in their
+ * webhook handlers.
+ *
+ * @param args.user - The signed-in user; `skipSubscriptionCheck` exempts them
+ * @param args.customer - The user's Stripe customer with its subscriptions
+ */
+export async function validateSubscriptionIsActive({
+  user,
+  customer,
+}: {
+  user: Pick<User, "id" | "skipSubscriptionCheck" | "tierId">;
+  customer: CustomerWithSubscriptions | null;
+}) {
+  if (user.skipSubscriptionCheck) return;
+
+  const hasAccess = customer?.subscriptions?.data.some((sub) =>
+    subscriptionStatusGrantsPlan(sub.status)
+  );
+
+  if (!hasAccess && user.tierId !== "free") {
+    await updateUserTierId(user.id, "free");
+  }
+}
+
+/** Fetches paid invoices for a customer (last N invoices) */
+export async function getCustomerPaidInvoices(customerId: string, limit = 10) {
+  try {
+    if (!stripe) return [];
+    const invoices = await stripe.invoices.list({
+      customer: customerId,
+      status: "paid",
+      limit,
+    });
+    return invoices.data;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to fetch paid invoices",
+      additionalData: { customerId },
+      label,
+    });
+  }
+}
+
+/**
+ * Retrieves Stripe customer data and builds a deduplicated email list.
+ * Use this when sending subscription-related emails to both Stripe and Shelf emails.
+ */
+export async function getCustomerNotificationData({
+  customerId,
+  user,
+}: {
+  customerId: string;
+  user: UserNameFields & { email: string };
+}) {
+  const stripeCustomer = await stripe.customers.retrieve(customerId);
+  const stripeEmail =
+    stripeCustomer && !stripeCustomer.deleted ? stripeCustomer.email : null;
+  const stripeName =
+    stripeCustomer && !stripeCustomer.deleted ? stripeCustomer.name : null;
+
+  // Deduplicate emails (Stripe email + Shelf user email)
+  const emailsToNotify = new Set<string>();
+  if (stripeEmail) emailsToNotify.add(stripeEmail.toLowerCase());
+  if (user.email) emailsToNotify.add(user.email.toLowerCase());
+
+  return {
+    emailsToNotify,
+    /**
+     * `customerName` is a salutation ("Hey {name},"), not a billing name — so a
+     * display name outranks the name Stripe holds, which is the legal one we
+     * registered for invoices.
+     */
+    customerName: user.displayName?.trim() || stripeName || user.firstName,
+  };
+}
+
+/**
+ * Prepares invoice notification data and returns deduplicated email list.
+ * Use this when sending invoice-related emails to both Stripe and Shelf emails.
+ */
+export async function getInvoiceNotificationData({
+  customerId,
+  invoice,
+  user,
+  prefs,
+}: {
+  customerId: string;
+  invoice: Stripe.Invoice;
+  user: UserNameFields & { email: string };
+  /** Resolved formatting prefs of the billed (recipient) user. */
+  prefs: ResolvedFormatPrefs;
+}) {
+  const { emailsToNotify, customerName } = await getCustomerNotificationData({
+    customerId,
+    user,
+  });
+
+  const subscriptionName =
+    invoice.lines?.data?.[0]?.description || "Shelf Subscription";
+  const amountDue = new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: invoice.currency,
+  }).format(invoice.amount_due / 100);
+  const dueDate = invoice.due_date
+    ? formatDate(new Date(invoice.due_date * 1000), prefs, {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      })
+    : null;
+
+  return {
+    emailsToNotify,
+    customerName,
+    subscriptionName,
+    amountDue,
+    dueDate,
+  };
+}
+
+/** Fetches upcoming invoices for all active subscriptions of a customer */
+export async function getCustomerUpcomingInvoices(
+  customer: CustomerWithSubscriptions
+) {
+  try {
+    if (!stripe) return [];
+
+    const activeSubscriptions =
+      customer.subscriptions?.data.filter(
+        (sub) => sub.status === "active" || sub.status === "trialing"
+      ) ?? [];
+
+    if (activeSubscriptions.length === 0) return [];
+
+    // Fetch upcoming invoice for each active subscription
+    const upcomingInvoices = await Promise.all(
+      activeSubscriptions.map(async (sub) => {
+        try {
+          const invoice = await stripe.invoices.createPreview({
+            customer: customer.id,
+            subscription: sub.id,
+          });
+          return invoice;
+        } catch (cause) {
+          // Stripe throws errors when there's no upcoming invoice:
+          // - 'invoice_upcoming_none' for subscriptions without upcoming invoices
+          // - 404 for trialing subscriptions that will pause (no payment method)
+          if (
+            cause instanceof Stripe.errors.StripeInvalidRequestError &&
+            (cause.code === "invoice_upcoming_none" || cause.statusCode === 404)
+          ) {
+            return null;
+          }
+          throw cause;
+        }
+      })
+    );
+
+    // Filter out null values (subscriptions without upcoming invoices)
+    return upcomingInvoices.filter(
+      (invoice): invoice is NonNullable<typeof invoice> => invoice !== null
+    );
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to fetch upcoming invoices",
+      additionalData: { customerId: customer.id },
+      label,
+    });
+  }
+}
+
+export type SubscriptionDetail = {
+  subscriptionId: string;
+  subscriptionName: string;
+  type: "tier" | "addon";
+};
+
+export type OwnerSubscriptionInfo = {
+  hasActiveSubscription: boolean;
+  subscriptions: SubscriptionDetail[];
+  tierId: string | null;
+};
+
+/**
+ * Gets active subscription info for a user by their userId
+ * Returns the active or trialing subscription if one exists
+ */
+export async function getUserActiveSubscription(
+  userId: string
+): Promise<Stripe.Subscription | null> {
+  try {
+    if (!stripe || !premiumIsEnabled) return null;
+
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { customerId: true },
+    });
+
+    if (!user?.customerId) return null;
+
+    const customer = (await getStripeCustomer(
+      user.customerId
+    )) as CustomerWithSubscriptions;
+
+    if (customer.deleted) return null;
+
+    return getCustomerActiveSubscription({ customer });
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to get user active subscription",
+      additionalData: { userId },
+      label,
+    });
+  }
+}
+
+/**
+ * Gets ALL active/trialing subscriptions for a user.
+ * Used by the transfer flow to transfer all relevant subscriptions.
+ */
+export async function getUserActiveSubscriptions(
+  userId: string
+): Promise<Stripe.Subscription[]> {
+  try {
+    if (!stripe || !premiumIsEnabled) return [];
+
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { customerId: true },
+    });
+
+    if (!user?.customerId) return [];
+
+    const subscriptions = await getCustomerSubscriptionsWithProducts(
+      user.customerId
+    );
+
+    return subscriptions.filter(
+      (sub) => sub.status === "active" || sub.status === "trialing"
+    );
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to get user active subscriptions",
+      additionalData: { userId },
+      label,
+    });
+  }
+}
+
+/**
+ * Gets subscription info formatted for the transfer dialog display.
+ * Returns details about ALL of the owner's active subscriptions (tier + addons).
+ *
+ * @param ownerId - The user ID of the workspace owner
+ * @param organizationId - The workspace being transferred (used to filter addon subscriptions)
+ */
+export async function getOwnerSubscriptionInfo(
+  ownerId: string,
+  organizationId: string
+): Promise<OwnerSubscriptionInfo> {
+  try {
+    if (!stripe || !premiumIsEnabled) {
+      return {
+        hasActiveSubscription: false,
+        subscriptions: [],
+        tierId: null,
+      };
+    }
+
+    const user = await db.user.findUnique({
+      where: { id: ownerId },
+      select: { customerId: true, tierId: true },
+    });
+
+    if (!user?.customerId) {
+      return {
+        hasActiveSubscription: false,
+        subscriptions: [],
+        tierId: user?.tierId || null,
+      };
+    }
+
+    const allSubscriptions = await getCustomerSubscriptionsWithProducts(
+      user.customerId
+    );
+
+    // Filter to active or trialing subscriptions
+    const activeSubscriptions = allSubscriptions.filter(
+      (sub) => sub.status === "active" || sub.status === "trialing"
+    );
+
+    if (activeSubscriptions.length === 0) {
+      return {
+        hasActiveSubscription: false,
+        subscriptions: [],
+        tierId: user.tierId,
+      };
+    }
+
+    // Classify each subscription by inspecting its line-item products
+    const details: SubscriptionDetail[] = [];
+    for (const sub of activeSubscriptions) {
+      for (const item of sub.items.data) {
+        const product = item.price?.product as Stripe.Product | null;
+        if (!product) continue;
+
+        const shelfTier = product.metadata?.shelf_tier;
+        const productType = product.metadata?.product_type;
+
+        if (shelfTier) {
+          details.push({
+            subscriptionId: sub.id,
+            subscriptionName: product.name || "Active Plan",
+            type: "tier",
+          });
+        } else if (productType === "addon") {
+          // Only include addon subscriptions linked to this workspace
+          const subOrgId = (
+            sub as Stripe.Subscription & { metadata: Record<string, string> }
+          ).metadata?.organizationId;
+          if (subOrgId === organizationId) {
+            details.push({
+              subscriptionId: sub.id,
+              subscriptionName: product.name || "Add-on",
+              type: "addon",
+            });
+          }
+        }
+      }
+    }
+
+    return {
+      hasActiveSubscription: details.length > 0,
+      subscriptions: details,
+      tierId: user.tierId,
+    };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to get owner subscription info",
+      additionalData: { ownerId, organizationId },
+      label,
+    });
+  }
+}
+
+/**
+ * Transfers a Stripe subscription to a different customer.
+ *
+ * Since Stripe doesn't support changing the customer on an existing subscription,
+ * we cancel the old one and create a new one for the new customer.
+ *
+ * The billing cycle is preserved by setting `billing_cycle_anchor` to the
+ * original subscription's renewal date (`current_period_end`). Combined with
+ * `proration_behavior: 'none'`, the new subscription is immediately active
+ * with no charge until the original renewal date.
+ *
+ * The new owner must add their own payment method before the renewal date.
+ */
+export async function transferSubscriptionToCustomer({
+  subscriptionId,
+  newCustomerId,
+}: {
+  subscriptionId: string;
+  newCustomerId: string;
+}): Promise<Stripe.Subscription> {
+  try {
+    if (!stripe) {
+      throw new ShelfError({
+        cause: null,
+        message: "Stripe not initialized",
+        additionalData: { subscriptionId, newCustomerId },
+        label,
+      });
+    }
+
+    // Retrieve the existing subscription with expanded price info
+    const existingSubscription = (await stripe.subscriptions.retrieve(
+      subscriptionId,
+      { expand: ["items.data.price"] }
+    )) as Stripe.Subscription;
+
+    // Capture the original renewal date before cancellation
+    // In newer Stripe API, current_period_end is on subscription items
+    const firstItem = existingSubscription.items.data[0];
+    if (!firstItem) {
+      throw new ShelfError({
+        cause: null,
+        message: "Subscription has no items",
+        additionalData: { subscriptionId },
+        label,
+      });
+    }
+    const originalRenewalDate = firstItem.current_period_end;
+
+    // Create new subscription FIRST, before canceling the old one.
+    // This ensures if creation fails, the original subscription is preserved.
+    // billing_cycle_anchor preserves the original renewal date so the first
+    // charge happens when the previously-paid period ends.
+    // proration_behavior 'none' ensures no charge for the partial period.
+    // payment_behavior 'allow_incomplete' allows creation without payment method.
+    const subscriptionParams: Stripe.SubscriptionCreateParams = {
+      customer: newCustomerId,
+      items: existingSubscription.items.data.map((item) => ({
+        price: item.price.id,
+        quantity: item.quantity ?? 1,
+      })),
+      proration_behavior: "none",
+      payment_behavior: "allow_incomplete",
+      metadata: {
+        ...existingSubscription.metadata,
+        transferred_from_subscription: subscriptionId,
+      },
+    };
+
+    // Preserve trial status: if the original subscription is trialing,
+    // set trial_end so the new owner continues the trial instead of
+    // getting an immediately active subscription.
+    if (
+      existingSubscription.status === "trialing" &&
+      existingSubscription.trial_end
+    ) {
+      subscriptionParams.trial_end = existingSubscription.trial_end;
+    } else {
+      // For active (paid) subscriptions, preserve the billing cycle so the
+      // first charge happens when the previously-paid period ends.
+      subscriptionParams.billing_cycle_anchor = originalRenewalDate;
+    }
+
+    let newSubscription: Stripe.Subscription;
+    try {
+      newSubscription = await stripe.subscriptions.create(subscriptionParams);
+    } catch (anchorError: unknown) {
+      // billing_cycle_anchor can fail when the anchor date exceeds Stripe's
+      // "next natural billing date" (e.g. test clocks with forwarded time).
+      // Retry without the anchor so the transfer still succeeds.
+      const isAnchorError =
+        anchorError instanceof Error &&
+        anchorError.message?.includes("billing_cycle_anchor");
+
+      if (!isAnchorError) throw anchorError;
+
+      const { billing_cycle_anchor: _, ...paramsWithoutAnchor } =
+        subscriptionParams;
+      newSubscription = await stripe.subscriptions.create(paramsWithoutAnchor);
+    }
+
+    // Mark the old subscription as a transfer so the delete webhook
+    // doesn't undo work done by the new subscription's create webhook
+    // (e.g. disabling audits via handleAuditAddonWebhook).
+    await stripe.subscriptions.update(subscriptionId, {
+      metadata: { transferred_to_subscription: newSubscription.id },
+    });
+
+    // Only cancel the old subscription after the new one is successfully created
+    // No credits are issued - the remaining value transfers to the new owner
+    await stripe.subscriptions.cancel(subscriptionId, {
+      prorate: false,
+    });
+
+    return newSubscription;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to transfer subscription to new customer",
+      additionalData: { subscriptionId, newCustomerId },
+      label,
+    });
+  }
+}
+
+/**
+ * Checks if a user has an active subscription
+ * Used to validate if a user can receive a transferred subscription
+ */
+export async function userHasActiveSubscription(
+  userId: string
+): Promise<boolean> {
+  const subscription = await getUserActiveSubscription(userId);
+  return subscription !== null;
+}
+
+/**
+ * Checks if a Stripe customer has any payment method attached
+ * Returns true if the customer has at least one payment method
+ */
+export async function customerHasPaymentMethod(
+  customerId: string
+): Promise<boolean> {
+  try {
+    if (!stripe) return false;
+
+    // Check for any attached payment methods
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: customerId,
+      limit: 1,
+    });
+
+    if (paymentMethods.data.length > 0) {
+      return true;
+    }
+
+    // Also check legacy sources (cards added via old API)
+    const customer = await stripe.customers.retrieve(customerId);
+    if (customer.deleted) return false;
+
+    return !!customer.default_source;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to check customer payment method",
+      additionalData: { customerId },
+      label,
+    });
+  }
+}

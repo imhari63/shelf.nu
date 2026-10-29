@@ -1,0 +1,239 @@
+import type { ChangeEvent, RefObject, InputHTMLAttributes } from "react";
+import { forwardRef, useState } from "react";
+
+import { countCharacters } from "~/utils/count-characters";
+
+import { withNumberInputWheelGuard } from "~/utils/number-input-wheel-guard";
+import { tw } from "~/utils/tw";
+import { InnerLabel } from "./inner-label";
+import { CharacterCount } from "../shared/character-count";
+import type { IconType } from "../shared/icons-map";
+import iconsMap from "../shared/icons-map";
+
+export interface InputProps
+  extends InputHTMLAttributes<HTMLInputElement | HTMLTextAreaElement> {
+  name?: string;
+
+  /** Label for the input field */
+  label: string;
+
+  /** Type of the input. Default is input. Possible options are:
+   * - input
+   * - textarea
+   */
+  inputType?: "input" | "textarea";
+
+  /** Whether the label is hidden */
+  hideLabel?: boolean;
+
+  /** Whether the label is hidden on md */
+  hideMd?: boolean;
+
+  /** name of any icon available in icons map */
+  icon?: IconType;
+
+  /** Class name for the icon */
+  iconClassName?: string;
+
+  /** Add on to the input. Cannot be used together with icon  */
+  addOn?: string;
+
+  /** Class name for the wrapper element */
+  className?: string;
+
+  /** Class name for the input element */
+  inputClassName?: string;
+
+  /** Error message */
+  error?: string;
+
+  /** Choose to hide the error text. Only outline will show */
+  hideErrorText?: boolean;
+
+  /** Needed for input type textarea */
+  rows?: number;
+
+  /**
+   * Textarea only. The most characters the field accepts, shown as a live
+   * counter under the field. Typing past it is allowed (the counter turns red)
+   * so the limit has to be enforced by the form's validation. A textarea with
+   * a `characterLimit` gets no `maxLength`, so text already longer than the
+   * limit stays editable.
+   */
+  characterLimit?: number;
+
+  /** Sometimes you want to append a button to the input field. Set this to true to manage the style */
+  hasAttachedButton?: boolean;
+
+  required?: boolean;
+
+  /**
+   * Autocomplete attribute for better form UX and accessibility.
+   * Common values: "email", "name", "username", "new-password", "current-password", "tel", etc.
+   * See: https://developer.mozilla.org/en-US/docs/Web/HTML/Attributes/autocomplete
+   */
+  autoComplete?: string;
+}
+
+/**
+ * Shared form field: label, optional icon or add-on, error text and the app's
+ * input styling. Renders a `<textarea>` when `inputType` is "textarea". Number
+ * inputs ignore the mouse wheel while focused, so scrolling a form cannot
+ * change their value.
+ */
+const Input = forwardRef(function Input(
+  {
+    className,
+    inputClassName,
+    error,
+    hideErrorText,
+    inputType = "input",
+    label,
+    hideLabel,
+    hideMd,
+    hasAttachedButton = false,
+    addOn,
+    onChange,
+    icon,
+    iconClassName,
+    required = false,
+    characterLimit,
+    ...rest
+  }: InputProps,
+  ref
+) {
+  const [typedLength, setTypedLength] = useState(() =>
+    countCharacters(String(rest.defaultValue ?? ""))
+  );
+  const characterCount =
+    rest.value !== undefined
+      ? countCharacters(String(rest.value))
+      : typedLength;
+
+  /**
+   * @TODO
+   * Add automatic server side validation for error messages using getValidationErrors so we dont have to server side errors manually but only pass client side useZorm errors
+   *
+   */
+
+  const iconClasses = tw(
+    "pointer-events-none absolute flex h-full items-center border-gray-300 px-[14px]",
+    iconClassName
+  );
+
+  const addonClasses = tw(
+    "pointer-events-none flex items-center rounded-l-[4px] border-y border-l border-gray-300 bg-white px-[14px] text-gray-600"
+  );
+
+  const inputClasses = tw(
+    "w-full max-w-full border border-gray-300 px-[14px] py-2 text-[16px] text-gray-900 shadow outline-none placeholder:text-gray-500 focus:border-primary-300 focus:ring-[0] disabled:cursor-not-allowed disabled:border-gray-300 disabled:bg-gray-50 disabled:text-gray-500 disabled:placeholder:text-gray-300",
+    /** Add some border for error */
+    error ? "border-error-300 focus:border-error-300 focus:ring-error-100" : "",
+
+    /** Add or remove classes depending on weather we use an icon or addOn */
+    icon || addOn
+      ? icon
+        ? "rounded-[4px] pl-[42px]"
+        : "rounded-l-none rounded-r-[4px]"
+      : "rounded-[4px]",
+    hasAttachedButton ? tw("rounded-r-none") : undefined,
+    inputClassName
+  );
+
+  /** Store props in an object for easier dynamic rendering of input type */
+  const inputProps = {
+    className: inputClasses,
+    onChange,
+    ref,
+    // A field with an error is invalid for assistive tech too, not just red
+    // (also when `hideErrorText` moves the message elsewhere). An explicit
+    // `aria-invalid` from the caller in `rest` still wins.
+    "aria-invalid": error ? true : undefined,
+    ...rest,
+  };
+
+  // why: a React onWheel cannot cancel the browser's wheel step (React attaches
+  // wheel passively); the guard adds a native listener while the input is focused.
+  const wheelGuard =
+    rest.type === "number" ? withNumberInputWheelGuard(rest) : {};
+
+  let input = (
+    <input
+      {...inputProps}
+      {...wheelGuard}
+      aria-label={label}
+      ref={ref as RefObject<HTMLInputElement> | undefined}
+    />
+  );
+
+  /**
+   * Links the textarea to its counter for assistive tech, so the count (and
+   * the fact that it is over the limit) is read out with the field.
+   */
+  const characterCountId =
+    inputType === "textarea" && characterLimit
+      ? `${inputProps.name ?? "textarea"}-character-count`
+      : undefined;
+
+  if (inputType === "textarea") {
+    const countedOnChange = characterLimit
+      ? (event: ChangeEvent<HTMLTextAreaElement>) => {
+          setTypedLength(countCharacters(event.target.value));
+          onChange?.(event);
+        }
+      : onChange;
+
+    input = (
+      <textarea
+        {...inputProps}
+        onChange={countedOnChange}
+        maxLength={characterLimit ? undefined : rest.maxLength || 250}
+        rows={rest.rows || 8}
+        ref={ref as RefObject<HTMLTextAreaElement> | undefined}
+        aria-label={label}
+        aria-describedby={
+          [rest["aria-describedby"], characterCountId]
+            .filter(Boolean)
+            .join(" ") || undefined
+        }
+      />
+    );
+  }
+
+  return (
+    <label
+      className={tw("relative flex flex-col", className)}
+      htmlFor={inputProps.name}
+    >
+      {/* Label */}
+      <InnerLabel hideLg={hideLabel} hideMd={hideMd} required={required}>
+        {label}
+      </InnerLabel>
+
+      <div className="input-wrapper relative flex flex-wrap items-stretch">
+        {/* IconType */}
+        {icon && <div className={iconClasses}>{iconsMap[icon]}</div>}
+        {/* Addon */}
+        {addOn && <div className={addonClasses}>{addOn}</div>}
+        {/* Input */}
+        {input}
+      </div>
+
+      {inputType === "textarea" && characterLimit ? (
+        <CharacterCount
+          id={characterCountId}
+          count={characterCount}
+          max={characterLimit}
+          className="mt-1 self-end"
+        />
+      ) : null}
+
+      {/* Error */}
+      {!hideErrorText && error && (
+        <div className="text-sm text-error-500">{error}</div>
+      )}
+    </label>
+  );
+});
+
+export default Input;

@@ -1,0 +1,317 @@
+import type { AssetStatus } from "@prisma/client";
+import {
+  assetStatusColorMap,
+  userFriendlyAssetStatus,
+} from "~/components/assets/asset-status-badge";
+import { db } from "~/database/db.server";
+import { defaultUserCategories } from "~/modules/user/service.server";
+import { ShelfError } from "./error";
+import type { ImportEligibilityArgs } from "./subscription.server";
+import { resolveCanImportAssetsOrFalse } from "./subscription.server";
+import type { UserNameFields } from "./user";
+
+// ---------------------------------------------------------------------------
+// buildAssetsByStatusChart — converts Prisma groupBy result to chart shape
+// ---------------------------------------------------------------------------
+
+export function buildAssetsByStatusChart(
+  statusGroups: { status: string; _count: { _all: number } }[]
+) {
+  const chartData = statusGroups.map((g) => ({
+    /** The `AssetStatus` value, for the asset index `status` filter */
+    id: g.status as AssetStatus,
+    status: userFriendlyAssetStatus(g.status as AssetStatus),
+    assets: g._count._all,
+    color: assetStatusColorMap(g.status as AssetStatus).text,
+  }));
+  return { chartData };
+}
+
+// ---------------------------------------------------------------------------
+// buildMonthlyGrowthData — builds cumulative chart data from raw SQL rows
+// ---------------------------------------------------------------------------
+
+interface MonthlyGrowthRow {
+  month_start: Date;
+  assets_created: number;
+}
+
+// Fixed-en-US short-month formatter — the SAME mechanism the shared date
+// formatter (formatDate) uses for name-months. Constructed once at module
+// scope because Intl formatter construction is costly to repeat in a loop.
+const SHORT_MONTH_FMT = new Intl.DateTimeFormat("en-US", { month: "short" });
+
+export function buildMonthlyGrowthData(
+  monthlyRows: MonthlyGrowthRow[],
+  baselineCount: number
+) {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+
+  // Build a lookup: "YYYY-MM" → assetsCreated
+  const rowMap = new Map<string, number>();
+  for (const row of monthlyRows) {
+    const d = new Date(row.month_start);
+    const key = `${d.getFullYear()}-${d.getMonth()}`;
+    rowMap.set(key, Number(row.assets_created));
+  }
+
+  // Build the 12-month array with cumulative totals
+  let cumulative = baselineCount;
+  const months: {
+    month: string;
+    year: number;
+    assetsCreated: number;
+    "Total assets": number;
+  }[] = [];
+
+  for (let i = 0; i < 12; i++) {
+    const d = new Date(start.getFullYear(), start.getMonth() + i, 1);
+    const key = `${d.getFullYear()}-${d.getMonth()}`;
+    const assetsCreated = rowMap.get(key) ?? 0;
+    cumulative += assetsCreated;
+
+    months.push({
+      // why: a monthly chart-axis BUCKET label, not a full date — it uses the
+      // same fixed-en-US Intl month rendering as the shared date formatter
+      // (short English month, e.g. "Jul"), and deliberately does NOT follow the
+      // user's numeric date-format preference (a "07/2026" axis would be worse
+      // UX). Kept a short name so a month-name preference stays visually aligned.
+      month: SHORT_MONTH_FMT.format(d),
+      year: d.getFullYear(),
+      assetsCreated,
+      "Total assets": cumulative,
+    });
+  }
+
+  return months;
+}
+
+// ---------------------------------------------------------------------------
+// getCustodiansOrderedByTotalCustodies — pre-aggregated version
+// ---------------------------------------------------------------------------
+
+interface DirectCustodian {
+  id: string;
+  name: string;
+  userId: string | null;
+  user:
+    | (UserNameFields & { profilePicture: string | null; email: string })
+    | null;
+  _count: { custodies: number };
+}
+
+interface BookingForCustodians {
+  custodianUserId: string | null;
+  custodianTeamMemberId: string | null;
+  custodianTeamMember: {
+    id: string;
+    name: string;
+    userId: string | null;
+  } | null;
+  custodianUser:
+    | (UserNameFields & { profilePicture: string | null; email: string })
+    | null;
+  /**
+   * Count of assets on this booking via the explicit `BookingAsset` pivot.
+   * Pre-Phase-3a this field was `_count.assets` (from the implicit M2M);
+   * the migration renamed it to `bookingAssets` across the Prisma schema
+   * but this interface wasn't updated, which caused `_count.assets` to
+   * resolve as `undefined` → NaN in the dashboard "Top custodians" widget.
+   */
+  _count: { bookingAssets: number };
+}
+
+export function getCustodiansOrderedByTotalCustodies({
+  directCustodians,
+  bookings,
+}: {
+  directCustodians: DirectCustodian[];
+  bookings: BookingForCustodians[];
+}) {
+  // Map keyed by (userId || teamMemberId)
+  const countMap = new Map<
+    string,
+    {
+      count: number;
+      custodian: {
+        id: string;
+        name: string;
+        userId: string | null;
+        user: (UserNameFields & { profilePicture: string | null }) | null;
+      };
+    }
+  >();
+
+  // Add direct custodies
+  for (const tm of directCustodians) {
+    const key = tm.userId ?? tm.id;
+    const existing = countMap.get(key);
+    if (existing) {
+      existing.count += tm._count.custodies;
+    } else {
+      countMap.set(key, {
+        count: tm._count.custodies,
+        custodian: {
+          id: tm.id,
+          name: tm.name,
+          userId: tm.userId,
+          user: tm.user,
+        },
+      });
+    }
+  }
+
+  // Add booking custodies
+  for (const booking of bookings) {
+    const assetCount = booking._count.bookingAssets;
+    if (assetCount === 0) continue;
+
+    if (booking.custodianTeamMemberId && booking.custodianTeamMember) {
+      const key =
+        booking.custodianTeamMember.userId ?? booking.custodianTeamMemberId;
+      const existing = countMap.get(key);
+      if (existing) {
+        existing.count += assetCount;
+      } else {
+        countMap.set(key, {
+          count: assetCount,
+          custodian: {
+            id: booking.custodianTeamMemberId,
+            name: booking.custodianTeamMember.name,
+            userId: booking.custodianTeamMember.userId,
+            user: null,
+          },
+        });
+      }
+    } else if (booking.custodianUserId && booking.custodianUser) {
+      const key = booking.custodianUserId;
+      const existing = countMap.get(key);
+      if (existing) {
+        existing.count += assetCount;
+      } else {
+        countMap.set(key, {
+          count: assetCount,
+          custodian: {
+            id: booking.custodianUserId,
+            name: "",
+            userId: booking.custodianUserId,
+            user: booking.custodianUser,
+          },
+        });
+      }
+    }
+  }
+
+  // Sort by count desc, then by id for stable order
+  const sorted = [...countMap.entries()]
+    .sort(
+      ([aKey, a], [bKey, b]) => b.count - a.count || aKey.localeCompare(bKey)
+    )
+    .slice(0, 5);
+
+  return sorted.map(([id, { count, custodian }]) => ({
+    id,
+    count,
+    custodian,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// checklistOptions
+// ---------------------------------------------------------------------------
+
+/**
+ * Computes the count-backed onboarding checklist booleans.
+ *
+ * `hasAssets` and `hasCustodies` are composed at the call site (the home
+ * loader) from queries it already runs, so they are deliberately not
+ * re-counted here — see the `checklistOptions` object it builds.
+ *
+ * @param args.organizationId - The workspace to compute the checklist for
+ * @returns Checklist booleans keyed by onboarding step
+ * @throws {ShelfError} If any count query fails
+ */
+export async function checklistOptions({
+  organizationId,
+}: {
+  organizationId: string;
+}) {
+  try {
+    const [categoriesCount, tagsCount, teamMembersCount, customFieldsCount] =
+      await Promise.all([
+        db.category.count({
+          where: {
+            organizationId,
+            name: {
+              notIn: defaultUserCategories.map((uc) => uc.name),
+            },
+          },
+        }),
+
+        db.tag.count({
+          where: { organizationId },
+        }),
+
+        db.teamMember.count({
+          where: { organizationId },
+        }),
+
+        db.customField.count({
+          where: {
+            organizationId,
+            deletedAt: null,
+          },
+        }),
+      ]);
+
+    return {
+      hasCategories: categoriesCount > 0,
+      hasTags: tagsCount > 0,
+      hasTeamMembers: teamMembersCount > 0,
+      hasCustomFields: customFieldsCount > 0,
+    };
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while loading checklist options. Please try again or contact support.",
+      additionalData: { organizationId },
+      label: "Dashboard",
+    });
+  }
+}
+
+/**
+ * Decides what the home page's onboarding checklist shows.
+ *
+ * The checklist is on screen until the member skips it or every item is done.
+ * It offers the spreadsheet import only while the workspace has no assets: once
+ * one exists, the member has already started, so the item is dropped rather
+ * than ticked. The import eligibility lookup runs only when the item could
+ * appear, and a failed lookup reads as "cannot import".
+ *
+ * @param args.checklistOptions - Every checklist item, `true` when done
+ * @param args.skipOnboardingChecklist - Whether the member skipped the checklist
+ * @param args.importEligibility - What `resolveCanImportAssetsOrFalse` needs
+ * @returns Whether the checklist shows, and whether it offers the import
+ */
+export async function resolveOnboardingChecklist({
+  checklistOptions,
+  skipOnboardingChecklist,
+  importEligibility,
+}: {
+  checklistOptions: Record<string, boolean> & { hasAssets: boolean };
+  skipOnboardingChecklist: boolean;
+  importEligibility: ImportEligibilityArgs;
+}): Promise<{ showsChecklist: boolean; canImportAssets: boolean }> {
+  const showsChecklist =
+    !skipOnboardingChecklist && !Object.values(checklistOptions).every(Boolean);
+
+  const offersImport = showsChecklist && !checklistOptions.hasAssets;
+  const canImportAssets = offersImport
+    ? await resolveCanImportAssetsOrFalse(importEligibility)
+    : false;
+
+  return { showsChecklist, canImportAssets };
+}

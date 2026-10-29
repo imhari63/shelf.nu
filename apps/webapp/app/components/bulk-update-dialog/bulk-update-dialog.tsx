@@ -1,0 +1,393 @@
+import { forwardRef, useCallback, useEffect } from "react";
+import type { ElementRef, ReactNode } from "react";
+import { useAtomValue, useSetAtom } from "jotai";
+
+import {
+  bulkDialogAtom,
+  closeBulkDialogAtom,
+  openBulkDialogAtom,
+} from "~/atoms/bulk-update-dialog";
+import {
+  bulkSelectionKey,
+  selectedBulkItemsAtom,
+  selectedBulkItemsCountAtom,
+} from "~/atoms/list";
+import { useSearchParams } from "~/hooks/search-params";
+import useFetcherWithReset from "~/hooks/use-fetcher-with-reset";
+import { isFormProcessing } from "~/utils/form";
+import { tw } from "~/utils/tw";
+import Icon from "../icons/icon";
+import { Dialog, DialogPortal } from "../layout/dialog";
+import { Button } from "../shared/button";
+import type { DisabledProp } from "../shared/button";
+
+/**
+ * Type of the dialog
+ * This `type` will be used to find which dialog to open while clicking on trigger
+ * */
+type BulkDialogType =
+  | "location"
+  | "category"
+  | "asset-model"
+  | "asset-model-remove"
+  | "assign-custody"
+  | "release-custody"
+  | "trash"
+  | "activate"
+  | "deactivate"
+  | "archive"
+  | "reinstate"
+  | "tag-add"
+  | "tag-remove"
+  | "cancel"
+  | "available"
+  | "unavailable"
+  | "bookings"
+  | "booking-exist"
+  // Model reservations, from the asset index's model view. Separate from
+  // "bookings"/"booking-exist" because a model row carries a per-model
+  // quantity that an asset row does not.
+  | "model-bookings"
+  | "model-booking-exist"
+  | "download-qr"
+  | "partial-checkin"
+  | "add-to-kit"
+  | "remove-from-kit"
+  | "start-audit"
+  | "add-to-audit"
+  | "delete-audit"
+  | "reorder-point";
+
+type CommonBulkDialogProps = {
+  type: BulkDialogType;
+};
+
+type BulkUpdateDialogTriggerProps = CommonBulkDialogProps & {
+  label?: string;
+  onClick?: () => void;
+  /** Boolean, or `{ reason }` to explain WHY the action is unavailable. */
+  disabled?: DisabledProp;
+};
+
+type BulkUpdateTriggerButtonProps = {
+  /** Boolean, or `{ reason }` to explain WHY the action is unavailable. */
+  disabled?: DisabledProp;
+  type: BulkDialogType;
+  label: string;
+  onClick?: () => void;
+  onOpen: () => void;
+};
+
+/**
+ * The actual trigger button for {@link BulkUpdateDialogTrigger}.
+ *
+ * Hoisted to module scope (instead of nested inside the parent) so React
+ * treats it as a stable component identity across renders.
+ */
+function BulkUpdateTriggerButton({
+  disabled,
+  type,
+  label,
+  onClick,
+  onOpen,
+}: BulkUpdateTriggerButtonProps) {
+  return (
+    <Button
+      type="button"
+      variant="link"
+      className={tw(
+        "w-full justify-start px-4  py-3 text-gray-700 hover:text-gray-700"
+      )}
+      width="full"
+      onClick={() => {
+        onClick && onClick();
+        onOpen();
+      }}
+      disabled={disabled}
+    >
+      <span className="flex items-center gap-2">
+        <Icon icon={type} /> {label}
+      </span>
+    </Button>
+  );
+}
+
+/** This component is going to trigger the open state of dialog */
+function BulkUpdateDialogTrigger({
+  type,
+  onClick,
+  label = `Update ${type}`,
+  disabled,
+}: BulkUpdateDialogTriggerProps) {
+  const openBulkDialog = useSetAtom(openBulkDialogAtom);
+
+  function handleOpenDialog() {
+    openBulkDialog(type);
+  }
+
+  /**
+   * `disabled` is handed straight to `Button`, which owns the
+   * disabled-with-reason presentation (hover, tap and `aria-describedby`).
+   * This used to re-implement the HoverCard here, which left every bulk action
+   * hover-only — dead grey controls on touch. Don't reintroduce that copy.
+   */
+  return (
+    <BulkUpdateTriggerButton
+      disabled={disabled}
+      type={type}
+      label={label}
+      onClick={onClick}
+      onOpen={handleOpenDialog}
+    />
+  );
+}
+
+export type DialogContentChildrenProps = {
+  disabled: boolean;
+  handleCloseDialog: () => void;
+  fetcherError?: string;
+  fetcherErrorAdditionalData?: Record<string, any>;
+  fetcherData?: Record<string, any>;
+};
+
+type BulkUpdateDialogContentProps = CommonBulkDialogProps & {
+  /**
+   * Additional className to dialog
+   */
+  className?: string;
+  /**
+   * Title for the Dialog content. A function receives the same props as
+   * `children`, so the title can follow the server's last answer (a bulk
+   * delete refused with a different count retitles itself).
+   * @default `Update ${type}`
+   */
+  title?: string | ((props: DialogContentChildrenProps) => string);
+  /**
+   * Description for the dialog content. Like `title`, may be a function of the
+   * `children` props.
+   * @default `Adjust the ${type} of selected (${itemsSelected}) assets.`
+   */
+  description?: string | ((props: DialogContentChildrenProps) => string);
+  /**
+   * URL of your action handler
+   * @example /api/assets/update-bulk-location
+   *  */
+  actionUrl?: string;
+  /**
+   * This will be called when the request was success
+   */
+  onSuccess?: () => void;
+  /**
+   * Content to be rendered inside the Dialog.
+   * It can either be a `ReactNode` or it can be a function returning `ReactNode`
+   * The function can receive props like `disabled`, `handleCloseDialog`, `fetcherError` with {@link DialogContentChildrenProps}
+   */
+  children: ReactNode | ((props: DialogContentChildrenProps) => ReactNode);
+  /**
+   * Id of the array input field
+   */
+  arrayFieldId: string;
+  /**
+   * If `true` then the dialog will not close after the success of dialog action.
+   */
+  skipCloseOnSuccess?: boolean;
+
+  /**
+   * When `true`, a successful mutation will NOT clear the bulk selection.
+   * Use only for flows that re-use the selection in an in-dialog success panel
+   * (e.g. the "Add more" path on add-to-existing-booking). Defaults to `false`
+   * so every bulk action clears the selection on success — the consistent
+   * behaviour across all index/list bulk actions.
+   */
+  keepSelectionOnSuccess?: boolean;
+
+  /**
+   * Additional className to form
+   */
+  formClassName?: string;
+
+  /**
+   * Opt in to a non-clipping, non-scrolling dialog body (`overflow: visible`).
+   *
+   * Set this ONLY when the dialog renders an inline, non-portaled floating
+   * element that must escape the body box — today that means `TagsAutocomplete`,
+   * whose `.react-tags__listbox` is absolutely positioned inside its own field.
+   * Radix popovers/selects wrapped in `PopoverPortal` render outside the dialog
+   * entirely and need nothing here.
+   *
+   * The cost is real: `.dialog-body` is the only scroll container a dialog has,
+   * so opting in means a dialog taller than `md:max-h-[calc(100vh-4rem)]` pushes
+   * its footer past the viewport with no way to reach it. This used to be on for
+   * every bulk dialog, which is what hid the "Create audit" submit button on
+   * short windows (#2894). A dialog that opts in must stay short.
+   *
+   * @default false
+   */
+  allowBodyOverflow?: boolean;
+};
+
+/** This component is basically the body of the Dialog */
+const BulkUpdateDialogContent = forwardRef<
+  ElementRef<"form">,
+  BulkUpdateDialogContentProps
+>(function (
+  {
+    className,
+    type,
+    children,
+    onSuccess,
+    title = `Update ${type}`,
+    description,
+    actionUrl,
+    arrayFieldId,
+    skipCloseOnSuccess = false,
+    keepSelectionOnSuccess = false,
+    formClassName = "",
+    allowBodyOverflow = false,
+  },
+  ref
+) {
+  const fetcher = useFetcherWithReset<any>();
+  const disabled = isFormProcessing(fetcher.state);
+
+  const [searchParams] = useSearchParams();
+
+  const bulkDialogOpenState = useAtomValue(bulkDialogAtom);
+  const closeBulkDialog = useSetAtom(closeBulkDialogAtom);
+
+  const selectedItems = useAtomValue(selectedBulkItemsAtom);
+  const totalItemsSelected = useAtomValue(selectedBulkItemsCountAtom);
+  const setSelectedItems = useSetAtom(selectedBulkItemsAtom);
+
+  const isDialogOpen = bulkDialogOpenState[type] === true;
+
+  const handleCloseDialog = useCallback(() => {
+    closeBulkDialog(type);
+    fetcher.reset();
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [closeBulkDialog, type]);
+
+  /**
+   * Runs once a bulk action succeeds. Clears the selection by default so the
+   * user does not have to manually "unselect all" before the next batch — the
+   * central behaviour that makes every index's bulk actions consistent.
+   *
+   * Opt out with `keepSelectionOnSuccess` for the rare flow that re-uses the
+   * selection in an in-dialog success panel (the dialog stays open via
+   * `skipCloseOnSuccess`).
+   */
+  const handleBulkActionSuccess = useCallback(() => {
+    if (!keepSelectionOnSuccess) {
+      setSelectedItems([]);
+    }
+
+    if (!skipCloseOnSuccess) {
+      handleCloseDialog();
+    }
+
+    onSuccess && onSuccess();
+  }, [
+    keepSelectionOnSuccess,
+    setSelectedItems,
+    skipCloseOnSuccess,
+    onSuccess,
+    handleCloseDialog,
+  ]);
+
+  useEffect(
+    function handleOnSuccess() {
+      if (fetcher.data?.error) {
+        return;
+      }
+
+      /** We have to close the dialog and remove all selected assets when update is success */
+      if (fetcher.data?.success) {
+        handleBulkActionSuccess();
+      }
+    },
+    [fetcher.data, handleBulkActionSuccess]
+  );
+
+  /** What `children`, `title` and `description` functions receive. */
+  const contentProps: DialogContentChildrenProps = {
+    disabled,
+    handleCloseDialog,
+    fetcherData: fetcher?.data,
+    fetcherError: fetcher?.data?.error?.message,
+    fetcherErrorAdditionalData: fetcher?.data?.error?.additionalData,
+  };
+
+  return (
+    <DialogPortal>
+      <Dialog
+        open={isDialogOpen}
+        onClose={handleCloseDialog}
+        className={tw(
+          allowBodyOverflow && "dialog-allows-overflow",
+          className || "lg:w-[400px]"
+        )}
+        title={
+          <div className="w-full">
+            {type !== "cancel" ? (
+              <div className="mb-2 inline-flex items-center justify-center rounded-full border-8 border-solid border-primary-50 bg-primary-100 p-2 text-primary-600">
+                <Icon icon={type} />
+              </div>
+            ) : null}
+            <div className={tw("mb-5", type === "cancel" && "mt-5")}>
+              <h4>
+                {typeof title === "function" ? title(contentProps) : title}
+              </h4>
+              <p>
+                {description
+                  ? typeof description === "function"
+                    ? description(contentProps)
+                    : description
+                  : `Adjust the ${type} of selected (${totalItemsSelected}) assets.`}
+              </p>
+            </div>
+          </div>
+        }
+      >
+        <fetcher.Form
+          ref={ref}
+          method="post"
+          action={actionUrl ? actionUrl : `/api/assets/bulk-update-${type}`}
+          className={tw("px-6 pb-6", formClassName)}
+        >
+          <input
+            type="hidden"
+            name="currentSearchParams"
+            value={searchParams.toString()}
+          />
+
+          {/* Keyed by `bulkSelectionKey`, not `item.id`: on a booking, two
+              rows of the SAME asset can be selected (a standalone slice and a
+              kit-driven one), which collides on `id` and makes React warn and
+              risk mispairing inputs across re-renders. Everywhere else the
+              helper falls back to `id`, so keys are unchanged. The submitted
+              VALUE stays `item.id` — handlers resolve assets by asset id. */}
+          {selectedItems.map((item, i) => (
+            <input
+              key={bulkSelectionKey(item)}
+              type="hidden"
+              name={`${arrayFieldId}[${i}]`}
+              value={item.id}
+            />
+          ))}
+          <div className="modal-content-wrapper">
+            {typeof children === "function" ? children(contentProps) : children}
+          </div>
+        </fetcher.Form>
+      </Dialog>
+    </DialogPortal>
+  );
+});
+
+BulkUpdateDialogContent.displayName = "BulkUpdateDialogContent";
+
+export {
+  BulkUpdateDialogTrigger,
+  BulkUpdateDialogContent,
+  type BulkDialogType,
+};

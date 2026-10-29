@@ -1,0 +1,2171 @@
+/**
+ * @file Tests for the pure diff computation logic in import-update-diff.ts.
+ * All functions tested here are pure (no database calls) and don't require mocking.
+ *
+ * @see {@link file://./import-update-diff.ts}
+ */
+import { describe, expect, it } from "vitest";
+import { decodeCsvListCell } from "~/utils/csv-cells";
+import { parseYesNo } from "~/utils/custom-fields";
+import { ShelfError } from "~/utils/error";
+import {
+  analyzeUpdateHeaders,
+  compareCoreField,
+  compareCustomField,
+  computeAssetDiffs,
+  describeBulkUpdateRowFailure,
+  isBackupExportHeaderRow,
+  normalizeExportedCurrencyValue,
+} from "./import-update-diff";
+import type { AssetForUpdate, HeaderAnalysis } from "./import-update-types";
+
+// ---------------------------------------------------------------------------
+// Test Helpers
+// ---------------------------------------------------------------------------
+
+/** Creates a minimal AssetForUpdate for testing field comparisons */
+function makeAsset(overrides: Partial<AssetForUpdate> = {}): AssetForUpdate {
+  return {
+    id: "uuid-1",
+    title: "Test Asset",
+    description: null,
+    sequentialId: "SAM-0001",
+    valuation: null,
+    availableToBook: true,
+    category: null,
+    location: null,
+    tags: [],
+    customFields: [],
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// normalizeExportedCurrencyValue
+// ---------------------------------------------------------------------------
+
+describe("normalizeExportedCurrencyValue", () => {
+  it("strips USD currency symbol and thousand separator", () => {
+    expect(normalizeExportedCurrencyValue("$1,234.56")).toBe("1234.56");
+  });
+
+  it("handles European format (dot thousands, comma decimal)", () => {
+    expect(normalizeExportedCurrencyValue("1.234,56")).toBe("1234.56");
+  });
+
+  it("handles European short decimal", () => {
+    expect(normalizeExportedCurrencyValue("5454,5")).toBe("5454.5");
+  });
+
+  it("passes through plain numbers", () => {
+    expect(normalizeExportedCurrencyValue("42.5")).toBe("42.5");
+    expect(normalizeExportedCurrencyValue("100")).toBe("100");
+  });
+
+  it("strips various currency symbols", () => {
+    expect(normalizeExportedCurrencyValue("€100")).toBe("100");
+    expect(normalizeExportedCurrencyValue("£50.25")).toBe("50.25");
+    expect(normalizeExportedCurrencyValue("¥1000")).toBe("1000");
+    expect(normalizeExportedCurrencyValue("₹500")).toBe("500");
+  });
+
+  it("handles empty and whitespace strings", () => {
+    expect(normalizeExportedCurrencyValue("")).toBe("");
+    expect(normalizeExportedCurrencyValue("  ")).toBe("");
+  });
+
+  it("treats ambiguous 3-digit-after-comma as US thousand", () => {
+    // "1,234" is ambiguous but our export uses US format
+    expect(normalizeExportedCurrencyValue("1,234")).toBe("1234");
+  });
+
+  it("handles negative numbers", () => {
+    expect(normalizeExportedCurrencyValue("-42.5")).toBe("-42.5");
+  });
+
+  it("handles value with only currency symbol", () => {
+    expect(normalizeExportedCurrencyValue("$")).toBe("");
+  });
+
+  it("handles multiple thousand separators", () => {
+    expect(normalizeExportedCurrencyValue("1,234,567.89")).toBe("1234567.89");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseYesNo
+// ---------------------------------------------------------------------------
+
+describe("parseYesNo", () => {
+  it('returns true for "yes" (case-insensitive)', () => {
+    expect(parseYesNo("yes")).toBe(true);
+    expect(parseYesNo("Yes")).toBe(true);
+    expect(parseYesNo("YES")).toBe(true);
+  });
+
+  it('returns false for "no" (case-insensitive)', () => {
+    expect(parseYesNo("no")).toBe(false);
+    expect(parseYesNo("No")).toBe(false);
+    expect(parseYesNo("NO")).toBe(false);
+  });
+
+  it("trims whitespace before matching", () => {
+    expect(parseYesNo(" yes ")).toBe(true);
+    expect(parseYesNo("  no  ")).toBe(false);
+  });
+
+  it("returns undefined for unrecognized values", () => {
+    expect(parseYesNo("")).toBe(undefined);
+    expect(parseYesNo("maybe")).toBe(undefined);
+    expect(parseYesNo("true")).toBe(undefined);
+    expect(parseYesNo("1")).toBe(undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// analyzeUpdateHeaders
+// ---------------------------------------------------------------------------
+
+describe("analyzeUpdateHeaders", () => {
+  const mockCustomFields = [
+    { id: "cf1", name: "Serial Number", type: "TEXT" as const },
+    { id: "cf2", name: "Purchase Date", type: "DATE" as const },
+    { id: "cf3", name: "Notes", type: "MULTILINE_TEXT" as const },
+  ];
+
+  it("identifies Asset ID as primary identifier", () => {
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "Name", "Category"],
+      mockCustomFields
+    );
+    expect(result.idColumnIndex).toBe(0);
+    expect(result.idDbField).toBe("sequentialId");
+    expect(result.idColumnHeader).toBe("Asset ID");
+    expect(result.fallbackId).toBeNull();
+  });
+
+  it("identifies ID (UUID) as primary when Asset ID is absent", () => {
+    const result = analyzeUpdateHeaders(
+      ["ID", "Name", "Category"],
+      mockCustomFields
+    );
+    expect(result.idColumnIndex).toBe(0);
+    expect(result.idDbField).toBe("id");
+    expect(result.idColumnHeader).toBe("ID");
+  });
+
+  it("uses Asset ID as primary and ID as fallback when both present", () => {
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "ID", "Name"],
+      mockCustomFields
+    );
+    expect(result.idColumnIndex).toBe(0);
+    expect(result.idDbField).toBe("sequentialId");
+    expect(result.fallbackId).toEqual({
+      index: 1,
+      dbField: "id",
+      header: "ID",
+    });
+  });
+
+  it("returns idColumnIndex -1 when no identifier column found", () => {
+    const result = analyzeUpdateHeaders(["Name", "Category"], mockCustomFields);
+    expect(result.idColumnIndex).toBe(-1);
+  });
+
+  it("classifies updatable core fields", () => {
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "Name", "Category", "Location", "Tags", "Value"],
+      mockCustomFields
+    );
+    const updatableKeys = result.updatableColumns.map((c) => c.internalKey);
+    expect(updatableKeys).toContain("name");
+    expect(updatableKeys).toContain("category");
+    expect(updatableKeys).toContain("location");
+    expect(updatableKeys).toContain("tags");
+    expect(updatableKeys).toContain("valuation");
+  });
+
+  it("classifies non-updatable fields as ignored", () => {
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "Name", "Status", "Kit", "Custody"],
+      mockCustomFields
+    );
+    expect(result.ignoredColumns).toContain("Status");
+    expect(result.ignoredColumns).toContain("Kit");
+    expect(result.ignoredColumns).toContain("Custody");
+  });
+
+  it("updates a workspace custom field named like the export-only QR URL column", () => {
+    // The asset export leaves out its own QR URL column when a custom field
+    // already uses that header, so a "QR URL" header in such a workspace is
+    // the custom field.
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "Name", "QR URL"],
+      [...mockCustomFields, { id: "cf4", name: "QR URL", type: "TEXT" }]
+    );
+    expect(result.updatableColumns).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          csvHeader: "QR URL",
+          internalKey: "cf:QR URL",
+        }),
+      ])
+    );
+    expect(result.ignoredColumns).toEqual([]);
+  });
+
+  it("ignores the export-only QR URL and Total value columns", () => {
+    // A standard asset export fed back into the update importer carries these
+    // derived columns; they must be skipped, never reported as unknown.
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "Name", "QR ID", "QR URL", "Total value"],
+      mockCustomFields
+    );
+    expect(result.ignoredColumns).toEqual(
+      expect.arrayContaining(["QR URL", "Total value"])
+    );
+    expect(result.unrecognizedColumns).toEqual([]);
+  });
+
+  it("matches custom fields by name (case-insensitive)", () => {
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "serial number"],
+      mockCustomFields
+    );
+    expect(result.updatableColumns).toHaveLength(1);
+    expect(result.updatableColumns[0].kind).toBe("customField");
+    expect(result.updatableColumns[0].internalKey).toBe("cf:Serial Number");
+  });
+
+  it("ignores unsupported custom field types (MULTILINE_TEXT)", () => {
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "Notes"],
+      mockCustomFields
+    );
+    expect(result.updatableColumns).toHaveLength(0);
+    expect(result.ignoredColumns).toContain(
+      "Notes (multiline_text fields not supported for update)"
+    );
+  });
+
+  it("puts unknown columns in unrecognizedColumns", () => {
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "FooBar", "BazQux"],
+      mockCustomFields
+    );
+    expect(result.unrecognizedColumns).toEqual(["FooBar", "BazQux"]);
+  });
+
+  it("builds columnIndexMap for updatable columns", () => {
+    const result = analyzeUpdateHeaders(
+      ["Asset ID", "Name", "Category"],
+      mockCustomFields
+    );
+    expect(result.columnIndexMap.size).toBe(2);
+    expect(result.columnIndexMap.get(1)?.internalKey).toBe("name");
+    expect(result.columnIndexMap.get(2)?.internalKey).toBe("category");
+  });
+
+  it("trims header whitespace", () => {
+    const result = analyzeUpdateHeaders(
+      ["  Asset ID  ", "  Name  "],
+      mockCustomFields
+    );
+    expect(result.idColumnIndex).toBe(0);
+    expect(result.updatableColumns[0].internalKey).toBe("name");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// compareCoreField
+// ---------------------------------------------------------------------------
+
+describe("compareCoreField", () => {
+  describe("name", () => {
+    it("detects name change", () => {
+      const asset = makeAsset({ title: "Old Name" });
+      const result = compareCoreField("name", "New Name", asset, "Name");
+      expect(result).toEqual({
+        field: "Name",
+        currentValue: "Old Name",
+        newValue: "New Name",
+      });
+    });
+
+    it("returns null when name unchanged", () => {
+      const asset = makeAsset({ title: "Same Name" });
+      expect(compareCoreField("name", "Same Name", asset, "Name")).toBeNull();
+    });
+  });
+
+  describe("description (Task 2 fix round 1)", () => {
+    it("detects a description change", () => {
+      const asset = makeAsset({ description: "Old description" });
+      const result = compareCoreField(
+        "description",
+        "New description",
+        asset,
+        "Description"
+      );
+      expect(result).toEqual({
+        field: "Description",
+        currentValue: "Old description",
+        newValue: "New description",
+      });
+    });
+
+    it("returns null when description unchanged", () => {
+      const asset = makeAsset({ description: "Same description" });
+      expect(
+        compareCoreField(
+          "description",
+          "Same description",
+          asset,
+          "Description"
+        )
+      ).toBeNull();
+    });
+
+    it("treats a null description as empty when comparing", () => {
+      const asset = makeAsset({ description: null });
+      const result = compareCoreField(
+        "description",
+        "New description",
+        asset,
+        "Description"
+      );
+      expect(result?.currentValue).toBe("(none)");
+      expect(result?.newValue).toBe("New description");
+    });
+  });
+
+  describe("category", () => {
+    it("detects category change (case-insensitive)", () => {
+      const asset = makeAsset({ category: { name: "Electronics" } });
+      const result = compareCoreField(
+        "category",
+        "Furniture",
+        asset,
+        "Category"
+      );
+      expect(result?.newValue).toBe("Furniture");
+    });
+
+    it("returns null for same category different case", () => {
+      const asset = makeAsset({ category: { name: "Electronics" } });
+      expect(
+        compareCoreField("category", "electronics", asset, "Category")
+      ).toBeNull();
+    });
+
+    it('uses "Uncategorized" as default when asset has no category', () => {
+      const asset = makeAsset({ category: null });
+      expect(
+        compareCoreField("category", "Uncategorized", asset, "Category")
+      ).toBeNull();
+    });
+  });
+
+  describe("location", () => {
+    it("detects location change", () => {
+      const asset = makeAsset({
+        location: { id: "loc-1", name: "Office A" },
+      });
+      const result = compareCoreField(
+        "location",
+        "Warehouse",
+        asset,
+        "Location"
+      );
+      expect(result?.newValue).toBe("Warehouse");
+      expect(result?.currentValue).toBe("Office A");
+    });
+
+    it('shows "(none)" for null location', () => {
+      const asset = makeAsset({ location: null });
+      const result = compareCoreField("location", "Office", asset, "Location");
+      expect(result?.currentValue).toBe("(none)");
+    });
+
+    describe("multi-placement guard (Bug 2 fix)", () => {
+      // Bug 2: a QUANTITY_TRACKED asset can have units split across
+      // several AssetLocation rows. The CSV can only carry one `location`
+      // cell, so diffing against an arbitrary "primary" placement either
+      // lies in the preview or — worse — collapses real placement
+      // structure on apply. Multi-placement assets get a warning-marked
+      // change instead, which the apply layer always skips.
+      it("warns and skips instead of diffing when the asset has multiple placements", () => {
+        const asset = makeAsset({
+          location: { id: "loc-1", name: "Christmas Event" },
+          locationPlacementCount: 3,
+        });
+        const result = compareCoreField(
+          "location",
+          "Mithril Dragons",
+          asset,
+          "Location"
+        );
+        expect(result?.warning).toMatch(/multiple locations/i);
+        expect(result?.newValue).toBe("Mithril Dragons");
+      });
+
+      it("does not warn for a single-placement asset (regression guard)", () => {
+        const asset = makeAsset({
+          location: { id: "loc-1", name: "Office A" },
+          locationPlacementCount: 1,
+        });
+        const result = compareCoreField(
+          "location",
+          "Warehouse",
+          asset,
+          "Location"
+        );
+        expect(result?.warning).toBeUndefined();
+        expect(result?.newValue).toBe("Warehouse");
+      });
+
+      it("does not warn when locationPlacementCount is unset (pre-existing fixtures)", () => {
+        const asset = makeAsset({
+          location: { id: "loc-1", name: "Office A" },
+        });
+        const result = compareCoreField(
+          "location",
+          "Warehouse",
+          asset,
+          "Location"
+        );
+        expect(result?.warning).toBeUndefined();
+      });
+    });
+  });
+
+  describe("tags", () => {
+    it("detects tag additions", () => {
+      const asset = makeAsset({ tags: [{ id: "t1", name: "TagA" }] });
+      const result = compareCoreField("tags", "TagA, TagB", asset, "Tags");
+      expect(result).not.toBeNull();
+      expect(result?.newValue).toBe("TagA, TagB");
+    });
+
+    it("ignores tag reordering (case-insensitive)", () => {
+      const asset = makeAsset({
+        tags: [
+          { id: "t1", name: "Alpha" },
+          { id: "t2", name: "Beta" },
+        ],
+      });
+      expect(compareCoreField("tags", "beta, alpha", asset, "Tags")).toBeNull();
+    });
+
+    it('shows "(none)" when asset has no tags', () => {
+      const asset = makeAsset({ tags: [] });
+      const result = compareCoreField("tags", "NewTag", asset, "Tags");
+      expect(result?.currentValue).toBe("(none)");
+    });
+
+    it("keeps a quoted tag name intact in the value the apply flow re-reads", () => {
+      // `newValue` is not only display: import-update.server.ts and
+      // import-update-entities.server.ts decode it again to resolve and
+      // connect the tags, so it has to survive that second read.
+      const asset = makeAsset({ tags: [{ id: "t1", name: "small" }] });
+      const result = compareCoreField(
+        "tags",
+        '"Berlin, DE",small',
+        asset,
+        "Tags"
+      );
+
+      expect(result).not.toBeNull();
+      expect(decodeCsvListCell(result!.newValue)).toEqual([
+        "Berlin, DE",
+        "small",
+      ]);
+    });
+
+    it("reads a quoted tag name carrying a comma as one tag", () => {
+      // The import-ready export is this importer's input and quotes a tag name
+      // containing the separator, so a bare split would report a spurious
+      // change here and write the wrong tags on apply.
+      const asset = makeAsset({
+        tags: [
+          { id: "t1", name: "Berlin, DE" },
+          { id: "t2", name: "small" },
+        ],
+      });
+      expect(
+        compareCoreField("tags", '"Berlin, DE",small', asset, "Tags")
+      ).toBeNull();
+    });
+  });
+
+  describe("valuation", () => {
+    it("detects valuation change with currency normalization", () => {
+      const asset = makeAsset({ valuation: 100 });
+      const result = compareCoreField("valuation", "$200", asset, "Valuation");
+      expect(result?.newValue).toBe("200");
+    });
+
+    it("returns warning for invalid number", () => {
+      const asset = makeAsset({ valuation: 100 });
+      const result = compareCoreField("valuation", "abc", asset, "Valuation");
+      expect(result?.warning).toContain("not a valid number");
+    });
+
+    it("distinguishes null valuation from 0", () => {
+      const asset = makeAsset({ valuation: null });
+      const result = compareCoreField("valuation", "0", asset, "Valuation");
+      expect(result).not.toBeNull();
+      expect(result?.currentValue).toBe("(none)");
+      expect(result?.newValue).toBe("0");
+    });
+
+    it("ignores changes within epsilon threshold", () => {
+      const asset = makeAsset({ valuation: 100 });
+      expect(
+        compareCoreField("valuation", "100.0001", asset, "Valuation")
+      ).toBeNull();
+    });
+  });
+
+  describe("availableToBook", () => {
+    it("detects change from Yes to No", () => {
+      const asset = makeAsset({ availableToBook: true });
+      const result = compareCoreField(
+        "availableToBook",
+        "No",
+        asset,
+        "Available to book"
+      );
+      expect(result?.newValue).toBe("No");
+    });
+
+    it("returns warning for invalid boolean value", () => {
+      const asset = makeAsset({ availableToBook: true });
+      const result = compareCoreField(
+        "availableToBook",
+        "Maybe",
+        asset,
+        "Available to book"
+      );
+      expect(result?.warning).toContain("expected");
+    });
+
+    it("returns null when value unchanged", () => {
+      const asset = makeAsset({ availableToBook: true });
+      expect(
+        compareCoreField("availableToBook", "Yes", asset, "Available to book")
+      ).toBeNull();
+    });
+  });
+
+  // ── Wave-1 update-path additions: qty-tracked + AssetModel diffs ─────
+  // The diff layer is "preview-only" — the apply path enforces the actual
+  // type-vs-cell rules. The diff branches here are responsible for
+  // silently no-op'ing on the "wrong" type so the preview doesn't
+  // advertise changes the apply path will discard.
+  describe("quantity (qty-tracked)", () => {
+    it("produces a diff for a QUANTITY_TRACKED asset when the value differs", () => {
+      const asset = makeAsset({ type: "QUANTITY_TRACKED", quantity: 10 });
+      const result = compareCoreField("quantity", "42", asset, "Quantity");
+      expect(result).toEqual({
+        field: "Quantity",
+        currentValue: "10",
+        newValue: "42",
+      });
+    });
+
+    it("returns null when quantity is unchanged", () => {
+      const asset = makeAsset({ type: "QUANTITY_TRACKED", quantity: 10 });
+      expect(compareCoreField("quantity", "10", asset, "Quantity")).toBeNull();
+    });
+
+    it("produces a warning for an invalid quantity value", () => {
+      const asset = makeAsset({ type: "QUANTITY_TRACKED", quantity: 5 });
+      const result = compareCoreField("quantity", "abc", asset, "Quantity");
+      expect(result?.warning).toContain("valid quantity");
+    });
+
+    it("silently no-ops on INDIVIDUAL assets (apply path drops the cell)", () => {
+      const asset = makeAsset({ type: "INDIVIDUAL", quantity: 1 });
+      expect(compareCoreField("quantity", "99", asset, "Quantity")).toBeNull();
+    });
+  });
+
+  describe("minQuantity (qty-tracked)", () => {
+    it("produces a diff for a QUANTITY_TRACKED asset", () => {
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 50,
+        minQuantity: 5,
+      });
+      const result = compareCoreField(
+        "minQuantity",
+        "10",
+        asset,
+        "Min quantity"
+      );
+      expect(result?.newValue).toBe("10");
+      expect(result?.currentValue).toBe("5");
+    });
+
+    it("shows (none) for null current minQuantity", () => {
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 50,
+        minQuantity: null,
+      });
+      const result = compareCoreField(
+        "minQuantity",
+        "3",
+        asset,
+        "Min quantity"
+      );
+      expect(result?.currentValue).toBe("(none)");
+    });
+
+    it("warns on negative minQuantity", () => {
+      const asset = makeAsset({ type: "QUANTITY_TRACKED", quantity: 50 });
+      const result = compareCoreField(
+        "minQuantity",
+        "-5",
+        asset,
+        "Min quantity"
+      );
+      expect(result?.warning).toContain("min quantity");
+    });
+
+    it("silently no-ops on INDIVIDUAL assets", () => {
+      const asset = makeAsset({ type: "INDIVIDUAL", quantity: 1 });
+      expect(
+        compareCoreField("minQuantity", "5", asset, "Min quantity")
+      ).toBeNull();
+    });
+  });
+
+  describe("unitOfMeasure (qty-tracked)", () => {
+    it("detects a string change on a QUANTITY_TRACKED asset", () => {
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 50,
+        unitOfMeasure: "boxes",
+      });
+      const result = compareCoreField(
+        "unitOfMeasure",
+        "tons",
+        asset,
+        "Unit of measure"
+      );
+      expect(result?.currentValue).toBe("boxes");
+      expect(result?.newValue).toBe("tons");
+    });
+
+    it("returns null when value is unchanged", () => {
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 50,
+        unitOfMeasure: "boxes",
+      });
+      expect(
+        compareCoreField("unitOfMeasure", "boxes", asset, "Unit of measure")
+      ).toBeNull();
+    });
+
+    it("shows (none) when the asset has no unitOfMeasure yet", () => {
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 50,
+        unitOfMeasure: null,
+      });
+      const result = compareCoreField(
+        "unitOfMeasure",
+        "tons",
+        asset,
+        "Unit of measure"
+      );
+      expect(result?.currentValue).toBe("(none)");
+      expect(result?.newValue).toBe("tons");
+    });
+
+    it("silently no-ops on INDIVIDUAL assets", () => {
+      const asset = makeAsset({ type: "INDIVIDUAL", quantity: 1 });
+      expect(
+        compareCoreField("unitOfMeasure", "x", asset, "Unit of measure")
+      ).toBeNull();
+    });
+  });
+
+  describe("consumptionType (qty-tracked)", () => {
+    it("detects a valid change on a QUANTITY_TRACKED asset", () => {
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 50,
+        consumptionType: "ONE_WAY",
+      });
+      const result = compareCoreField(
+        "consumptionType",
+        "TWO_WAY",
+        asset,
+        "Consumption type"
+      );
+      expect(result?.newValue).toBe("TWO_WAY");
+      expect(result?.currentValue).toBe("ONE_WAY");
+    });
+
+    it("returns null when the value matches (case-insensitive uppercase)", () => {
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 50,
+        consumptionType: "ONE_WAY",
+      });
+      expect(
+        compareCoreField(
+          "consumptionType",
+          "one_way",
+          asset,
+          "Consumption type"
+        )
+      ).toBeNull();
+    });
+
+    it("warns on an invalid consumption type", () => {
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 50,
+        consumptionType: "ONE_WAY",
+      });
+      const result = compareCoreField(
+        "consumptionType",
+        "THREE_WAY",
+        asset,
+        "Consumption type"
+      );
+      expect(result?.warning).toContain("Unrecognized");
+    });
+
+    it("silently no-ops on INDIVIDUAL assets", () => {
+      const asset = makeAsset({ type: "INDIVIDUAL", quantity: 1 });
+      expect(
+        compareCoreField(
+          "consumptionType",
+          "ONE_WAY",
+          asset,
+          "Consumption type"
+        )
+      ).toBeNull();
+    });
+  });
+
+  describe("assetModel (INDIVIDUAL only)", () => {
+    it("produces a diff for an INDIVIDUAL asset with no model linked", () => {
+      const asset = makeAsset({ type: "INDIVIDUAL", assetModelId: null });
+      const result = compareCoreField(
+        "assetModel",
+        "Dell Latitude",
+        asset,
+        "Asset model"
+      );
+      expect(result?.currentValue).toBe("(none)");
+      expect(result?.newValue).toBe("Dell Latitude");
+    });
+
+    it("emits a warning-marked diff on QUANTITY_TRACKED assets so the dropped cell surfaces in the warnings pill", () => {
+      // Regression guard for the edge case where a row carrying ONLY
+      // an assetModel cell on a quantity-tracked asset previously landed
+      // in skippedAssets with the generic "No changes detected" reason —
+      // hiding the dropped cell from the user. The diff now emits a
+      // warning-marked FieldChange; the apply layer skips the field
+      // (because `.warning` is set) AND forwards the warning text into
+      // `result.warnings` so the user sees a yellow "Warnings" entry.
+      const asset = makeAsset({
+        type: "QUANTITY_TRACKED",
+        quantity: 10,
+        assetModelId: null,
+      });
+      const result = compareCoreField(
+        "assetModel",
+        "Dell Latitude",
+        asset,
+        "Asset model"
+      );
+      expect(result).not.toBeNull();
+      expect(result?.warning).toMatch(/quantity-tracked/i);
+      expect(result?.warning).toMatch(/INDIVIDUAL/);
+      expect(result?.newValue).toBe("Dell Latitude");
+    });
+  });
+
+  describe("assetModel — name comparison (Bug 1 fix)", () => {
+    // Bug 1: the preview compared the CSV cell (a model NAME, per the
+    // export) against `asset.assetModelId` (a cuid) — the two can never
+    // be string-equal, so EVERY row with a non-empty assetModel cell
+    // reported a phantom change, even on an untouched zero-edit round
+    // trip. Fixed to compare name-to-name via `asset.assetModel.name`.
+    it("is a no-op when the csv cell matches the current model's name (zero-edit round trip)", () => {
+      const asset = makeAsset({
+        type: "INDIVIDUAL",
+        assetModelId: "model-1",
+        assetModel: { id: "model-1", name: "MacBook pro 2022" },
+      });
+      const result = compareCoreField(
+        "assetModel",
+        "MacBook pro 2022",
+        asset,
+        "Asset model"
+      );
+      expect(result).toBeNull();
+    });
+
+    it("is a no-op case-insensitively, matching batchResolveAssetModelNames's own case-insensitive resolution", () => {
+      const asset = makeAsset({
+        type: "INDIVIDUAL",
+        assetModelId: "model-1",
+        assetModel: { id: "model-1", name: "MacBook pro 2022" },
+      });
+      const result = compareCoreField(
+        "assetModel",
+        "macbook PRO 2022",
+        asset,
+        "Asset model"
+      );
+      expect(result).toBeNull();
+    });
+
+    it("shows the model NAME — never the cuid — as currentValue when a real change is detected", () => {
+      const asset = makeAsset({
+        type: "INDIVIDUAL",
+        assetModelId: "model-x",
+        assetModel: { id: "model-x", name: "Dell Latitude" },
+      });
+      const result = compareCoreField(
+        "assetModel",
+        "ThinkPad X1",
+        asset,
+        "Asset model"
+      );
+      expect(result?.currentValue).toBe("Dell Latitude");
+      expect(result?.currentValue).not.toBe("model-x");
+      expect(result?.newValue).toBe("ThinkPad X1");
+    });
+  });
+
+  describe("type cell (read-only)", () => {
+    // The `type` internal-field key is intentionally NOT in UPDATABLE_FIELDS,
+    // which means analyzeUpdateHeaders won't classify a "Type" column as
+    // updatable in the first place. But the compareCoreField switch must
+    // also be defensive and treat it as a no-op so a stray callsite can't
+    // accidentally produce a diff.
+    it("returns null regardless of cell value", () => {
+      const asset = makeAsset({ type: "INDIVIDUAL", quantity: 1 });
+      expect(
+        compareCoreField("type", "QUANTITY_TRACKED", asset, "Type")
+      ).toBeNull();
+      expect(compareCoreField("type", "INDIVIDUAL", asset, "Type")).toBeNull();
+      expect(compareCoreField("type", "", asset, "Type")).toBeNull();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// compareCustomField
+// ---------------------------------------------------------------------------
+
+describe("compareCustomField", () => {
+  const textCfDef = {
+    name: "Serial",
+    type: "TEXT" as const,
+    helpText: "",
+    required: false,
+    active: true,
+  };
+
+  const boolCfDef = {
+    name: "Active",
+    type: "BOOLEAN" as const,
+    helpText: "",
+    required: false,
+    active: true,
+  };
+
+  const dateCfDef = {
+    name: "PurchaseDate",
+    type: "DATE" as const,
+    helpText: "",
+    required: false,
+    active: true,
+  };
+
+  const numberCfDef = {
+    name: "Weight",
+    type: "NUMBER" as const,
+    helpText: "",
+    required: false,
+    active: true,
+  };
+
+  describe("TEXT", () => {
+    it("detects text change", () => {
+      const asset = makeAsset({
+        customFields: [
+          {
+            id: "cfv1",
+            value: { raw: "OLD-123" },
+            customField: { name: "Serial" } as any,
+          },
+        ],
+      });
+      const result = compareCustomField(textCfDef, "NEW-456", asset, "Serial");
+      expect(result?.newValue).toBe("NEW-456");
+    });
+
+    it("returns null when text unchanged", () => {
+      const asset = makeAsset({
+        customFields: [
+          {
+            id: "cfv1",
+            value: { raw: "SAME" },
+            customField: { name: "Serial" } as any,
+          },
+        ],
+      });
+      expect(compareCustomField(textCfDef, "SAME", asset, "Serial")).toBeNull();
+    });
+  });
+
+  describe("BOOLEAN", () => {
+    it("detects boolean change", () => {
+      const asset = makeAsset({
+        customFields: [
+          {
+            id: "cfv1",
+            value: { raw: "yes", valueBoolean: true },
+            customField: { name: "Active" } as any,
+          },
+        ],
+      });
+      const result = compareCustomField(boolCfDef, "No", asset, "Active");
+      expect(result?.newValue).toBe("No");
+    });
+
+    it("returns warning for unrecognized boolean", () => {
+      const asset = makeAsset();
+      const result = compareCustomField(boolCfDef, "Maybe", asset, "Active");
+      expect(result?.warning).toContain("expected");
+    });
+
+    it("detects change from empty to boolean", () => {
+      const asset = makeAsset({ customFields: [] });
+      const result = compareCustomField(boolCfDef, "No", asset, "Active");
+      expect(result?.currentValue).toBe("(empty)");
+      expect(result?.newValue).toBe("No");
+    });
+  });
+
+  describe("DATE", () => {
+    it("detects valid date change", () => {
+      const asset = makeAsset({
+        customFields: [
+          {
+            id: "cfv1",
+            value: { raw: "2024-01-15" },
+            customField: { name: "PurchaseDate" } as any,
+          },
+        ],
+      });
+      const result = compareCustomField(
+        dateCfDef,
+        "2024-06-23",
+        asset,
+        "Purchase Date"
+      );
+      expect(result?.newValue).toBe("2024-06-23");
+      expect(result?.warning).toBeUndefined();
+    });
+
+    it("returns warning for invalid date format", () => {
+      const asset = makeAsset();
+      const result = compareCustomField(
+        dateCfDef,
+        "23 June 2024",
+        asset,
+        "Purchase Date"
+      );
+      expect(result?.warning).toContain("Invalid date format");
+    });
+
+    it("returns warning for impossible date (Feb 31)", () => {
+      const asset = makeAsset();
+      const result = compareCustomField(
+        dateCfDef,
+        "2024-02-31",
+        asset,
+        "Purchase Date"
+      );
+      expect(result?.warning).toContain("Invalid date format");
+    });
+  });
+
+  describe("NUMBER", () => {
+    it("detects number change with currency normalization", () => {
+      const asset = makeAsset({
+        customFields: [
+          {
+            id: "cfv1",
+            value: { raw: "50" },
+            customField: { name: "Weight" } as any,
+          },
+        ],
+      });
+      const result = compareCustomField(numberCfDef, "$100", asset, "Weight");
+      expect(result?.newValue).toBe("100");
+    });
+
+    it("returns warning for non-numeric value", () => {
+      const asset = makeAsset();
+      const result = compareCustomField(numberCfDef, "abc", asset, "Weight");
+      expect(result?.warning).toContain("not a valid number");
+    });
+
+    it("ignores change within epsilon", () => {
+      const asset = makeAsset({
+        customFields: [
+          {
+            id: "cfv1",
+            value: { raw: "100" },
+            customField: { name: "Weight" } as any,
+          },
+        ],
+      });
+      expect(
+        compareCustomField(numberCfDef, "100.0001", asset, "Weight")
+      ).toBeNull();
+    });
+
+    it("detects change from empty to number", () => {
+      const asset = makeAsset({ customFields: [] });
+      const result = compareCustomField(numberCfDef, "42", asset, "Weight");
+      expect(result?.currentValue).toBe("(empty)");
+      expect(result?.newValue).toBe("42");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeAssetDiffs
+// ---------------------------------------------------------------------------
+
+describe("computeAssetDiffs", () => {
+  /** Builds a minimal HeaderAnalysis for testing */
+  function makeHeaderAnalysis(
+    overrides: Partial<HeaderAnalysis> = {}
+  ): HeaderAnalysis {
+    const columnIndexMap = new Map<number, any>();
+    columnIndexMap.set(1, {
+      csvHeader: "Name",
+      internalKey: "name",
+      kind: "core",
+      csvIndex: 1,
+    });
+
+    return {
+      updatableColumns: [
+        {
+          csvHeader: "Name",
+          internalKey: "name",
+          kind: "core" as const,
+          csvIndex: 1,
+        },
+      ],
+      ignoredColumns: [],
+      unrecognizedColumns: [],
+      idColumnIndex: 0,
+      idDbField: "sequentialId" as const,
+      idColumnHeader: "Asset ID",
+      fallbackId: null,
+      columnIndexMap,
+      ...overrides,
+    };
+  }
+
+  it("detects changes between CSV and existing assets", () => {
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", makeAsset({ title: "Old Name" }));
+
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["SAM-0001", "New Name"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: assets,
+    });
+
+    expect(result.assetsToUpdate).toHaveLength(1);
+    expect(result.assetsToUpdate[0].changes[0].newValue).toBe("New Name");
+  });
+
+  it("skips assets with no changes", () => {
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", makeAsset({ title: "Same Name" }));
+
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["SAM-0001", "Same Name"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: assets,
+    });
+
+    expect(result.assetsToUpdate).toHaveLength(0);
+    expect(result.skippedAssets).toHaveLength(1);
+    expect(result.skippedAssets[0].reason).toBe("No changes detected");
+  });
+
+  it("reports an archived asset as a failed row, not a pending update", () => {
+    // why: `updateAsset` refuses archived assets at apply time (issue #382).
+    // The preview exists to say what will happen BEFORE anything is saved, so
+    // counting an archived row as "to update" and then failing it makes the
+    // preview lie about its own outcome.
+    const assets = new Map<string, AssetForUpdate>([
+      [
+        "SAM-0001",
+        makeAsset({
+          sequentialId: "SAM-0001",
+          title: "Old Name",
+          archivedAt: new Date("2026-08-14T00:00:00Z"),
+        }),
+      ],
+    ]);
+
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["SAM-0001", "New Name"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: assets,
+    });
+
+    expect(result.assetsToUpdate).toHaveLength(0);
+    expect(result.failedRows).toHaveLength(1);
+    expect(result.failedRows[0].reason).toBe(
+      "Asset is archived — reinstate it before updating"
+    );
+  });
+
+  it("still previews an update for an asset that is not archived", () => {
+    // why: guards against the archived branch swallowing ordinary rows —
+    // `archivedAt: null` must behave exactly as before.
+    const assets = new Map<string, AssetForUpdate>([
+      [
+        "SAM-0001",
+        makeAsset({
+          sequentialId: "SAM-0001",
+          title: "Old Name",
+          archivedAt: null,
+        }),
+      ],
+    ]);
+
+    const result = computeAssetDiffs({
+      csvData: [
+        ["Asset ID", "Name"],
+        ["SAM-0001", "New Name"],
+      ],
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: assets,
+    });
+
+    expect(result.failedRows).toHaveLength(0);
+    expect(result.assetsToUpdate).toHaveLength(1);
+  });
+
+  it("reports missing assets as failed rows", () => {
+    const assets = new Map<string, AssetForUpdate>();
+
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["SAM-9999", "Some Name"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: assets,
+    });
+
+    expect(result.failedRows).toHaveLength(1);
+    expect(result.failedRows[0].reason).toBe(
+      "Asset not found in your organization"
+    );
+  });
+
+  it("detects duplicate rows by canonical UUID", () => {
+    const asset = makeAsset({ id: "uuid-1" });
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", asset);
+    assets.set("SAM-0002", asset); // same UUID, different sequential ID
+
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["SAM-0001", "Change 1"],
+      ["SAM-0002", "Change 2"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: assets,
+    });
+
+    expect(result.assetsToUpdate).toHaveLength(1);
+    expect(result.failedRows).toHaveLength(1);
+    expect(result.failedRows[0].reason).toContain("Duplicate ID");
+  });
+
+  it("treats empty cells as no change", () => {
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", makeAsset({ title: "Keep This" }));
+
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["SAM-0001", ""],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: assets,
+    });
+
+    expect(result.assetsToUpdate).toHaveLength(0);
+    expect(result.skippedAssets).toHaveLength(1);
+  });
+
+  it("reports rows with missing asset ID", () => {
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["", "Some Name"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: new Map(),
+    });
+
+    expect(result.failedRows).toHaveLength(1);
+    expect(result.failedRows[0].reason).toBe("Missing asset ID");
+  });
+
+  it("uses fallback identifier when primary is blank", () => {
+    const asset = makeAsset({ id: "uuid-1", title: "Old Name" });
+    const primaryAssets = new Map<string, AssetForUpdate>();
+    const fallbackAssets = new Map<string, AssetForUpdate>();
+    fallbackAssets.set("uuid-1", asset);
+
+    const columnIndexMap = new Map<number, any>();
+    columnIndexMap.set(2, {
+      csvHeader: "Name",
+      internalKey: "name",
+      kind: "core",
+      csvIndex: 2,
+    });
+
+    const headerAnalysis = makeHeaderAnalysis({
+      fallbackId: { index: 1, dbField: "id", header: "ID" },
+      columnIndexMap,
+      updatableColumns: [
+        {
+          csvHeader: "Name",
+          internalKey: "name",
+          kind: "core" as const,
+          csvIndex: 2,
+        },
+      ],
+    });
+
+    const csvData = [
+      ["Asset ID", "ID", "Name"],
+      ["", "uuid-1", "New Name"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis,
+      existingAssets: primaryAssets,
+      fallbackAssets,
+    });
+
+    expect(result.assetsToUpdate).toHaveLength(1);
+    expect(result.assetsToUpdate[0].changes[0].newValue).toBe("New Name");
+  });
+
+  it("returns correct totalRows count", () => {
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["SAM-0001", "A"],
+      ["SAM-0002", "B"],
+      ["SAM-0003", "C"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: new Map(),
+    });
+
+    expect(result.totalRows).toBe(3);
+  });
+
+  it("detects clearing when empty cell has existing value (category)", () => {
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", makeAsset({ category: { name: "Electronics" } }));
+
+    const columnIndexMap = new Map<number, any>();
+    columnIndexMap.set(1, {
+      csvHeader: "Category",
+      internalKey: "category",
+      kind: "core",
+      csvIndex: 1,
+    });
+
+    const headerAnalysis = makeHeaderAnalysis({
+      columnIndexMap,
+      updatableColumns: [
+        {
+          csvHeader: "Category",
+          internalKey: "category",
+          kind: "core" as const,
+          csvIndex: 1,
+        },
+      ],
+    });
+
+    const csvData = [
+      ["Asset ID", "Category"],
+      ["SAM-0001", ""],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis,
+      existingAssets: assets,
+    });
+
+    expect(result.assetsToUpdate).toHaveLength(1);
+    expect(result.assetsToUpdate[0].changes[0].clearing).toBe(true);
+    expect(result.assetsToUpdate[0].changes[0].currentValue).toBe(
+      "Electronics"
+    );
+  });
+
+  it("does not clear when field is already empty", () => {
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", makeAsset({ category: null }));
+
+    const columnIndexMap = new Map<number, any>();
+    columnIndexMap.set(1, {
+      csvHeader: "Category",
+      internalKey: "category",
+      kind: "core",
+      csvIndex: 1,
+    });
+
+    const headerAnalysis = makeHeaderAnalysis({
+      columnIndexMap,
+      updatableColumns: [
+        {
+          csvHeader: "Category",
+          internalKey: "category",
+          kind: "core" as const,
+          csvIndex: 1,
+        },
+      ],
+    });
+
+    const csvData = [
+      ["Asset ID", "Category"],
+      ["SAM-0001", ""],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis,
+      existingAssets: assets,
+    });
+
+    // Empty→empty = no change
+    expect(result.assetsToUpdate).toHaveLength(0);
+    expect(result.skippedAssets).toHaveLength(1);
+  });
+
+  it("does not clear exempt fields (name)", () => {
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", makeAsset({ title: "Some Asset" }));
+
+    const csvData = [
+      ["Asset ID", "Name"],
+      ["SAM-0001", ""],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis: makeHeaderAnalysis(),
+      existingAssets: assets,
+    });
+
+    // Name is exempt from clearing
+    expect(result.assetsToUpdate).toHaveLength(0);
+    expect(result.skippedAssets).toHaveLength(1);
+  });
+
+  it("does not clear description on an empty cell (matches 'name' semantics, Task 2 fix round 1)", () => {
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", makeAsset({ description: "Keep this description" }));
+
+    const columnIndexMap = new Map<number, any>();
+    columnIndexMap.set(1, {
+      csvHeader: "Description",
+      internalKey: "description",
+      kind: "core",
+      csvIndex: 1,
+    });
+
+    const headerAnalysis = makeHeaderAnalysis({
+      columnIndexMap,
+      updatableColumns: [
+        {
+          csvHeader: "Description",
+          internalKey: "description",
+          kind: "core" as const,
+          csvIndex: 1,
+        },
+      ],
+    });
+
+    const csvData = [
+      ["Asset ID", "Description"],
+      ["SAM-0001", ""],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis,
+      existingAssets: assets,
+    });
+
+    // Description is not clearable via an empty cell — same as "name".
+    expect(result.assetsToUpdate).toHaveLength(0);
+    expect(result.skippedAssets).toHaveLength(1);
+  });
+
+  it("produces a description diff for a real change", () => {
+    const assets = new Map<string, AssetForUpdate>();
+    assets.set("SAM-0001", makeAsset({ description: "Old description" }));
+
+    const columnIndexMap = new Map<number, any>();
+    columnIndexMap.set(1, {
+      csvHeader: "Description",
+      internalKey: "description",
+      kind: "core",
+      csvIndex: 1,
+    });
+
+    const headerAnalysis = makeHeaderAnalysis({
+      columnIndexMap,
+      updatableColumns: [
+        {
+          csvHeader: "Description",
+          internalKey: "description",
+          kind: "core" as const,
+          csvIndex: 1,
+        },
+      ],
+    });
+
+    const csvData = [
+      ["Asset ID", "Description"],
+      ["SAM-0001", "New description"],
+    ];
+
+    const result = computeAssetDiffs({
+      csvData,
+      headerAnalysis,
+      existingAssets: assets,
+    });
+
+    expect(result.assetsToUpdate).toHaveLength(1);
+    expect(result.assetsToUpdate[0].changes[0]).toMatchObject({
+      field: "Description",
+      currentValue: "Old description",
+      newValue: "New description",
+    });
+  });
+
+  describe("'Uncategorized' guard", () => {
+    // The Standard (human/analytics) export writes the literal string
+    // "Uncategorized" for assets with no category
+    // (utils/csv.server.ts:592-594). Without this guard, re-importing
+    // that file would try to set a REAL category literally named
+    // "Uncategorized" for every previously-uncategorized asset. The cell
+    // must behave exactly like an empty cell.
+    function makeCategoryHeaderAnalysis(): HeaderAnalysis {
+      const columnIndexMap = new Map<number, any>();
+      columnIndexMap.set(1, {
+        csvHeader: "Category",
+        internalKey: "category",
+        kind: "core",
+        csvIndex: 1,
+      });
+      return makeHeaderAnalysis({
+        columnIndexMap,
+        updatableColumns: [
+          {
+            csvHeader: "Category",
+            internalKey: "category",
+            kind: "core" as const,
+            csvIndex: 1,
+          },
+        ],
+      });
+    }
+
+    it("clears an existing category instead of creating one literally named 'Uncategorized'", () => {
+      const assets = new Map<string, AssetForUpdate>();
+      assets.set("SAM-0001", makeAsset({ category: { name: "Electronics" } }));
+
+      const csvData = [
+        ["Asset ID", "Category"],
+        ["SAM-0001", "Uncategorized"],
+      ];
+
+      const result = computeAssetDiffs({
+        csvData,
+        headerAnalysis: makeCategoryHeaderAnalysis(),
+        existingAssets: assets,
+      });
+
+      expect(result.assetsToUpdate).toHaveLength(1);
+      const change = result.assetsToUpdate[0].changes[0];
+      expect(change.clearing).toBe(true);
+      expect(change.newValue).toBe("(empty)");
+      expect(change.currentValue).toBe("Electronics");
+    });
+
+    it("is a no-op when the asset already has no category (no category created)", () => {
+      const assets = new Map<string, AssetForUpdate>();
+      assets.set("SAM-0001", makeAsset({ category: null }));
+
+      const csvData = [
+        ["Asset ID", "Category"],
+        ["SAM-0001", "Uncategorized"],
+      ];
+
+      const result = computeAssetDiffs({
+        csvData,
+        headerAnalysis: makeCategoryHeaderAnalysis(),
+        existingAssets: assets,
+      });
+
+      expect(result.assetsToUpdate).toHaveLength(0);
+      expect(result.skippedAssets).toHaveLength(1);
+      expect(result.skippedAssets[0].reason).toBe("No changes detected");
+    });
+
+    it("preserves a REAL category literally named 'Uncategorized'", () => {
+      // why: an org can genuinely have a category called "Uncategorized".
+      // The guard reads that cell as "empty", so without excluding assets
+      // already in such a category a zero-edit Standard round trip would
+      // silently strip it from every one of them.
+      const assets = new Map<string, AssetForUpdate>();
+      assets.set(
+        "SAM-0001",
+        makeAsset({ category: { name: "Uncategorized" } })
+      );
+
+      const csvData = [
+        ["Asset ID", "Category"],
+        ["SAM-0001", "Uncategorized"],
+      ];
+
+      const result = computeAssetDiffs({
+        csvData,
+        headerAnalysis: makeCategoryHeaderAnalysis(),
+        existingAssets: assets,
+      });
+
+      expect(result.assetsToUpdate).toHaveLength(0);
+      expect(result.skippedAssets).toHaveLength(1);
+      expect(result.skippedAssets[0].reason).toBe("No changes detected");
+    });
+
+    it("matches case-insensitively ('uncategorized', 'UNCATEGORIZED')", () => {
+      const assets = new Map<string, AssetForUpdate>();
+      assets.set(
+        "SAM-0001",
+        makeAsset({ id: "uuid-1", category: { name: "Electronics" } })
+      );
+      assets.set(
+        "SAM-0002",
+        makeAsset({ id: "uuid-2", category: { name: "Electronics" } })
+      );
+
+      const csvData = [
+        ["Asset ID", "Category"],
+        ["SAM-0001", "uncategorized"],
+        ["SAM-0002", "UNCATEGORIZED"],
+      ];
+
+      const result = computeAssetDiffs({
+        csvData,
+        headerAnalysis: makeCategoryHeaderAnalysis(),
+        existingAssets: assets,
+      });
+
+      expect(result.assetsToUpdate).toHaveLength(2);
+      for (const asset of result.assetsToUpdate) {
+        expect(asset.changes[0].clearing).toBe(true);
+      }
+    });
+  });
+
+  describe("multi-placement location guard (Bug 2 fix)", () => {
+    // Reproduces the "Gloves" scenario: a QUANTITY_TRACKED asset with
+    // units split across three AssetLocation rows (Christmas Event,
+    // Mithril Dragons, God Wars Dungeon). Any `location` cell on such a
+    // row — populated OR empty — must warn-and-skip, never propose (or
+    // apply) a single-location collapse.
+    function makeLocationHeaderAnalysis(): HeaderAnalysis {
+      const columnIndexMap = new Map<number, any>();
+      columnIndexMap.set(1, {
+        csvHeader: "Location",
+        internalKey: "location",
+        kind: "core",
+        csvIndex: 1,
+      });
+      return makeHeaderAnalysis({
+        columnIndexMap,
+        updatableColumns: [
+          {
+            csvHeader: "Location",
+            internalKey: "location",
+            kind: "core" as const,
+            csvIndex: 1,
+          },
+        ],
+      });
+    }
+
+    it("warns and skips when a location cell names a different location on a multi-placement asset", () => {
+      const assets = new Map<string, AssetForUpdate>();
+      assets.set(
+        "SAM-0001",
+        makeAsset({
+          location: { id: "loc-mithril", name: "Mithril Dragons" },
+          locationPlacementCount: 3,
+        })
+      );
+
+      const csvData = [
+        ["Asset ID", "Location"],
+        ["SAM-0001", "Christmas Event"],
+      ];
+
+      const result = computeAssetDiffs({
+        csvData,
+        headerAnalysis: makeLocationHeaderAnalysis(),
+        existingAssets: assets,
+      });
+
+      expect(result.assetsToUpdate).toHaveLength(1);
+      const change = result.assetsToUpdate[0].changes[0];
+      expect(change.warning).toMatch(/multiple locations/i);
+      expect(change.newValue).toBe("Christmas Event");
+    });
+
+    it("warns and skips on an EMPTY location cell on a multi-placement asset (does not wipe placements)", () => {
+      const assets = new Map<string, AssetForUpdate>();
+      assets.set(
+        "SAM-0001",
+        makeAsset({
+          location: { id: "loc-mithril", name: "Mithril Dragons" },
+          locationPlacementCount: 3,
+        })
+      );
+
+      const csvData = [
+        ["Asset ID", "Location"],
+        ["SAM-0001", ""],
+      ];
+
+      const result = computeAssetDiffs({
+        csvData,
+        headerAnalysis: makeLocationHeaderAnalysis(),
+        existingAssets: assets,
+      });
+
+      expect(result.assetsToUpdate).toHaveLength(1);
+      const change = result.assetsToUpdate[0].changes[0];
+      expect(change.warning).toMatch(/multiple locations/i);
+      // Must NOT be routed through the clearing path (which would signal
+      // "wipe the location" to the apply layer).
+      expect(change.clearing).toBeUndefined();
+    });
+
+    it("still updates location normally for a single-placement asset (regression guard)", () => {
+      const assets = new Map<string, AssetForUpdate>();
+      assets.set(
+        "SAM-0001",
+        makeAsset({
+          location: { id: "loc-office", name: "Office A" },
+          locationPlacementCount: 1,
+        })
+      );
+
+      const csvData = [
+        ["Asset ID", "Location"],
+        ["SAM-0001", "Warehouse"],
+      ];
+
+      const result = computeAssetDiffs({
+        csvData,
+        headerAnalysis: makeLocationHeaderAnalysis(),
+        existingAssets: assets,
+      });
+
+      expect(result.assetsToUpdate).toHaveLength(1);
+      const change = result.assetsToUpdate[0].changes[0];
+      expect(change.warning).toBeUndefined();
+      expect(change.newValue).toBe("Warehouse");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// describeBulkUpdateRowFailure
+// ---------------------------------------------------------------------------
+
+describe("describeBulkUpdateRowFailure", () => {
+  const GENERIC =
+    "We could not create or update this Asset. Please try again or contact support.";
+
+  it("returns 'Unknown error' for non-Error causes", () => {
+    expect(describeBulkUpdateRowFailure("oops")).toBe("Unknown error");
+    expect(describeBulkUpdateRowFailure(null)).toBe("Unknown error");
+  });
+
+  it("returns the message for a plain Error", () => {
+    expect(describeBulkUpdateRowFailure(new Error("boom"))).toBe("boom");
+  });
+
+  it("returns the ShelfError message when it wraps no underlying error", () => {
+    const err = new ShelfError({
+      cause: null,
+      message: GENERIC,
+      label: "Assets",
+    });
+    expect(describeBulkUpdateRowFailure(err)).toBe(GENERIC);
+  });
+
+  it("surfaces the underlying Prisma code + detail behind the generic wrapper", () => {
+    // why: mimic a Prisma known-request error shape (code + multi-line message)
+    const prismaError = Object.assign(
+      new Error(
+        "Invalid `prisma.asset.update()` invocation\n\n  The column `Asset.foo` does not exist."
+      ),
+      { code: "P2022" }
+    );
+    const wrapped = new ShelfError({
+      cause: prismaError,
+      message: GENERIC,
+      label: "Assets",
+    });
+
+    const result = describeBulkUpdateRowFailure(wrapped);
+
+    expect(result).toContain(GENERIC);
+    expect(result).toContain("P2022:");
+    expect(result).toContain("The column `Asset.foo` does not exist.");
+    // Only the actionable last line — not the "Invalid `prisma...` invocation"
+    // preamble — so the CSV report stays concise and leaks no internal detail.
+    expect(result).not.toContain("invocation");
+    expect(result).not.toContain("\n");
+  });
+
+  it("does not duplicate the message when the underlying matches the wrapper", () => {
+    const wrapped = new ShelfError({
+      cause: new Error(GENERIC),
+      message: GENERIC,
+      label: "Assets",
+    });
+    expect(describeBulkUpdateRowFailure(wrapped)).toBe(GENERIC);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// analyzeUpdateHeaders — content-importer vocabulary (Task 2)
+//
+// Shelf has two independent CSV header vocabularies (asset-index export
+// display labels vs. content-importer machine keys, see
+// EXPORT_HEADER_TO_FIELD_MAP). These are the regression guards for the
+// reported bug: feeding an import-ready export into the update importer
+// rejected every column.
+// ---------------------------------------------------------------------------
+
+describe("analyzeUpdateHeaders — content-importer vocabulary (Task 2)", () => {
+  it("classifies the reported customer header row with zero unrecognized columns", () => {
+    // The customer's exact 30-header export (see
+    // .superpowers/sdd/drifting-painting-pebble/brian-repro.csv). Before
+    // this fix: 0 updatable, 0 ignored, 29 unrecognized — only `ID`
+    // matched, by coincidence.
+    const headers = [
+      "title",
+      "ID",
+      "description",
+      "category",
+      "kit",
+      "tags",
+      "location",
+      "custodian",
+      "bookable",
+      "valuation",
+      "assetModel",
+      "type",
+      "quantity",
+      "minQuantity",
+      "unitOfMeasure",
+      "consumptionType",
+      "cf:Serial,type:TEXT",
+      "cf:Order Number,type:TEXT",
+      "cf:LACCD #,type:TEXT",
+      "cf:IT Asset #,type:TEXT",
+      "cf:Model #,type:TEXT",
+      "cf:Perkins Purchase,type:TEXT",
+      "cf:Perkins Item Fund ID,type:TEXT",
+      "cf:Manufacturer,type:TEXT",
+      "cf:Supplier,type:TEXT",
+      "cf:Purchase Date,type:DATE",
+      "cf:Perkins Fund #,type:TEXT",
+      "cf:Perkins Fund ID #,type:TEXT",
+      "cf:Perkins Item?,type:BOOLEAN",
+      "cf:Perkins Fiscal Year,type:TEXT",
+    ];
+    const orgCustomFields = [
+      { id: "cf1", name: "Serial", type: "TEXT" as const },
+      { id: "cf2", name: "Order Number", type: "TEXT" as const },
+      { id: "cf3", name: "LACCD #", type: "TEXT" as const },
+      { id: "cf4", name: "IT Asset #", type: "TEXT" as const },
+      { id: "cf5", name: "Model #", type: "TEXT" as const },
+      { id: "cf6", name: "Perkins Purchase", type: "TEXT" as const },
+      { id: "cf7", name: "Perkins Item Fund ID", type: "TEXT" as const },
+      { id: "cf8", name: "Manufacturer", type: "TEXT" as const },
+      { id: "cf9", name: "Supplier", type: "TEXT" as const },
+      { id: "cf10", name: "Purchase Date", type: "DATE" as const },
+      { id: "cf11", name: "Perkins Fund #", type: "TEXT" as const },
+      { id: "cf12", name: "Perkins Fund ID #", type: "TEXT" as const },
+      { id: "cf13", name: "Perkins Item?", type: "BOOLEAN" as const },
+      { id: "cf14", name: "Perkins Fiscal Year", type: "TEXT" as const },
+    ];
+
+    const result = analyzeUpdateHeaders(headers, orgCustomFields);
+
+    expect(result.unrecognizedColumns).toEqual([]);
+    expect(result.idDbField).toBe("id");
+    expect(result.idColumnHeader).toBe("ID");
+
+    const updatableKeys = result.updatableColumns.map((c) => c.internalKey);
+    expect(updatableKeys).toContain("assetModel");
+
+    const cfKeys = result.updatableColumns
+      .filter((c) => c.kind === "customField")
+      .map((c) => c.internalKey);
+    expect(cfKeys).toHaveLength(14);
+    for (const name of orgCustomFields.map((cf) => cf.name)) {
+      expect(cfKeys).toContain(`cf:${name}`);
+    }
+  });
+
+  it("resolves both vocabularies to the same internal field", () => {
+    const contentImporter = analyzeUpdateHeaders(
+      ["title", "bookable", "assetModel", "valuation"],
+      []
+    );
+    const assetIndex = analyzeUpdateHeaders(
+      ["Name", "Available to book", "Asset model", "Value"],
+      []
+    );
+
+    const keysOf = (r: HeaderAnalysis) =>
+      r.updatableColumns.map((c) => c.internalKey).sort();
+
+    expect(keysOf(contentImporter)).toEqual([
+      "assetModel",
+      "availableToBook",
+      "name",
+      "valuation",
+    ]);
+    expect(keysOf(assetIndex)).toEqual(keysOf(contentImporter));
+  });
+
+  it("matches fixed-field and identifier headers case-insensitively", () => {
+    for (const header of ["Asset Model", "asset model", "ASSETMODEL"]) {
+      const result = analyzeUpdateHeaders(["ID", header], []);
+      expect(result.updatableColumns[0]?.internalKey).toBe("assetModel");
+    }
+
+    for (const header of ["id", "ID"]) {
+      const result = analyzeUpdateHeaders([header, "Name"], []);
+      expect(result.idDbField).toBe("id");
+      expect(result.idColumnIndex).toBe(0);
+    }
+  });
+
+  it("resolves cf:<Name>,type:<TYPE>, cf:<Name>, and bare <Name> to the same custom field", () => {
+    const orgCustomFields = [
+      { id: "cf1", name: "Serial", type: "TEXT" as const },
+    ];
+
+    for (const header of ["cf:Serial,type:TEXT", "cf:Serial", "Serial"]) {
+      const result = analyzeUpdateHeaders(["ID", header], orgCustomFields);
+      expect(result.updatableColumns).toHaveLength(1);
+      expect(result.updatableColumns[0].internalKey).toBe("cf:Serial");
+    }
+  });
+
+  it("leaves a cf: header naming an unknown field unrecognized", () => {
+    const result = analyzeUpdateHeaders(
+      ["ID", "cf:DoesNotExist,type:TEXT"],
+      []
+    );
+    expect(result.updatableColumns).toHaveLength(0);
+    expect(result.unrecognizedColumns).toEqual(["cf:DoesNotExist,type:TEXT"]);
+  });
+
+  it("uses the org's stored custom-field type even when the header declares a different one", () => {
+    // The org's "Serial" field is TEXT; the header declares BOOLEAN. The
+    // workspace definition wins — no warning, no branch on the mismatch.
+    const orgCustomFields = [
+      { id: "cf1", name: "Serial", type: "TEXT" as const },
+    ];
+    const result = analyzeUpdateHeaders(
+      ["ID", "cf:Serial,type:BOOLEAN"],
+      orgCustomFields
+    );
+    expect(result.updatableColumns).toHaveLength(1);
+    expect(result.updatableColumns[0].cfDef?.type).toBe("TEXT");
+  });
+
+  it("classifies description as updatable, and kit / custodian as ignored (not updatable)", () => {
+    const result = analyzeUpdateHeaders(
+      ["ID", "description", "kit", "custodian"],
+      []
+    );
+    const updatableKeys = result.updatableColumns.map((c) => c.internalKey);
+    expect(updatableKeys).toContain("description");
+    expect(result.ignoredColumns).toContain("kit");
+    expect(result.ignoredColumns).toContain("custodian");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isBackupExportHeaderRow: legacy workspace backup file detection
+//
+// A legacy workspace backup file carries raw Prisma field/relation names as
+// headers, with `category` / `tags` / `assetModel` cells containing JSON
+// blobs. Case-insensitive identifier matching lets its `id` column pass the
+// "no identifier column" guard, so this predicate catches it before its JSON
+// cells get proposed as literal new entities.
+// ---------------------------------------------------------------------------
+
+describe("isBackupExportHeaderRow", () => {
+  it("detects a raw backup-export header row", () => {
+    // Representative subset of a legacy backup file's header row: id/title
+    // plus relation keys whose cells are JSON blobs.
+    const headers = [
+      "id",
+      "title",
+      "description",
+      "category",
+      "tags",
+      "assetModel",
+      "assetLocations",
+      "customFields",
+      "notes",
+      "createdAt",
+      "updatedAt",
+    ];
+    expect(isBackupExportHeaderRow(headers)).toBe(true);
+  });
+
+  it("matches case-insensitively when all five markers are present", () => {
+    expect(
+      isBackupExportHeaderRow([
+        "id",
+        "NOTES",
+        "CreatedAt",
+        "assetlocations",
+        "CUSTOMFIELDS",
+        "updatedat",
+      ])
+    ).toBe(true);
+  });
+
+  it("requires ALL five markers together — a subset is not enough", () => {
+    // why: guards against a false positive. A real backup export always
+    // carries all five (fixed `include` shape); a partial match is more
+    // likely a coincidental header name from a different file.
+    expect(isBackupExportHeaderRow(["id", "notes"])).toBe(false);
+    expect(isBackupExportHeaderRow(["id", "notes", "createdAt"])).toBe(false);
+    expect(
+      isBackupExportHeaderRow([
+        "id",
+        "notes",
+        "createdAt",
+        "updatedAt",
+        "customFields",
+        // missing "assetLocations"
+      ])
+    ).toBe(false);
+  });
+
+  it("does not false-positive on a workspace custom field literally named 'Notes'", () => {
+    // why: regression guard — an earlier version of this predicate matched
+    // on ANY single marker, which broke a real customer scenario: a custom
+    // field named "Notes" collided with the backup export's raw `notes`
+    // relation key and rejected a perfectly normal update CSV.
+    expect(isBackupExportHeaderRow(["Asset ID", "Notes"])).toBe(false);
+  });
+
+  it("does not fire for a normal import-ready export header row", () => {
+    const headers = [
+      "id",
+      "title",
+      "description",
+      "category",
+      "kit",
+      "tags",
+      "location",
+      "custodian",
+      "bookable",
+      "valuation",
+      "assetModel",
+      "type",
+      "quantity",
+      "minQuantity",
+      "unitOfMeasure",
+      "consumptionType",
+      "cf:Serial,type:TEXT",
+    ];
+    expect(isBackupExportHeaderRow(headers)).toBe(false);
+  });
+
+  it("does not fire for a normal Standard-export header row", () => {
+    // Standard export uses display labels ("Created at", with a space) —
+    // not the raw camelCase key ("createdAt") the backup export emits.
+    const headers = [
+      "Asset ID",
+      "Name",
+      "Description",
+      "Category",
+      "Tags",
+      "Location",
+      "Created at",
+      "Updated at",
+      "Asset model",
+    ];
+    expect(isBackupExportHeaderRow(headers)).toBe(false);
+  });
+});
+
+describe("computeAssetDiffs: description length limit", () => {
+  const headers = ["Asset ID", "Description", "Name"];
+
+  /** Diffs one data row per asset against `SAM-0001` and `SAM-0002`. */
+  function diff(
+    rows: string[][],
+    stored: Partial<AssetForUpdate> = { description: "Old description" }
+  ) {
+    const existingAssets = new Map<string, AssetForUpdate>([
+      ["SAM-0001", makeAsset({ id: "uuid-1", ...stored })],
+      ["SAM-0002", makeAsset({ id: "uuid-2", sequentialId: "SAM-0002" })],
+    ]);
+    return computeAssetDiffs({
+      csvData: [headers, ...rows],
+      headerAnalysis: analyzeUpdateHeaders(headers, []),
+      existingAssets,
+    });
+  }
+
+  it("refuses a row whose new description is over 5,000 characters", () => {
+    const result = diff([
+      ["SAM-0002", "Fits", "Test Asset"],
+      ["SAM-0001", "a".repeat(5123), "New Name"],
+    ]);
+
+    expect(result.failedRows).toEqual([
+      {
+        rowNumber: 3,
+        id: "SAM-0001",
+        reason:
+          "Description too long: 5,123 characters, but the maximum is 5,000. Shorten it and import again.",
+      },
+    ]);
+    expect(result.assetsToUpdate.map((a) => a.id)).toEqual(["SAM-0002"]);
+  });
+
+  it("accepts a description of exactly 5,000 characters", () => {
+    const description = "a".repeat(5000);
+    const result = diff([["SAM-0001", description, "Test Asset"]]);
+
+    expect(result.failedRows).toEqual([]);
+    expect(result.assetsToUpdate[0].changes).toEqual([
+      {
+        field: "Description",
+        currentValue: "Old description",
+        newValue: description,
+      },
+    ]);
+  });
+
+  it("counts a \\r\\n line break as one character", () => {
+    // 5,001 UTF-16 units, 5,000 characters as the user counts them.
+    const description = `${"a".repeat(2500)}\r\n${"a".repeat(2499)}`;
+    const result = diff([["SAM-0001", description, "Test Asset"]]);
+
+    expect(result.failedRows).toEqual([]);
+    expect(result.assetsToUpdate[0].changes[0].newValue).toBe(description);
+  });
+
+  it("does not block a row that leaves a stored over-limit description as it is", () => {
+    const stored = "a".repeat(6000);
+    const result = diff([["SAM-0001", stored, "New Name"]], {
+      description: stored,
+    });
+
+    expect(result.failedRows).toEqual([]);
+    expect(result.assetsToUpdate[0].changes).toEqual([
+      { field: "Name", currentValue: "Test Asset", newValue: "New Name" },
+    ]);
+  });
+
+  it("treats a stored description that differs only by surrounding whitespace as unchanged", () => {
+    // The CSV cell arrives trimmed, so a stored trailing line break is not
+    // something the file asks to change.
+    const result = diff([["SAM-0001", "a".repeat(6000), "New Name"]], {
+      description: `${"a".repeat(6000)}\n`,
+    });
+
+    expect(result.failedRows).toEqual([]);
+    expect(result.assetsToUpdate[0].changes).toEqual([
+      { field: "Name", currentValue: "Test Asset", newValue: "New Name" },
+    ]);
+  });
+});
