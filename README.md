@@ -159,5 +159,3 @@ Shelf.nu is licensed under [AGPL-3.0](./LICENSE), with one exception.
 The companion mobile app in [`apps/companion/`](./apps/companion) is **not open source**. Its source is available under the [PolyForm Internal Use License 1.0.0](./apps/companion/LICENSE). You may read it, build it and change it for the internal business operations of your own company. You may not distribute it. Publishing the app, or an app based on it, on the Apple App Store, Google Play or any other store is distribution.
 
 This section is a summary. The license files are the binding terms.
-#   s h e l f . n u  
- 
